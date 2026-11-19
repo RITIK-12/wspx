@@ -1,0 +1,154 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "wspx"
+dynamic = ["version"]
+description = "Grep, edit, check, test and version-control model weights. A sandboxed harness for AI agents."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Ritik Bompilwar" }]
+requires-python = ">=3.11"
+keywords = [
+    "llm",
+    "model-editing",
+    "interpretability",
+    "agents",
+    "mcp",
+    "pytorch",
+    "transformers",
+    "version-control",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+# The client install stays light: no torch, no provider SDKs.
+dependencies = [
+    "httpx>=0.28",
+    "mcp>=2.3",
+    "modal>=1.6.4",
+    "pydantic>=2.14",
+    "typer>=0.29",
+]
+
+[project.optional-dependencies]
+control = [
+    "fastapi>=0.165",
+    "pyarrow>=26",
+    "sse-starlette>=3.7",
+    "uvicorn>=0.54",
+]
+driver = [
+    "anthropic>=2.11",
+    "google-genai>=3.6",
+    "openai>=3.56",
+]
+# Deliberately small: no provider SDKs, so the only holder of keys is easy to audit.
+gateway = [
+    "starlette>=1.10",
+    "uvicorn>=0.54",
+]
+lab = [
+    "accelerate>=1.16",
+    "gguf>=0.19",
+    "huggingface_hub>=2.4",
+    "numpy>=2.0",
+    "pyarrow>=26",
+    "safetensors>=0.8",
+    "starlette>=1.10",
+    "torch>=2.15",
+    "transformers>=5.23",
+    "uvicorn>=0.54",
+]
+peft = ["peft>=0.22"]
+all = ["wspx[control,driver,gateway,lab,peft]"]
+
+[project.scripts]
+wspx = "wspx.cli.main:app"
+
+[project.urls]
+Homepage = "https://github.com/RITIK-12/wspx"
+Source = "https://github.com/RITIK-12/wspx"
+Issues = "https://github.com/RITIK-12/wspx/issues"
+
+[project.entry-points."wspx.ops"]
+ablate = "wspx.lab.ops.builtin:ablate"
+bake_steer = "wspx.lab.ops.builtin:bake_steer"
+orthogonalize = "wspx.lab.ops.builtin:orthogonalize"
+project_out = "wspx.lab.ops.builtin:project_out"
+rank_one_write = "wspx.lab.ops.builtin:rank_one_write"
+transplant = "wspx.lab.ops.builtin:transplant"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.4",
+    "pytest>=9.2",
+    "pytest-asyncio>=1.5",
+    "respx>=0.23",
+    "ruff>=0.17",
+]
+
+[tool.hatch.version]
+path = "src/wspx/_version.py"
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/tests", "/LICENSE", "/README.md"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/wspx"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "PL", "PT", "C4", "PERF"]
+ignore = [
+    "PLR0911", # too many returns: dispatchers read better flat
+    "PLR0912", # too many branches
+    "PLR0913", # too many arguments: tool signatures mirror their schemas
+    "PLR0915", # too many statements
+    "PLR2004", # magic values: thresholds are documented where used
+    "PLC0415", # imports inside functions keep heavy deps (torch) off the client path
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["PLR2004", "S101"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["wspx"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+mypy_path = "src"
+packages = ["wspx"]
+
+[[tool.mypy.overrides]]
+module = ["modal.*", "gguf.*", "pyarrow.*", "peft.*", "accelerate.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "slow: exercises real Hugging Face architectures; deselect with -m 'not slow'",
+]
+filterwarnings = ["error::DeprecationWarning:wspx.*"]
