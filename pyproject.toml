@@ -124,6 +124,9 @@ ignore = [
     "PLR0915", # too many statements
     "PLR2004", # magic values: thresholds are documented where used
     "PLC0415", # imports inside functions keep heavy deps (torch) off the client path
+    "RUF001",  # typographic symbols (×, ≥, →) are intentional in user-facing text
+    "RUF002",
+    "RUF003",
 ]
 
 [tool.ruff.lint.per-file-ignores]
