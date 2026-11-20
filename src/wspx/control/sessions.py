@@ -69,6 +69,8 @@ class SessionManager:
         self._lab_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
         self._lab_gen: dict[str, int] = defaultdict(int)
         self._missed: dict[str, int] = defaultdict(int)
+        self._epoch: dict[str, int] = defaultdict(int)
+        """State-changing tool calls so far, per session: part of a repeated call's key."""
         self._lab_why: dict[str, str] = {}
         """Why the last generation ended: calls that waited on it fail with this."""
         """Bumped by every lab stop: a start begun under an older value is abandoned."""
@@ -406,10 +408,11 @@ class SessionManager:
             return ""
         notes = []
         try:
+            key = {"tool": name, "args": args, "state": self._epoch[sid]}
+            if TOOLS[name].mutates and result.get("ok", True):
+                self._epoch[sid] += 1
             verdicts = (
-                []
-                if source == "driver"
-                else [self.gateway.observe(sid, "call", {"tool": name, "args": args}, label=name)]
+                [] if source == "driver" else [self.gateway.observe(sid, "call", key, label=name)]
             )
             codes = sorted(set(_CODE_RE.findall(result.get("summary") or "")))
             if codes:

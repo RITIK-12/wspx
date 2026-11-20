@@ -47,6 +47,10 @@ from wspx.gateway.usage import (
     openai_json,
 )
 from wspx.loops import LoopDetector
+from wspx.tools.schemas import TOOLS
+
+STATE_CHANGING = frozenset(name for name, spec in TOOLS.items() if spec.mutates)
+"""wspx tools that change the weights or the session: the same call after one is not a repeat."""
 
 UPSTREAMS = {
     "anthropic": "https://api.anthropic.com",
@@ -152,6 +156,8 @@ def create_app(config: GatewayConfig) -> Starlette:
         timeout=httpx.Timeout(900.0, connect=15.0), transport=config.transport
     )
     last_body: dict[str, tuple[bytes, int]] = {}
+    epochs: dict[str, int] = {}
+    """Per session, how many state-changing tool calls came before (part of a call's key)."""
 
     def session_of(request: Request) -> str:
         token = (
@@ -326,9 +332,15 @@ def create_app(config: GatewayConfig) -> Starlette:
             )
         else:
             for name, args in obs.tool_calls:
+                # `test` after a new edit is a new question: key calls by the state they ran on
+                state = epochs.get(session, 0)
                 verdicts.append(
-                    loops.observe(session, "call", {"tool": name, "args": args}, label=name)
+                    loops.observe(
+                        session, "call", {"tool": name, "args": args, "state": state}, label=name
+                    )
                 )
+                if name in STATE_CHANGING:
+                    epochs[session] = state + 1
             if obs.text.strip():
                 verdicts.append(loops.observe(session, "output", obs.text))
             if not obs.tool_calls and not obs.text.strip():

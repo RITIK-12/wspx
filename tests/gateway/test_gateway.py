@@ -497,3 +497,22 @@ def test_custom_tools_pass(setup) -> None:  # type: ignore[no-untyped-def]
     )
     assert r.status_code == 200
     assert len(upstream.requests) == 1
+
+
+def test_the_same_call_after_an_edit_is_not_a_repeat(setup) -> None:  # type: ignore[no-untyped-def]
+    client, upstream, ledger = setup
+    test = ("test", {"suite": "ladder_dev", "vs": "base"})
+    edit = ("edit", {"op": "scale", "args": {"targets": "L3.mlp.down", "factor": 0.9}})
+
+    def turn(*calls: tuple[str, dict]) -> None:  # type: ignore[type-arg]
+        upstream.reply = lambda r: httpx.Response(200, json=anthropic_reply("", list(calls)))
+        assert call(client).status_code == 200
+
+    for _ in range(4):  # edit, then test: four rounds of the same test on new weights
+        turn(edit)
+        turn(test)
+    assert ledger.paused("s1") is None
+    assert not [e for e in ledger.loop_events("s1") if "test" in json.dumps(e)]
+    for _ in range(3):  # the same test three times on the same weights is a repeat
+        turn(test)
+    assert any("test" in json.dumps(e) for e in ledger.loop_events("s1"))
