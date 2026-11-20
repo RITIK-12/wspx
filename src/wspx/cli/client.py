@@ -40,6 +40,13 @@ class Control:
         data: list[dict[str, Any]] = self._req("GET", "/api/sessions")["sessions"]
         return data
 
+    def upload_project(self, snapshot: bytes) -> str:
+        """Store a packed project; returns its snapshot id (uploads are deduplicated by content)."""
+        data: dict[str, Any] = self._req(
+            "POST", "/api/projects", content=snapshot, headers={"content-type": "application/gzip"}
+        )
+        return str(data["snapshot"])
+
     def new(self, **body: Any) -> dict[str, Any]:
         data: dict[str, Any] = self._req("POST", "/api/sessions", json=body)
         return data

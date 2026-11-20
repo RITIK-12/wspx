@@ -290,3 +290,42 @@ def test_ui_views_are_served_from_the_store(tmp_path: Path) -> None:
         assert obj["kind"] == "forward"
         assert obj["arrays"]["lens_ids"]
         assert sid not in manager.labs
+
+
+def test_projects_ship_their_files_and_settings_to_the_lab(tmp_path: Path) -> None:
+    from wspx.config import WspxConfig
+    from wspx.control.backend import project_workdir
+    from wspx.project import Project
+
+    root = tmp_path / "proj"
+    (root / "data").mkdir(parents=True)
+    (root / "wspx.toml").write_text('[project]\nname = "demo"\n\n[check]\nmax_rel_norm = 0.01\n')
+    (root / "data" / "loops.jsonl").write_text('{"prompt": "Wait"}\n')
+    found = Project.find(root)
+    assert found is not None
+    packed = found.pack()
+    gzip = USER | {"content-type": "application/gzip"}
+
+    client, manager = make(tmp_path)
+    with client:
+        up = client.post("/api/projects", content=packed, headers=gzip)
+        assert up.status_code == 200, up.text
+        assert up.json()["files"] == 2
+        snapshot = up.json()["snapshot"]
+        again = client.post("/api/projects", content=packed, headers=gzip).json()
+        assert again["snapshot"] == snapshot  # stored once, by content
+        assert client.post("/api/projects", content=b"junk", headers=gzip).status_code == 400
+
+        unknown = {"model": "tiny", "snapshot": "sha256:" + "0" * 64}
+        assert client.post("/api/sessions", json=unknown, headers=USER).status_code == 400
+        body = {"model": "tiny", "project": "demo", "snapshot": snapshot}
+        sid = client.post("/api/sessions", json=body, headers=USER).json()["id"]
+        record = manager.get(sid)
+        assert (record.project, record.snapshot) == ("demo", snapshot)
+        listed = client.get("/api/sessions", headers=USER).json()["sessions"]
+        assert [s["project"] for s in listed] == ["demo"]
+
+    workdir = project_workdir(record, Store(tmp_path / "store"))
+    assert workdir is not None
+    assert (workdir / "data" / "loops.jsonl").read_text() == '{"prompt": "Wait"}\n'
+    assert WspxConfig.discover(workdir).check.max_rel_norm == 0.01

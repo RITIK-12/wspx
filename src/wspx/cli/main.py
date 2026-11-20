@@ -14,6 +14,7 @@ import typer
 from wspx import __version__
 from wspx.cli import config as cli_config
 from wspx.cli.client import Control
+from wspx.config import CONFIG_FILENAME, find_config
 from wspx.errors import WspxError
 
 app = typer.Typer(
@@ -44,13 +45,20 @@ def _control() -> Control:
     return Control(cfg.url, cfg.token)
 
 
+def _project_root() -> str:
+    """The enclosing project's root ("" outside any project); each has its own current session."""
+    found = find_config()
+    return str(found.parent) if found else ""
+
+
 def _session(value: str | None) -> str:
     cfg = cli_config.load()
-    sid = value or cfg.session
+    root = _project_root()
+    sid = value or cfg.current(root)
     if not sid:
         raise typer.BadParameter("no session: pass --session or start one with `wspx new`")
-    if value and value != cfg.session:
-        cfg.session = value
+    if value and value != cfg.current(root):
+        cfg.set_current(root, value)
         cli_config.save(cfg)
     return sid
 
@@ -156,60 +164,126 @@ def deploy(
 
 
 @app.command()
+def init(
+    model: Annotated[
+        str | None, typer.Option("--model", "-m", help="Hugging Face model id.")
+    ] = None,
+    driver: Annotated[
+        str | None, typer.Option("--driver", "-d", help="e.g. anthropic:claude-opus-5-5")
+    ] = None,
+    gpu: Annotated[str | None, typer.Option("--gpu", help="e.g. L4, H100 or H100:8")] = None,
+) -> None:
+    """Make the current directory a wspx project (writes wspx.toml)."""
+    path = Path.cwd() / CONFIG_FILENAME
+    if path.exists():
+        raise typer.BadParameter(f"{path} already exists")
+
+    def entry(key: str, value: str | None, example: str) -> str:
+        return f'{key} = "{value}"' if value else f'# {key} = "{example}"'
+
+    path.write_text(
+        "\n".join(
+            [
+                "[project]",
+                f'name = "{Path.cwd().name}"',
+                "",
+                "[model]",
+                entry("id", model, "Qwen/Qwen3-0.6B"),
+                "",
+                "[driver]",
+                entry("model", driver, "anthropic:claude-opus-5-5"),
+                "",
+                "[lab]",
+                entry("gpu", gpu, "L4"),
+                "",
+                "[tests]",
+                'paths = ["wtests/"]',
+                "",
+            ]
+        )
+    )
+    typer.echo(f'wrote {path}; start a session here with `wspx new "<task>"`')
+
+
+@app.command()
 def new(
     task: Annotated[
         str, typer.Argument(help="What the driver should do (omit for an interactive session).")
     ] = "",
     model: Annotated[
-        str, typer.Option("--model", "-m", help="Hugging Face model id or path.")
-    ] = "",
+        str | None, typer.Option("--model", "-m", help="Hugging Face model id or path.")
+    ] = None,
     driver: Annotated[
         str | None, typer.Option("--driver", "-d", help="e.g. anthropic:claude-opus-5-5")
     ] = None,
     gpu: Annotated[
-        str | None, typer.Option("--gpu", help="e.g. H100 or H100:8 (default: CPU)")
+        str | None, typer.Option("--gpu", help="e.g. L4, H100 or H100:8 (default: CPU)")
     ] = None,
     branch: Annotated[str | None, typer.Option("--branch")] = None,
     revision: Annotated[str | None, typer.Option("--revision")] = None,
     trust_remote_code: Annotated[bool, typer.Option("--trust-remote-code")] = False,
 ) -> None:
-    """Start a session."""
-    if not model:
-        raise typer.BadParameter("--model is required")
+    """Start a session. Inside a project, wspx.toml supplies the defaults and the lab gets its files."""
+    from wspx.config import WspxConfig
+    from wspx.project import Project
+
     try:
-        record = _control().new(
+        project = Project.find()
+        cfg = project.config if project else WspxConfig()
+        model = model or cfg.model.id
+        if not model:
+            raise typer.BadParameter("pass --model, or set [model] id in wspx.toml (`wspx init`)")
+        control = _control()
+        snapshot = control.upload_project(project.pack()) if project else None
+        record = control.new(
             model=model,
-            driver=driver,
+            driver=driver or cfg.driver.model,
             task=task,
-            gpu=gpu,
+            gpu=gpu or cfg.lab.gpu,
             branch=branch,
-            revision=revision,
-            trust_remote_code=trust_remote_code,
+            revision=revision or cfg.model.revision,
+            dtype=cfg.model.dtype,
+            trust_remote_code=trust_remote_code or cfg.model.trust_remote_code,
+            grace_s=cfg.lab.grace,
+            keep_warm=cfg.lab.keep_warm,
+            project=project.name if project else "",
+            snapshot=snapshot,
         )
     except WspxError as exc:
         _fail(exc)
         return
-    cfg = cli_config.load()
-    cfg.session = record["id"]
-    cli_config.save(cfg)
+    state = cli_config.load()
+    state.set_current(str(project.root) if project else "", record["id"])
+    cli_config.save(state)
+    where = f" in {project.name}" if project else ""
+    driven = f" driven by {record['driver']}" if record.get("driver") else ""
     typer.echo(
-        f"session {record['id']} on {model}"
-        + (f" driven by {driver}" if driver else "")
-        + "\nthe lab is starting; `wspx open` to watch"
+        f"session {record['id']}{where} on {model}{driven}\n"
+        "the lab is starting; `wspx open` to watch"
     )
 
 
 @app.command()
-def sessions() -> None:
-    """List sessions."""
+def sessions(
+    all_: Annotated[bool, typer.Option("--all", help="Include other projects' sessions.")] = False,
+) -> None:
+    """List this project's sessions (or every session with --all)."""
+    from wspx.project import Project
+
     try:
         rows = _control().sessions()
+        project = None if all_ else Project.find()
     except WspxError as exc:
         _fail(exc)
         return
-    for r in rows:
+    if project is not None:
+        rows = [r for r in rows if r.get("project") == project.name]
+    current = cli_config.load().current(_project_root())
+    for r in sorted(rows, key=lambda r: r.get("created", 0)):
+        mark = "*" if r["id"] == current else " "
         typer.echo(
-            f"{r['id']}  {r['status']:<8} {r['tier']:<5} {r['model']}  {r.get('driver') or ''}"
+            f"{mark} {r['id']}  {r['status']:<8} {r['tier']:<5} {r.get('project') or '-':<16} "
+            f"{r['model']}  {r.get('driver') or ''}"
         )
 
 
@@ -217,7 +291,7 @@ def sessions() -> None:
 def open_ui(session: Session = None) -> None:
     """Open the UI in a browser."""
     cfg = cli_config.require(cli_config.load())
-    sid = session or cfg.session
+    sid = session or cfg.current(_project_root())
     url = f"{cfg.url.rstrip('/')}/#token={cfg.token}" + (f"&session={sid}" if sid else "")
     webbrowser.open(url)
     typer.echo(f"{cfg.url}  (the token is in the URL fragment, not sent to the server in logs)")
@@ -702,10 +776,11 @@ def mcp() -> None:
 
     cfg = cli_config.require(cli_config.load())
     control = Control(cfg.url, cfg.token)
+    root = _project_root()
 
     def call(session: str | None, name: str, args: dict[str, Any]) -> dict[str, Any]:
         try:
-            return control.tool(session or cfg.session, name, args)
+            return control.tool(session or cfg.current(root), name, args)
         except WspxError as exc:
             return {"summary": str(exc), "ok": False}
 
@@ -719,7 +794,9 @@ def hook_codex() -> None:
     try:
         payload = json.loads(sys.stdin.read() or "{}")
         if cfg.url and cfg.token:
-            Control(cfg.url, cfg.token).ingest("codex", payload, cfg.session or None)
+            Control(cfg.url, cfg.token).ingest(
+                "codex", payload, cfg.current(_project_root()) or None
+            )
     except (WspxError, json.JSONDecodeError):
         pass  # a hook must never break the agent; the call log stays authoritative
 

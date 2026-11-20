@@ -29,6 +29,9 @@ class SessionRecord:
     """hot · grace · cold"""
     grace_s: float = 900.0
     keep_warm: str = "auto"
+    project: str = ""
+    snapshot: str | None = None
+    """Object id of the project snapshot the lab unpacks as its working directory."""
     created: float = 0.0
     fingerprint: str | None = None
     reason: str = ""
@@ -199,11 +202,13 @@ class LocalBackend:
 
 
 def _load_lab(record: SessionRecord, store: Any) -> Any:
+    from wspx.config import WspxConfig
     from wspx.lab.ir.capture import build_ir
     from wspx.lab.loader import load_hf
     from wspx.lab.sdk import _cached_ir, _save_ir
     from wspx.lab.session import Lab
 
+    workdir = project_workdir(record, store)
     loaded = load_hf(
         record.model,
         revision=record.revision,
@@ -223,4 +228,17 @@ def _load_lab(record: SessionRecord, store: Any) -> Any:
         branch=record.branch,
         tokenizer=loaded.tokenizer,
         base_reader=loaded.base_reader if loaded.readable else None,
+        workdir=workdir,
+        config=WspxConfig.discover(workdir) if workdir else None,
+    )
+
+
+def project_workdir(record: SessionRecord, store: Any) -> Path | None:
+    """Unpack the session's project snapshot into a fresh working directory, if it has one."""
+    if not record.snapshot:
+        return None
+    from wspx.project import extract
+
+    return extract(
+        store.objects.get(record.snapshot), tempfile.mkdtemp(prefix=f"wspx-{record.id}-work-")
     )

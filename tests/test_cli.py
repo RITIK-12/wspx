@@ -33,6 +33,17 @@ class FakeControl:
     def limits(self) -> list[dict[str, Any]]:
         return []
 
+    uploads: list[bytes]
+    created: list[dict[str, Any]]
+
+    def upload_project(self, snapshot: bytes) -> str:
+        self.uploads = [*getattr(self, "uploads", []), snapshot]
+        return "sha256:" + "a" * 64
+
+    def new(self, **body: Any) -> dict[str, Any]:
+        self.created = [*getattr(self, "created", []), body]
+        return {"id": "s_new", **body}
+
 
 def test_version() -> None:
     result = runner.invoke(main.app, ["--version"])
@@ -97,3 +108,51 @@ def test_client_install_never_imports_torch() -> None:
     code = "import sys, wspx, wspx.cli.main, wspx.tools; assert 'torch' not in sys.modules, 'torch imported'"
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=False)
     assert proc.returncode == 0, proc.stderr
+
+
+def test_config_keeps_a_current_session_per_project() -> None:
+    cfg = cli_config.CliConfig("u", "t", "s_global")
+    cfg.set_current("/work/a", "s_a")
+    cfg.set_current("/work/b c", "s_b")
+    cli_config.save(cfg)
+    loaded = cli_config.load()
+    assert loaded.current("") == "s_global"
+    assert (loaded.current("/work/a"), loaded.current("/work/b c")) == ("s_a", "s_b")
+    assert loaded.current("/elsewhere") == ""
+
+
+def test_init_then_new_takes_defaults_and_files_from_the_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "loops"
+    (project / "data").mkdir(parents=True)
+    (project / "data" / "loops.jsonl").write_text('{"prompt": "Wait"}\n')
+    monkeypatch.chdir(project)
+    result = runner.invoke(main.app, ["init", "--model", "Qwen/Qwen3-0.6B", "--gpu", "L4"])
+    assert result.exit_code == 0, result.output
+    assert runner.invoke(main.app, ["init"]).exit_code != 0  # never overwrites
+
+    fake = FakeControl()
+    monkeypatch.setattr(main, "_control", lambda: fake)
+    result = runner.invoke(main.app, ["new", "remove the loop direction"])
+    assert result.exit_code == 0, result.output
+    body = fake.created[0]
+    assert (body["model"], body["gpu"], body["project"]) == ("Qwen/Qwen3-0.6B", "L4", "loops")
+    assert body["driver"] is None  # left commented out by init
+    assert body["snapshot"] == "sha256:" + "a" * 64
+    assert len(fake.uploads) == 1
+
+    # the new session is current here, and only here
+    state = cli_config.load()
+    assert state.current(str(project.resolve())) == "s_new"
+    assert state.current("") == ""
+    assert runner.invoke(main.app, ["info"]).exit_code == 0
+    assert fake.calls[-1][0] == "s_new"
+
+
+def test_new_needs_a_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(main, "_control", FakeControl)
+    result = runner.invoke(main.app, ["new", "task"])
+    assert result.exit_code != 0
+    assert "--model" in result.output

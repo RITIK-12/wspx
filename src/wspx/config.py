@@ -65,6 +65,14 @@ class _Section(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+class ProjectSection(_Section):
+    name: str | None = None
+    """Shown next to its sessions; defaults to the project directory's name."""
+    exclude: list[str] = Field(default_factory=list)
+    """Paths kept out of the upload to the lab (``.dockerignore`` patterns), on top of
+    the defaults: version control, virtualenvs, caches, stores and weight files."""
+
+
 class ModelSection(_Section):
     id: str | None = None
     revision: str | None = None
@@ -110,6 +118,7 @@ class PolicySection(_Section):
 
 
 class WspxConfig(_Section):
+    project: ProjectSection = Field(default_factory=ProjectSection)
     model: ModelSection = Field(default_factory=ModelSection)
     driver: DriverSection = Field(default_factory=DriverSection)
     lab: LabSection = Field(default_factory=LabSection)

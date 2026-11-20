@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 from starlette.types import Receive, Scope, Send
 
 from wspx import __version__
+from wspx import project as project_snapshot
 from wspx.auth import TokenError, check_bearer, verify
 from wspx.control.backend import Backend
 from wspx.control.gateway_client import GatewayAdmin
@@ -81,6 +82,8 @@ class NewSession(BaseModel):
     trust_remote_code: bool = False
     grace_s: float = Field(900.0, ge=0)
     keep_warm: str = "auto"
+    project: str = ""
+    snapshot: str | None = Field(None, pattern=r"^sha256:[0-9a-f]{64}$")
 
 
 class ToolCall(BaseModel):
@@ -219,6 +222,15 @@ def create_app(
     def new_session(body: NewSession) -> dict[str, Any]:
         record = guarded(lambda: manager.create(**body.model_dump()))
         return record.to_dict()  # type: ignore[no-any-return]
+
+    @app.post("/api/projects", dependencies=[Depends(user)])
+    async def upload_project(request: Request) -> dict[str, Any]:
+        """Store a project snapshot (a gzipped tar from ``wspx.project``) by content hash."""
+        data = await request.body()
+        if len(data) > project_snapshot.MAX_BYTES:
+            raise HTTPException(413, "project snapshot too large")
+        infos = guarded(lambda: project_snapshot.members(data))
+        return {"snapshot": store.objects.put(data), "files": len(infos)}
 
     @app.get("/api/sessions/{sid}", dependencies=[Depends(user)])
     def get_session(sid: str) -> dict[str, Any]:

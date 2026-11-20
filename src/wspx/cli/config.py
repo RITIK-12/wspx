@@ -1,13 +1,15 @@
-"""Where the CLI finds the deployed control plane: ``~/.config/wspx/config.toml``.
+"""The CLI's own state: ``~/.config/wspx/config.toml``.
 
-Environment variables ``WSPX_URL`` and ``WSPX_TOKEN`` override the file.
+It holds where the deployed control plane is and which session each project
+(and the shell outside any project) is working on. ``WSPX_URL``, ``WSPX_TOKEN``
+and ``WSPX_SESSION`` override it.
 """
 
 from __future__ import annotations
 
 import os
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from wspx.errors import ConfigError
@@ -23,7 +25,21 @@ class CliConfig:
     url: str = ""
     token: str = ""
     session: str = ""
-    """The default session for tool commands."""
+    """The current session outside any project."""
+    projects: dict[str, str] = field(default_factory=dict)
+    """Project root → that project's current session."""
+
+    def current(self, root: str = "") -> str:
+        """The session tool commands use in project ``root`` ("" outside any project)."""
+        return os.environ.get("WSPX_SESSION") or (
+            self.projects.get(root, "") if root else self.session
+        )
+
+    def set_current(self, root: str, session: str) -> None:
+        if root:
+            self.projects[root] = session
+        else:
+            self.session = session
 
 
 def load() -> CliConfig:
@@ -32,10 +48,14 @@ def load() -> CliConfig:
     if p.exists():
         data = tomllib.loads(p.read_text())
         cloud = data.get("cloud", {})
-        cfg = CliConfig(cloud.get("url", ""), cloud.get("token", ""), data.get("session", ""))
+        cfg = CliConfig(
+            cloud.get("url", ""),
+            cloud.get("token", ""),
+            data.get("session", ""),
+            {str(k): str(v) for k, v in data.get("projects", {}).items()},
+        )
     cfg.url = os.environ.get("WSPX_URL", cfg.url)
     cfg.token = os.environ.get("WSPX_TOKEN", cfg.token)
-    cfg.session = os.environ.get("WSPX_SESSION", cfg.session)
     return cfg
 
 
@@ -54,6 +74,8 @@ def save(cfg: CliConfig) -> Path:
         f"token = {q(cfg.token)}",
         "",
     ]
+    if cfg.projects:
+        lines += ["[projects]", *(f"{q(k)} = {q(v)}" for k, v in sorted(cfg.projects.items())), ""]
     p.write_text("\n".join(lines))
     p.chmod(0o600)
     return p

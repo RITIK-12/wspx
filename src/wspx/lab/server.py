@@ -19,6 +19,7 @@ import os
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from starlette.applications import Starlette
@@ -187,6 +188,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--store", required=True, help="the store volume (read-only in the cloud)")
     parser.add_argument("--overlay", default="/tmp/wspx-overlay")
     parser.add_argument("--workdir", default="/workspace")
+    parser.add_argument(
+        "--snapshot", default=None, help="object id of the project to unpack into --workdir"
+    )
     parser.add_argument("--dtype", default="bfloat16")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--port", type=int, default=8080)
@@ -195,11 +199,16 @@ def main(argv: list[str] | None = None) -> None:
 
     import uvicorn
 
+    from wspx.config import WspxConfig
     from wspx.lab.ir.capture import build_ir
     from wspx.lab.loader import load_hf
     from wspx.lab.sdk import _cached_ir, _save_ir
+    from wspx.project import extract
 
     store: Store = OverlayStore(args.store, args.overlay)
+    workdir = Path(args.workdir)
+    if args.snapshot:
+        extract(store.objects.get(args.snapshot), workdir)
     loaded = load_hf(
         args.model, dtype=args.dtype, trust_remote_code=args.trust_remote_code, local_only=True
     )
@@ -215,7 +224,8 @@ def main(argv: list[str] | None = None) -> None:
         branch=args.branch,
         tokenizer=loaded.tokenizer,
         base_reader=loaded.base_reader if loaded.readable else None,
-        workdir=__import__("pathlib").Path(args.workdir),
+        workdir=workdir,
+        config=WspxConfig.discover(workdir),
     )
     server = LabServer(lab, lease_s=args.lease, token=os.environ.get("WSPX_LAB_TOKEN"))
     server.watchdog()

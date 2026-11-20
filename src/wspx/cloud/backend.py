@@ -90,6 +90,8 @@ class ModalBackend:
         ]
         if record.branch:
             args += ["--branch", record.branch]
+        if record.snapshot:
+            args += ["--snapshot", record.snapshot]
         if record.trust_remote_code:
             args.append("--trust-remote-code")
         sandbox = self.modal.Sandbox.create(

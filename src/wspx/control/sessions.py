@@ -85,9 +85,13 @@ class SessionManager:
         trust_remote_code: bool = False,
         grace_s: float = 900.0,
         keep_warm: str = "auto",
+        project: str = "",
+        snapshot: str | None = None,
     ) -> SessionRecord:
         if self.halted:
             raise WspxError("wspx is halted; `wspx resume` first")
+        if snapshot is not None and not self.store.objects.has(snapshot):
+            raise WspxError(f"project snapshot {snapshot[:12]} was not uploaded")
         sid = "s_" + secrets.token_hex(4)
         record = SessionRecord(
             sid,
@@ -101,6 +105,8 @@ class SessionManager:
             trust_remote_code,
             grace_s=grace_s,
             keep_warm=keep_warm,
+            project=project,
+            snapshot=snapshot,
             created=time.time(),
         )
         self.records[sid] = record
