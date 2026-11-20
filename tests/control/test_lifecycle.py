@@ -224,3 +224,13 @@ def test_a_failed_start_fails_the_calls_queued_behind_it(tmp_path: Path) -> None
     wait(lambda: m.get(sid).status == "error")
     assert m.tool(sid, "info", {}, source="human")["ok"] is False  # a new call tries again
     assert backend.labs_started == 2
+
+
+def test_a_driver_session_is_starting_until_its_lab_is_up(tmp_path: Path) -> None:
+    m, backend = manager(tmp_path)
+    sid = m.create(model="m", driver="anthropic:x").id
+    assert m.get(sid).status == "starting"  # the driver is queued, not waiting for a press
+    assert m.create(model="m").status == "idle"  # no driver: nothing to start
+    backend.ready.set()
+    wait(lambda: m.get(sid).status == "running")
+    assert len(backend.runners) == 1

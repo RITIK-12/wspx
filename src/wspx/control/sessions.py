@@ -74,6 +74,8 @@ class SessionManager:
             known = {f.name for f in fields(SessionRecord)}
             record = SessionRecord(**{k: v for k, v in data.items() if k in known})
             record.tier = "cold"
+            if record.status == "starting":  # nothing is queued across a restart
+                record.status = "idle"
             self.records[record.id] = record
 
     # ------------------------------------------------------------------ sessions
@@ -114,6 +116,7 @@ class SessionManager:
             project=project,
             snapshot=snapshot,
             created=time.time(),
+            status="starting" if driver else "idle",
         )
         self.records[sid] = record
         self._save(record)
@@ -143,7 +146,7 @@ class SessionManager:
             self._save(record)
             self.trace.event(sid, "error", {"error": record.reason})
             return
-        if record.driver and record.status in ("idle", "running"):
+        if record.driver and record.status in ("starting", "running"):
             self.start_driver(sid)
 
     def start_driver(self, sid: str) -> None:

@@ -26,7 +26,7 @@ class SessionRecord:
     dtype: str = "bfloat16"
     trust_remote_code: bool = False
     status: str = "idle"
-    """idle · running · paused · stopped · done · error"""
+    """starting (driver queued until the lab is up) · idle · running · paused · stopped · done · error"""
     tier: str = "cold"
     """hot · grace · cold"""
     grace_s: float = 900.0

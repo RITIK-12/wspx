@@ -39,7 +39,10 @@ export function SessionView({ session, onChange }: { session: Session; onChange:
         <span className="spacer" />
         {session.status === "running" && <button onClick={() => act("pause")}>Pause</button>}
         {session.status === "paused" && <button onClick={() => act("resume")}>Resume</button>}
-        {session.driver && session.status !== "running" && session.status !== "paused" && (
+        {session.status === "starting" && session.driver && (
+          <span className="muted small">the driver starts when the lab is up</span>
+        )}
+        {session.driver && ["idle", "done", "stopped", "error"].includes(session.status) && (
           <button onClick={() => act("start")}>Run driver</button>
         )}
         <button className="danger" onClick={() => act("stop")}>

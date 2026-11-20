@@ -152,7 +152,11 @@ def create_app(
 
     def mcp_call(session: str | None, name: str, args: dict[str, Any]) -> dict[str, Any]:
         if session is None:
-            running = [r.id for r in manager.records.values() if r.status in ("idle", "running")]
+            running = [
+                r.id
+                for r in manager.records.values()
+                if r.status in ("starting", "idle", "running")
+            ]
             if len(running) != 1:
                 return {
                     "summary": "pick a session: set the X-Wspx-Session header (see `wspx connect`)",
