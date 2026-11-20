@@ -1,0 +1,30 @@
+{
+  "name": "wspx",
+  "description": "Grep, edit, check, test and version-control model weights through a wspx deployment.",
+  "author": {"name": "Ritik Bompilwar"},
+  "license": "Apache-2.0",
+  "mcpServers": {
+    "wspx": {
+      "type": "http",
+      "url": "${WSPX_URL}/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${WSPX_TOKEN}",
+        "X-Wspx-Session": "${WSPX_SESSION}"
+      }
+    }
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "mcp__wspx__.*",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "${WSPX_URL}/api/ingest/claude-code?session=${WSPX_SESSION}",
+            "headers": {"Authorization": "Bearer ${WSPX_TOKEN}"}
+          }
+        ]
+      }
+    ]
+  }
+}

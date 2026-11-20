@@ -1,0 +1,9 @@
+
+# wspx: forward Codex tool events to the wspx trace (see `wspx hook codex`)
+[[hooks.post_tool_use]]
+type = "command"
+command = ["wspx", "hook", "codex"]
+
+[[hooks.user_prompt_submit]]
+type = "command"
+command = ["wspx", "hook", "codex"]
