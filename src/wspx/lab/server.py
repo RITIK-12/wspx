@@ -134,13 +134,20 @@ class LabServer:
                 return _JSON({"error": "unauthorized"}, status_code=401)
             body = await request.json() if await request.body() else {}
             self.renew(float(body.get("lease_s", DEFAULT_LEASE_S)))
-            with self._lock:
-                journal = self.journal()
+            # Never wait here for a tool call to finish: blocking on the lock would stall the
+            # event loop, and a heartbeat that times out makes the control plane think the lab
+            # is gone. A busy lab renews its lease; that call's response carries the journal.
+            if not self._lock.acquire(blocking=False):
+                return _JSON({"lease_expires": self.lease_expires, "busy": True})
+            try:
+                journal, workspace = self.journal(), self.workspace()
+            finally:
+                self._lock.release()
             return _JSON(
                 {
                     "lease_expires": self.lease_expires,
                     "journal": journal,
-                    "workspace": self.workspace(),
+                    "workspace": workspace,
                     "fingerprint": self.lab.ir.fingerprint,
                 }
             )

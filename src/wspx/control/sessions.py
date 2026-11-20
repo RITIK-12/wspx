@@ -29,6 +29,8 @@ from wspx.store.overlay import apply_journal
 from wspx.tools import TOOLS
 
 LEASE_S = 300.0
+MISSED_HEARTBEATS = 3
+"""Consecutive failed heartbeats before a lab is given up on (and terminated)."""
 RECENT_CALL_S = 120.0
 STORE_SERVED = frozenset({"info", "ls"})
 _CODE_RE = re.compile(r"\b([EW]\d{3})\b")
@@ -66,6 +68,7 @@ class SessionManager:
         """Bumped by every kill --all and resume, so a stale halt read cannot undo them."""
         self._lab_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
         self._lab_gen: dict[str, int] = defaultdict(int)
+        self._missed: dict[str, int] = defaultdict(int)
         self._lab_why: dict[str, str] = {}
         """Why the last generation ended: calls that waited on it fail with this."""
         """Bumped by every lab stop: a start begun under an older value is abandoned."""
@@ -494,10 +497,14 @@ class SessionManager:
                     self.stop_lab(sid, "idle past the grace period")
                     continue
                 record.tier = "grace"
+            self._save(record)
             try:
                 self._persist(sid, self.labs[sid].heartbeat(LEASE_S))
+                self._missed.pop(sid, None)
             except Exception as exc:
-                self.labs.pop(sid, None)
-                record.tier = "cold"
-                self.trace.event(sid, "lab", {"tier": "cold", "reason": f"lost: {exc}"})
-            self._save(record)
+                self._missed[sid] += 1
+                if self._missed[sid] < MISSED_HEARTBEATS:
+                    continue  # a slow answer is not a lost lab; its lease still has time
+                self._missed.pop(sid, None)
+                # terminate it rather than forget it, or it keeps its GPU until the lease lapses
+                self.stop_lab(sid, f"lost: no heartbeat answered {MISSED_HEARTBEATS} times ({exc})")

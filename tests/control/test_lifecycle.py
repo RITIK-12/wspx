@@ -234,3 +234,31 @@ def test_a_driver_session_is_starting_until_its_lab_is_up(tmp_path: Path) -> Non
     backend.ready.set()
     wait(lambda: m.get(sid).status == "running")
     assert len(backend.runners) == 1
+
+
+class SilentLab(FakeLab):
+    def __init__(self) -> None:
+        self.stopped = False
+
+    def heartbeat(self, lease_s: float) -> dict[str, Any]:
+        raise TimeoutError("The read operation timed out")
+
+    def stop(self) -> None:
+        self.stopped = True
+
+
+def test_a_lab_is_given_up_on_after_several_missed_heartbeats(tmp_path: Path) -> None:
+    """One slow heartbeat dropped a live lab, which kept its GPU while a second one started."""
+    from wspx.control.sessions import MISSED_HEARTBEATS
+
+    m, _ = manager(tmp_path)
+    sid = m.create(model="m").id
+    lab = SilentLab()
+    m.labs[sid] = lab
+    for _ in range(MISSED_HEARTBEATS - 1):
+        m.tick()
+        assert m.labs.get(sid) is lab  # a missed beat or two is a busy lab, not a lost one
+    m.tick()
+    assert sid not in m.labs
+    assert lab.stopped  # terminated, not just forgotten
+    assert m.get(sid).tier == "cold"
