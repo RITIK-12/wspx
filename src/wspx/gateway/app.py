@@ -18,6 +18,7 @@ pauses. No agent tool can reach it.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -60,6 +61,13 @@ KEY_ENV = {
     "hf-router": ("HF_TOKEN",),
 }
 DEFAULT_MAX_OUTPUT = 128_000
+KEY_CHECKS = {
+    "anthropic": ("/v1/models", {"anthropic-version": "2023-06-01"}),
+    "openai": ("/v1/models", {}),
+    "google": ("/v1beta/models", {}),
+    "hf-router": ("https://huggingface.co/api/whoami-v2", {}),
+}
+"""A free, read-only request per provider that succeeds only with a valid key."""
 """Worst case used when a request does not state its output cap."""
 HOP_HEADERS = frozenset(
     {
@@ -431,6 +439,36 @@ def create_app(config: GatewayConfig) -> Starlette:
             ledger.pause(session, f"loop detected: {verdict.message}")
         return {"verdict": verdict.to_dict()}
 
+    async def check_key(provider: str) -> dict[str, Any]:
+        key = config.keys.get(provider)
+        if not key:
+            return {"set": False}
+        path, extra = KEY_CHECKS[provider]
+        url = path if path.startswith("https://") else config.upstreams[provider] + path
+        try:
+            r = await client.get(url, headers=auth_headers(provider, key) | extra, timeout=20.0)
+        except httpx.HTTPError as exc:
+            return {"set": True, "ok": None, "detail": f"unreachable: {exc}"}
+        if r.status_code < 400:
+            return {"set": True, "ok": True}
+        return {"set": True, "ok": False, "detail": f"{r.status_code}: {r.text[:200]}"}
+
+    async def keys(_request: Request) -> Any:
+        """Which provider keys this gateway holds and whether each works (never the values)."""
+        results = await asyncio.gather(*(check_key(p) for p in KEY_CHECKS))
+        return {"keys": dict(zip(KEY_CHECKS, results, strict=True))}
+
+    async def recycle(_request: Request) -> Any:
+        """Load changed keys: on Modal, retire this container so the next call starts fresh."""
+        import modal
+
+        if modal.is_local():
+            return {"recycled": False, "detail": "restart the gateway to load changed keys"}
+        import modal.experimental
+
+        modal.experimental.stop_fetching_inputs()
+        return {"recycled": True}
+
     async def health(_request: Request) -> Response:
         return JSONResponse({"ok": True, "halted": ledger.halted() is not None})
 
@@ -446,6 +484,8 @@ def create_app(config: GatewayConfig) -> Starlette:
         Route("/admin/sessions/{session}", admin(session_info)),
         Route("/admin/prices", admin(prices), methods=["POST"]),
         Route("/admin/observe", admin(observe), methods=["POST"]),
+        Route("/admin/keys", admin(keys)),
+        Route("/admin/recycle", admin(recycle), methods=["POST"]),
     ]
     app = Starlette(routes=routes)
     app.state.ledger = ledger

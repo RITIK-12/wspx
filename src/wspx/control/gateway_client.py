@@ -29,6 +29,13 @@ class GatewayAdmin:
             raise WspxError(f"gateway {path}: {r.text[:300]}")
         return r.json()
 
+    def keys(self) -> dict[str, Any]:
+        data: dict[str, Any] = self._req("GET", "/admin/keys")["keys"]
+        return data
+
+    def recycle(self) -> bool:
+        return bool(self._req("POST", "/admin/recycle")["recycled"])
+
     def limits(self) -> list[dict[str, Any]]:
         data: list[dict[str, Any]] = self._req("GET", "/admin/limits")["limits"]
         return data

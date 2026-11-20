@@ -65,6 +65,13 @@ class Control:
         data: dict[str, Any] = self._req("POST", f"/api/sessions/{sid}/{action}", json=body)
         return data
 
+    def keys(self) -> dict[str, Any]:
+        data: dict[str, Any] = self._req("GET", "/api/keys")["keys"]
+        return data
+
+    def reload_keys(self) -> bool:
+        return bool(self._req("POST", "/api/keys/reload")["reloaded"])
+
     def limits(self) -> list[dict[str, Any]]:
         data: list[dict[str, Any]] = self._req("GET", "/api/limits")["limits"]
         return data

@@ -420,3 +420,28 @@ def test_price_table_fallbacks() -> None:
     assert table.get("anthropic", "claude-opus-5-5-fast") == OPUS
     assert table.get("openai", "gpt-x") == Price(1, 2)
     assert table.get("openai", "gpt-unknown") is None
+
+
+def test_keys_are_checked_without_being_revealed(setup) -> None:  # type: ignore[no-untyped-def]
+    client, upstream, _ = setup
+
+    def reply(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "api.openai.com":
+            return httpx.Response(401, json={"error": {"message": "invalid key"}})
+        return httpx.Response(200, json={"data": []})
+
+    upstream.reply = reply
+    assert client.get("/admin/keys").status_code == 401
+    keys = admin(client, "GET", "keys").json()["keys"]
+    assert keys["anthropic"] == {"set": True, "ok": True}
+    assert keys["google"] == {"set": True, "ok": True}
+    assert keys["openai"]["ok"] is False
+    assert "401" in keys["openai"]["detail"]
+    assert keys["hf-router"] == {"set": False}
+    assert "sk-real" not in json.dumps(keys)
+    sent = {r.url.host: r for r in upstream.requests}
+    assert sent["api.anthropic.com"].headers["x-api-key"] == "sk-real"
+    assert sent["api.anthropic.com"].method == "GET"
+
+    # outside Modal there is no container to recycle; the gateway says so
+    assert admin(client, "POST", "recycle").json()["recycled"] is False

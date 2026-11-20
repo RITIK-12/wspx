@@ -68,14 +68,27 @@ def set_key(provider: str, value: str) -> None:
         raise ValueError("the key is empty")
     ensure_environment()
     name, var = KEY_SECRETS[provider]
+    _write_secret(name, {var: value})
+
+
+def _write_secret(name: str, values: dict[str, str]) -> None:
+    """Create or overwrite a secret in place, over the API (values never reach argv)."""
     import modal
 
     # The overwrite path `modal secret create --force` uses; fall back to the CLI if it moves.
     create_deployed = getattr(modal.Secret, "_create_deployed", None)
     if create_deployed is None:
-        _modal("secret", "create", name, f"{var}={value}", "--env", ENVIRONMENT, "--force")
+        pairs = [f"{k}={v}" for k, v in values.items()]
+        _modal("secret", "create", name, *pairs, "--env", ENVIRONMENT, "--force")
         return
-    create_deployed(name, {var: value}, environment_name=ENVIRONMENT, overwrite=True)
+    create_deployed(name, values, environment_name=ENVIRONMENT, overwrite=True)
+
+
+def remove_key(provider: str) -> None:
+    """Empty a provider's secret (it must keep existing: deployed functions reference it)."""
+    if provider not in KEY_SECRETS:
+        raise ValueError(f"unknown provider {provider!r}; use one of {', '.join(KEY_SECRETS)}")
+    _write_secret(KEY_SECRETS[provider][0], {"WSPX_UNSET": "1"})
 
 
 def deploy() -> Deployment:  # pragma: no cover - needs a Modal account

@@ -99,33 +99,76 @@ def login() -> None:
     raise typer.Exit(subprocess.call([sys.executable, "-m", "modal", "token", "new"]))
 
 
+PROVIDERS = "anthropic, openai, google or hf"
+SPEND_CAPS = {
+    "anthropic": "https://platform.claude.com/settings/limits",
+    "openai": "https://platform.openai.com/settings/organization/limits",
+    "google": "https://aistudio.google.com/spend",
+}
+
+
+def _reload_keys() -> str:
+    """Make a running deployment pick up changed keys; says what happened."""
+    cfg = cli_config.load()
+    if not (cfg.url and cfg.token):
+        return "it is used once you run `wspx deploy`"
+    try:
+        reloaded = Control(cfg.url, cfg.token).reload_keys()
+    except WspxError:
+        return "the deployment did not answer; it takes effect on the next `wspx deploy`"
+    return "active now" if reloaded else "it takes effect when the gateway restarts"
+
+
 @keys_app.command("set")
-def keys_set(
-    provider: Annotated[str, typer.Argument(help="anthropic, openai, google or hf")],
-) -> None:
-    """Store a provider key as a Modal secret."""
+def keys_set(provider: Annotated[str, typer.Argument(help=PROVIDERS)]) -> None:
+    """Store a provider key once; every session and project uses it."""
     from modal.exception import Error as ModalError
 
     from wspx.cloud.deploy import set_key
 
-    links = {
-        "anthropic": "https://platform.claude.com/settings/limits",
-        "openai": "https://platform.openai.com/settings/organization/limits",
-        "google": "https://aistudio.google.com/spend",
-    }
     value = typer.prompt(f"{provider} key", hide_input=True)
     try:
         set_key(provider, value)
     except (ValueError, subprocess.CalledProcessError, ModalError) as exc:
         _fail(exc)
-    typer.echo(
-        f"stored the {provider} key in your Modal account; it takes effect when the gateway restarts "
-        "(or run `wspx deploy`)."
-    )
-    if provider in links:
-        typer.echo(
-            f"tip: a hard monthly cap can also be set in {provider}'s console: {links[provider]}"
-        )
+    typer.echo(f"stored the {provider} key in your Modal account; {_reload_keys()}")
+    if provider in SPEND_CAPS:
+        typer.echo(f"tip: {provider} can also cap spend on its side: {SPEND_CAPS[provider]}")
+
+
+@keys_app.command("rm")
+def keys_rm(provider: Annotated[str, typer.Argument(help=PROVIDERS)]) -> None:
+    """Remove a provider key."""
+    from modal.exception import Error as ModalError
+
+    from wspx.cloud.deploy import remove_key
+
+    try:
+        remove_key(provider)
+    except (ValueError, subprocess.CalledProcessError, ModalError) as exc:
+        _fail(exc)
+    typer.echo(f"removed the {provider} key; {_reload_keys()}")
+
+
+@keys_app.command("list")
+def keys_list() -> None:
+    """Which keys are set and whether each works (checked with a free API call)."""
+    try:
+        keys = _control().keys()
+    except WspxError as exc:
+        _fail(exc)
+        return
+    names = {"hf-router": "hf"}
+    for provider, state in keys.items():
+        if not state.get("set"):
+            status = "not set"
+        elif state.get("ok"):
+            status = "ok"
+        elif state.get("ok") is None:
+            status = f"set, not checked ({state.get('detail', '')})"
+        else:
+            status = f"rejected ({state.get('detail', '')})"
+        typer.echo(f"{names.get(provider, provider):<10} {status}")
 
 
 @app.command()

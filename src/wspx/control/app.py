@@ -359,6 +359,14 @@ def create_app(
             raise HTTPException(503, "no gateway configured")
         return manager.gateway
 
+    @app.get("/api/keys", dependencies=[Depends(user)])
+    def get_keys() -> dict[str, Any]:
+        return {"keys": guarded(lambda: need_gateway().keys())}
+
+    @app.post("/api/keys/reload", dependencies=[Depends(user)])
+    def reload_keys() -> dict[str, Any]:
+        return {"reloaded": guarded(lambda: need_gateway().recycle())}
+
     @app.get("/api/limits", dependencies=[Depends(user)])
     def get_limits() -> dict[str, Any]:
         return {"limits": guarded(lambda: need_gateway().limits())}

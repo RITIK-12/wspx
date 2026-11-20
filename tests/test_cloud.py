@@ -93,6 +93,8 @@ def test_set_key_uses_the_api_not_argv(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ("environment", "create", "wspx") in argv  # works before the first deploy
     assert not any("sk-test-value" in " ".join(a) for a in argv)
     assert created == [("wspx-key-anthropic", {"ANTHROPIC_API_KEY": "sk-test-value"}, "wspx", True)]
+    deploy.remove_key("anthropic")  # the secret stays (functions reference it), emptied
+    assert created[-1] == ("wspx-key-anthropic", {"WSPX_UNSET": "1"}, "wspx", True)
     with pytest.raises(ValueError, match="empty"):
         deploy.set_key("anthropic", "   ")
     with pytest.raises(ValueError, match="unknown provider"):
