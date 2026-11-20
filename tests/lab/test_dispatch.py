@@ -331,3 +331,10 @@ def test_branches_of_other_models_are_not_this_models(tmp_path: Path) -> None:  
     assert "first-side" not in other.repo.branches()
     listed = views.commits(other.store, other.ir.fingerprint, "s_other2")["commits"]
     assert listed == []
+
+
+def test_sigma_thresholds_say_what_they_came_to(lab) -> None:  # type: ignore[no-untyped-def]
+    """Seen live: hits scored 3.83 under "colnorm > 4σ"; the scores are raw, the bar is not 4."""
+    hits = call(lab, "grep", {"expression": "colnorm > 1σ", "in": "L*.mlp.down", "top": 2})
+    assert "threshold 1σ = " in hits.summary
+    assert "(mean " in hits.summary

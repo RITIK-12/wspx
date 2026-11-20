@@ -1270,7 +1270,13 @@ class Lab:
         return ToolResult(
             f"merged {branch} as {commit.short} [{status}] · {len(both)} tensor(s) changed on "
             f"both sides"
-            + (f" ({strategies_used})" if strategies_used else "")
+            + (
+                f" ({strategies_used})"
+                if strategies_used
+                else " (neither side added patches the other also added, so no strategy was needed)"
+                if both
+                else ""
+            )
             + f" · {kl_text}"
             + (f"\nneeds review: {'; '.join(review)}" if review else ""),
             {"commit": commit.oid, "merge": info},
@@ -1506,6 +1512,8 @@ class GrepHits:
                 else ""
             )
         tail = f"{head} · {r.seconds * 1000:.0f} ms · saved as {self.handle}"
+        if r.thresholds:  # scores are raw values; say what they were compared against
+            tail += "\nthreshold " + "; ".join(r.thresholds)
         if r.skipped:
             tail += (
                 f"\nskipped {len(r.skipped)} tensor(s) with no {r.axis} units: "

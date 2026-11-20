@@ -676,6 +676,8 @@ class GrepResult:
     seconds: float = 0.0
     skipped: list[str] = field(default_factory=list)
     """Tensors in the scope that could not be split into units (convolutions, vectors)."""
+    thresholds: list[str] = field(default_factory=list)
+    """What each σ threshold came to: scores are raw values, compared against these."""
 
 
 def grep(
@@ -708,6 +710,7 @@ def grep(
         raise GrepError("scope contains no weights")
 
     # σ thresholds need the population of the left side across the whole scope.
+    thresholds: list[str] = []
     for node in _sigma_nodes(tree):
         values = torch.cat([_flat(_Eval(env, b).eval(node.left), b) for b in batches])
         mu, sd = (
@@ -717,6 +720,10 @@ def grep(
         right = node.right
         assert isinstance(right, Num)
         env._cache[f"sigma:{id(node)}"] = torch.tensor(mu + right.value * sd)
+        thresholds.append(
+            f"{right.value:g}σ = {mu + right.value * sd:.4g} (mean {mu:.4g} + {right.value:g} × "
+            f"std {sd:.4g} over the scope)"
+        )
 
     scores: list[Hit] = []
     hits: list[Hit] = []
@@ -756,6 +763,7 @@ def grep(
         scores,
         time.perf_counter() - started,
         skipped,
+        thresholds,
     )
 
 

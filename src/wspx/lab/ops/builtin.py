@@ -252,8 +252,9 @@ def bake_steer(ctx: OpContext, direction: Any, *, scale: float, at: int | str) -
         rows = ctx.weight(embed).float().norm(dim=-1).median()
         hint = (
             f". at=0 shifts every token embedding instead: that is before block 0, not after "
-            f"block {at}, so a direction measured at L{at} may mean something else there, and "
-            f"scale is an absolute norm (embedding rows have median norm {float(rows):.3g})"
+            f"block {at}, so a direction found deeper in the model may mean something else "
+            f"there, and scale is an absolute norm (embedding rows have median norm "
+            f"{float(rows):.3g})"
         )
     raise PatchError(f"block {at} has no writer bias to carry a steering vector ({where}){hint}")
 

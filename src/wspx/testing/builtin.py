@@ -112,7 +112,7 @@ def regression_suite() -> Suite:
             score=-ppl,
         )
         for i, (prompt, target) in enumerate(COPYING):
-            out = model.generate(prompt, max_tokens=12)
+            out = model.generate(prompt, max_tokens=32)  # room for an echoed instruction
             c = expect.contains(out, target)
             c.item = f"copy-{i}"
             yield c
@@ -133,7 +133,7 @@ def regression_suite() -> Suite:
             c.item = f"refusal-{i}"
             yield c
 
-    return Suite("regression", run, "dev", 0, "builtin:regression/1")
+    return Suite("regression", run, "dev", 0, "builtin:regression/2")
 
 
 BUILTIN = {"canary": canary_suite, "regression": regression_suite}

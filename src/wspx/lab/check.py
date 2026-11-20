@@ -335,8 +335,12 @@ def numeric_check(ir: ModelIR, tree: WorkingTree, plan: EditPlan, cfg: CheckSect
         add(
             diag(
                 Code.DENSE_EDIT,
-                f"edit changes {frac:.1%} of all parameter values",
-                detail=["broad edits are more likely to have side effects than narrow ones"],
+                f"edit changes {frac:.1%} of all parameter values ({touched:,} of {total_numel:,})",
+                detail=[
+                    "counted after rounding to the stored dtype: values whose change rounds "
+                    "away are not included",
+                    "broad edits are more likely to have side effects than narrow ones",
+                ],
                 severity=Severity.WARNING,
                 fixes=[Fix(title="narrow it: fewer tensors, rows or columns")],
             )
