@@ -37,3 +37,6 @@ htmlcov/
 
 # Local design notes (not part of the distribution)
 harness-plan.md
+
+# UI build dependencies (the built bundle lives in src/wspx/control/ui)
+ui/node_modules/
