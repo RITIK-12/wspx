@@ -457,3 +457,43 @@ def test_setting_a_limit_replaces_the_one_on_the_same_thing(tmp_path: Path) -> N
         ("day", "dollars", 10.0),
         ("session", "calls", 400.0),
     ]
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        (
+            "anthropic/v1/messages",
+            {"tools": [{"type": "web_search_20260209", "name": "web_search"}]},
+        ),
+        ("anthropic/v1/messages", {"tools": [{"type": "web_fetch_20260209", "name": "web_fetch"}]}),
+        ("anthropic/v1/messages", {"tools": [{"type": "code_execution_20250825", "name": "x"}]}),
+        (
+            "anthropic/v1/messages",
+            {"mcp_servers": [{"type": "url", "url": "https://x", "name": "m"}]},
+        ),
+        ("anthropic/v1/messages", {"container": "cntr_1"}),
+        ("openai/v1/responses", {"tools": [{"type": "web_search"}]}),
+        ("openai/v1/responses", {"tools": [{"type": "mcp", "server_url": "https://x"}]}),
+        ("openai/v1/chat/completions", {"web_search_options": {}}),
+        ("google/v1beta/models/gemini-3:generateContent", {"tools": [{"googleSearch": {}}]}),
+        ("google/v1beta/models/gemini-3:generateContent", {"tools": [{"codeExecution": {}}]}),
+    ],
+)
+def test_provider_run_tools_never_reach_the_provider(setup, path: str, body: dict) -> None:  # type: ignore[no-untyped-def,type-arg]
+    client, upstream, _ = setup
+    full = {"model": "claude-opus-5-5", "max_tokens": 10, "messages": [], **body}
+    r = call(client, body=full, path=path)
+    assert r.status_code == 403
+    assert r.json()["error"]["type"] == "wspx_server_tools"
+    assert upstream.requests == []
+
+
+def test_custom_tools_pass(setup) -> None:  # type: ignore[no-untyped-def]
+    client, upstream, _ = setup
+    tools = [{"name": "info", "description": "d", "input_schema": {"type": "object"}}]
+    r = call(
+        client, body={"model": "claude-opus-5-5", "max_tokens": 10, "messages": [], "tools": tools}
+    )
+    assert r.status_code == 200
+    assert len(upstream.requests) == 1

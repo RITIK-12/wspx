@@ -262,3 +262,80 @@ def test_a_lab_is_given_up_on_after_several_missed_heartbeats(tmp_path: Path) ->
     assert sid not in m.labs
     assert lab.stopped  # terminated, not just forgotten
     assert m.get(sid).tier == "cold"
+
+
+# --------------------------------------------------------------------------- experiment guards
+
+
+def test_denied_tools_are_refused_for_the_driver_and_recorded(tmp_path: Path) -> None:
+    m, backend = manager(tmp_path)
+    backend.ready.set()
+    with pytest.raises(WspxError, match="no tool 'browse'"):
+        m.create(model="x", tools_deny=["browse"])
+    record = m.create(model="x", driver="anthropic:claude-opus-5-5", tools_deny=["run", "export"])
+    m.lab(record.id)
+    out = m.tool(record.id, "run", {"script": "a.py"}, source="driver")
+    assert not out["ok"]
+    assert "turned off" in out["summary"]
+    assert m.tool(record.id, "run", {"script": "a.py"}, source="human")["ok"]
+    assert m.tool(record.id, "info", {}, source="driver")["ok"]
+    calls = [e for e in m.trace.events(record.id) if e["kind"] == "tool_call"]
+    assert any(e["payload"]["tool"] == "run" and not e["payload"]["ok"] for e in calls)
+    m.start_driver(record.id)
+    created = next(e for e in m.trace.events(record.id) if e["kind"] == "session")
+    assert created["payload"]["tools_deny"] == ["export", "run"]
+
+
+def test_gpu_time_runs_out_and_stops_the_driver_and_lab(tmp_path: Path) -> None:
+    m, backend = manager(tmp_path)
+    backend.ready.set()
+    record = m.create(model="x", driver="anthropic:claude-opus-5-5", max_lab_s=600)
+    m.lab(record.id)
+    m.start_driver(record.id)
+    assert "[GPU time left: 10 min of 10 min]" in m.tool(record.id, "info", {})["summary"]
+    assert record.lab_since is not None
+    m.tick(now=record.lab_since + 300)
+    assert record.id in m.labs
+    m.tick(now=record.lab_since + 601)
+    assert record.id not in m.labs
+    assert record.status == "stopped"
+    assert "GPU time" in record.reason
+    assert not backend.runners[-1].running
+    assert record.lab_seconds >= 600
+    with pytest.raises(WspxError, match="used its GPU time"):
+        m.lab(record.id)
+
+
+def test_gpu_time_adds_up_over_labs(tmp_path: Path) -> None:
+    m, backend = manager(tmp_path)
+    backend.ready.set()
+    record = m.create(model="x", max_lab_s=3600)
+    m.lab(record.id)
+    record.lab_since = time.time() - 100  # this lab ran 100 s
+    m.stop_lab(record.id, "test")
+    assert 99 < record.lab_seconds < 110
+    assert record.lab_since is None
+    m.lab(record.id)
+    record.lab_since = time.time() - 50
+    assert 149 < record.lab_used(time.time()) < 165
+    stop = [
+        e for e in m.trace.events(record.id) if e["kind"] == "lab" and "gpu_seconds" in e["payload"]
+    ]
+    assert stop
+    assert stop[0]["payload"]["gpu_seconds"] >= 99
+
+
+def test_the_lab_network_check_is_recorded(tmp_path: Path) -> None:
+    class Checked(FakeLab):
+        def heartbeat(self, lease_s: float) -> dict[str, Any]:
+            return {"network": "blocked"}
+
+    m, backend = manager(tmp_path)
+    backend.ready.set()
+    backend.start_lab = lambda record, cancelled: Checked()  # type: ignore[method-assign]
+    record = m.create(model="x")
+    m.lab(record.id)
+    hot = [
+        e for e in m.trace.events(record.id) if e["kind"] == "lab" and e["payload"]["tier"] == "hot"
+    ]
+    assert hot[-1]["payload"]["network"] == "blocked"

@@ -106,6 +106,9 @@ class GatewayConfig:
     loop_window: int = 10
     loops_enabled: bool = True
     transport: httpx.AsyncBaseTransport | None = None
+    allow_server_tools: bool = False
+    """Off by default: a driver gets wspx's tools only, never the provider's web search,
+    web fetch, code execution or MCP connectors (which would reach outside the harness)."""
 
     @classmethod
     def from_env(cls) -> GatewayConfig:
@@ -126,6 +129,7 @@ class GatewayConfig:
             ledger_path=os.environ.get("WSPX_LEDGER", "/ledger/ledger.db"),
             keys=keys,
             compat=compat,
+            allow_server_tools=os.environ.get("WSPX_ALLOW_SERVER_TOOLS", "") == "1",
         )
 
 
@@ -186,6 +190,9 @@ def create_app(config: GatewayConfig) -> Starlette:
             call = describe(config, provider, path, body)
         except ValueError as exc:
             return error(404, "wspx_route", str(exc))
+        if not config.allow_server_tools and (reason := reaches_outside(provider, body)):
+            print(f"wspx gateway: refused a {provider} call from {session}: {reason}", flush=True)
+            return error(403, "wspx_server_tools", reason)
         key = config.keys.get(provider) if provider != "compat" else None
         if provider == "compat":
             key = config.compat[path.split("/", 1)[0]][1]
@@ -496,6 +503,50 @@ def create_app(config: GatewayConfig) -> Starlette:
 # --------------------------------------------------------------------------- request shapes
 
 _GEMINI_RE = re.compile(r"models/(?P<model>[^/:]+):(?P<method>\w+)")
+
+
+_OPENAI_TOOL_TYPES = {"function", "custom"}
+_GEMINI_TOOL_KEYS = {"functionDeclarations", "function_declarations"}
+
+
+def reaches_outside(provider: str, body: bytes) -> str | None:
+    """Why a request would reach past the harness (a provider-run tool), or None.
+
+    Custom tools are fine: the harness runs them. Provider-run ("server") tools are not:
+    web search and fetch, code execution, MCP connectors, containers and the like.
+    """
+    try:
+        data = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    tools = data.get("tools") or []
+    if provider == "anthropic":
+        for key in ("mcp_servers", "container"):
+            if data.get(key):
+                return f"{key} is not allowed: drivers get wspx's tools only"
+        for tool in tools:
+            kind = tool.get("type") if isinstance(tool, dict) else None
+            if kind not in (None, "custom"):
+                return f"provider-run tool {kind!r} is not allowed: drivers get wspx's tools only"
+        return None
+    if provider == "google":
+        for tool in tools:
+            extra = set(tool) - _GEMINI_TOOL_KEYS if isinstance(tool, dict) else {"?"}
+            if extra:
+                return (
+                    f"provider-run tool {sorted(extra)[0]!r} is not allowed: drivers get wspx's "
+                    "tools only"
+                )
+        return None
+    if "web_search_options" in data:
+        return "web_search_options is not allowed: drivers get wspx's tools only"
+    for tool in tools:
+        kind = tool.get("type") if isinstance(tool, dict) else None
+        if kind not in _OPENAI_TOOL_TYPES:
+            return f"provider-run tool {kind!r} is not allowed: drivers get wspx's tools only"
+    return None
 
 
 def describe(config: GatewayConfig, provider: str, path: str, body: bytes) -> Call:

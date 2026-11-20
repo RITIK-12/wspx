@@ -210,3 +210,51 @@ def test_a_limit_pauses_the_session_rather_than_failing_it() -> None:
     assert "wspx resume" in result.reason
     start = h.events[0]  # type: ignore[attr-defined]
     assert (start["type"], start["message"]) == ("start", "task")  # the trace starts at the start
+
+
+def test_denied_tools_are_not_offered() -> None:
+    class Offering(Scripted):
+        def tools(self) -> list[dict[str, Any]]:
+            return [
+                {"name": "info"},
+                {"name": "run"},
+                {"type": "function", "function": {"name": "export"}},
+            ]
+
+    provider = Offering([done()])
+    runner = Runner(
+        provider, hooks(), RunnerConfig("sys", "task", deny=frozenset({"run", "export"}))
+    )
+    assert runner._tools == [{"name": "info"}]
+    runner.run()
+    start = next(e for e in runner.hooks.events if e["type"] == "start")  # type: ignore[attr-defined]
+    assert "run" not in start["tools"]
+    assert "export" not in start["tools"]
+    assert "info" in start["tools"]
+
+
+def test_the_runner_reads_denied_tools_from_its_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from wspx.driver import run
+
+    seen: dict[str, Any] = {}
+
+    class Capture:
+        def __init__(self, provider: Any, hooks: Any, config: RunnerConfig) -> None:
+            seen["deny"] = config.deny
+
+        def run(self) -> Any:
+            return None
+
+    monkeypatch.setattr(run, "Runner", Capture)
+    env = {
+        "WSPX_CONTROL_URL": "http://c",
+        "WSPX_GATEWAY_URL": "http://g",
+        "WSPX_SESSION": "s",
+        "WSPX_RUNNER_TOKEN": "r",
+        "WSPX_LLM_TOKEN": "l",
+        "WSPX_TOOLS_DENY": "run,export",
+    }
+    run.run_from_env(env, provider=Scripted([]))
+    assert seen["deny"] == frozenset({"run", "export"})

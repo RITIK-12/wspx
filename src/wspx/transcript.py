@@ -113,6 +113,10 @@ def _event(e: dict[str, Any]) -> list[str]:
         ]
     if kind == "lab":
         extra = f" in {p['load_seconds']:.0f} s" if p.get("load_seconds") else ""
+        if p.get("network"):
+            extra += f" · outbound network {p['network']}"
+        if p.get("gpu_seconds") is not None:
+            extra += f" · {p['gpu_seconds'] / 60:.1f} GPU min used"
         return [
             f"- {at} lab {p.get('tier')}{extra}" + (f": {p['reason']}" if p.get("reason") else "")
         ]

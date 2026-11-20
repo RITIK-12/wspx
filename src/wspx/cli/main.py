@@ -274,6 +274,18 @@ def new(
     branch: Annotated[str | None, typer.Option("--branch")] = None,
     revision: Annotated[str | None, typer.Option("--revision")] = None,
     trust_remote_code: Annotated[bool, typer.Option("--trust-remote-code")] = False,
+    deny_tool: Annotated[
+        list[str] | None,
+        typer.Option("--deny-tool", help="A tool the driver may not use (repeatable), e.g. run."),
+    ] = None,
+    max_gpu_time: Annotated[
+        str | None,
+        typer.Option("--max-gpu-time", help="GPU time for the session, load included, e.g. 100m."),
+    ] = None,
+    grace: Annotated[
+        str | None,
+        typer.Option("--grace", help="Release the GPU after this long idle, e.g. 5m."),
+    ] = None,
 ) -> None:
     """Start a session. Inside a project, wspx.toml supplies the defaults and the lab gets its files."""
     from wspx.config import WspxConfig
@@ -296,10 +308,14 @@ def new(
             revision=revision or cfg.model.revision,
             dtype=cfg.model.dtype,
             trust_remote_code=trust_remote_code or cfg.model.trust_remote_code,
-            grace_s=cfg.lab.grace,
+            grace_s=_duration(grace, "--grace") if grace else cfg.lab.grace,
             keep_warm=cfg.lab.keep_warm,
             project=project.name if project else "",
             snapshot=snapshot,
+            tools_deny=sorted(set(deny_tool or []) | set(cfg.driver.deny_tools)),
+            max_lab_s=(
+                _duration(max_gpu_time, "--max-gpu-time") if max_gpu_time else cfg.lab.max_gpu_time
+            ),
         )
     except WspxError as exc:
         _fail(exc)
@@ -932,3 +948,12 @@ def hook_codex() -> None:
 
 if __name__ == "__main__":
     app()
+
+
+def _duration(text: str, flag: str) -> float:
+    from wspx.config import parse_duration
+
+    try:
+        return parse_duration(text)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint=flag) from None

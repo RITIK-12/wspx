@@ -61,6 +61,8 @@ class RunnerConfig:
     stuck_after: int = 3
     max_turns: int | None = None
     """No default: long experiments are never cut off by the runner."""
+    deny: frozenset[str] = frozenset()
+    """Tools this session turned off: the model is not offered them."""
 
 
 @dataclass
@@ -80,7 +82,7 @@ class Runner:
         self.history: list[Message] = []
         self.turns = 0
         self._recent: list[tuple[str, tuple[str, ...]]] = []
-        self._tools = provider.tools()
+        self._tools = [t for t in provider.tools() if _tool_name(t) not in config.deny]
 
     def run(self) -> RunResult:
         workspace = self.hooks.workspace()
@@ -94,7 +96,7 @@ class Runner:
                 "effort": self.config.effort,
                 "max_tokens": self.config.max_tokens,
                 "compact_at": self.config.compact_at,
-                "tools": sorted(TOOLS),
+                "tools": sorted(n for n in TOOLS if n not in self.config.deny),
                 "system": self.config.system,
                 "message": first,
             }
@@ -285,3 +287,8 @@ def _limit_message(text: str) -> str:
     """The gateway's own words from a limit refusal (``'message': '...'``), else the text."""
     match = re.search(r"'message': '([^']*)'", text) or re.search(r'"message": "([^"]*)"', text)
     return match.group(1) if match else text[:300]
+
+
+def _tool_name(tool: dict[str, Any]) -> str:
+    """A provider tool definition's name (Chat Completions nests it under ``function``)."""
+    return str(tool.get("name") or (tool.get("function") or {}).get("name") or "")

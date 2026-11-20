@@ -121,8 +121,12 @@ def run_from_env(
         provider = make_provider(
             env["WSPX_DRIVER"], gateway=env["WSPX_GATEWAY_URL"], token=env["WSPX_LLM_TOKEN"]
         )
+    deny = frozenset(t for t in env.get("WSPX_TOOLS_DENY", "").split(",") if t)
     config = RunnerConfig(
-        system=skill_text(), task=env.get("WSPX_TASK", ""), effort=env.get("WSPX_EFFORT", "high")
+        system=skill_text(),
+        task=env.get("WSPX_TASK", ""),
+        effort=env.get("WSPX_EFFORT", "high"),
+        deny=deny,
     )
     return Runner(provider, hooks.hooks(), config).run()
 

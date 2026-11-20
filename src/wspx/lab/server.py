@@ -72,6 +72,8 @@ class LabServer:
         self._lock = threading.Lock()
         self.started = time.time()
         self.calls = 0
+        self.network = ""
+        """What the startup check found: ``blocked`` when nothing outside answers."""
 
     # ------------------------------------------------------------------ lease
 
@@ -126,6 +128,7 @@ class LabServer:
                     "lease_expires": self.lease_expires,
                     "uptime": time.time() - self.started,
                     "calls": self.calls,
+                    "network": self.network,
                 }
             )
 
@@ -149,6 +152,7 @@ class LabServer:
                     "journal": journal,
                     "workspace": workspace,
                     "fingerprint": self.lab.ir.fingerprint,
+                    "network": self.network,
                 }
             )
 
@@ -183,6 +187,32 @@ class LabServer:
                 Route("/tool/{name:str}", tool, methods=["POST"]),
             ]
         )
+
+
+NETWORK_PROBES = [
+    ("1.1.1.1", 443),
+    ("8.8.8.8", 53),
+    ("huggingface.co", 443),
+    ("api.anthropic.com", 443),
+]
+
+
+def network_check(timeout: float = 3.0) -> str:
+    """Try to open a connection to a few public hosts: ``blocked`` when none answers.
+
+    The result is recorded with the lab's start in the session's trace, as evidence of what
+    the lab could reach.
+    """
+    import socket
+
+    reached = []
+    for host, port in NETWORK_PROBES:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                reached.append(f"{host}:{port}")
+        except OSError:
+            continue
+    return "blocked" if not reached else "open (reached " + ", ".join(reached) + ")"
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -233,8 +263,11 @@ def main(argv: list[str] | None = None) -> None:
         base_reader=loaded.base_reader if loaded.readable else None,
         workdir=workdir,
         config=WspxConfig.discover(workdir),
+        processor=loaded.processor,
     )
     server = LabServer(lab, lease_s=args.lease, token=os.environ.get("WSPX_LAB_TOKEN"))
+    server.network = network_check()
+    print(f"wspx lab: outbound network {server.network}", file=sys.stderr, flush=True)
     server.watchdog()
     uvicorn.run(server.app(), host="0.0.0.0", port=args.port, log_level="warning")
 

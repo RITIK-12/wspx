@@ -85,6 +85,8 @@ class NewSession(BaseModel):
     keep_warm: str = "auto"
     project: str = ""
     snapshot: str | None = Field(None, pattern=r"^sha256:[0-9a-f]{64}$")
+    tools_deny: list[str] = Field(default_factory=list)
+    max_lab_s: float | None = Field(None, gt=0)
 
 
 class ToolCall(BaseModel):

@@ -129,7 +129,36 @@ def math_finishes(model):
 
 `wspx test --vs <revision>` runs them item by item against another revision and
 reports confidence intervals. Suites with `split="heldout"` show the agent only
-aggregate scores. The built-in `canary` and `regression` suites need no data.
+aggregate scores. `@suite(blind=True)` does the same for a suite the agent may run
+as often as it likes. A check's `group` (say, the class) adds a pass rate per
+group and balanced accuracy. The built-in `canary` and `regression` suites need no
+data.
+
+Tools cannot read files in the test folders, so a suite's answers stay with the
+suite. Prompts the agent may use go in `prompts/<set>.jsonl`, one per line, and
+are referenced as `{"item": "<set>/<n>"}`.
+
+On vision-language models, prompts can carry images and video as chat messages:
+
+```python
+q = {
+    "messages": [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": "prompts/frame.png"},
+                {"type": "text", "text": "Is the cup on the plate?"},
+            ],
+        }
+    ]
+}
+out = model.generate(q, max_tokens=64)
+answers = model.generate_many([q] * 8, max_tokens=64, watch=["yes", "no"])
+```
+
+A video is `{"type": "video", "video": "clip.mp4"}` or a list of frame files.
+`generate_many` batches greedy answers and records the log-probability of the
+watched tokens at each step.
 
 ## Configuration
 
@@ -146,10 +175,12 @@ dtype = "bfloat16"
 
 [driver]
 model = "anthropic:claude-opus-5-5"
+deny_tools = ["run"]        # tools the agent is not offered
 
 [lab]
 gpu = "L4"
 grace = "15m"               # keep the lab warm this long after the session goes idle
+max_gpu_time = "2h"         # then the session's agent and lab stop
 
 [check]
 max_rel_norm = 0.05
@@ -157,6 +188,7 @@ max_canary_kl = 0.10
 
 [tests]
 paths = ["wtests/"]
+prompts = "prompts/"
 
 [policy]
 protected_branches = ["main"]
@@ -183,7 +215,12 @@ wspx kill --hard            # with only your Modal token, even if the deployment
 wspx resume
 ```
 
-Labs run in Modal sandboxes with no network access and no secrets.
+Labs run in Modal sandboxes with no network access and no secrets; each lab
+checks this when it starts and the result is in the session's trace. The gateway
+refuses model calls that ask for the provider's own tools (web search, web
+fetch, code execution, MCP connectors), so an agent only has wspx's tools.
+`wspx new --deny-tool run --max-gpu-time 2h --grace 5m` turns tools off and caps
+GPU time for one session.
 
 ## Supported models
 
@@ -193,7 +230,7 @@ Falcon, Mixtral, gpt-oss, DeepSeek-V3, Jamba, Bamba, Mamba, ViT and ResNet, and
 plain MLPs, CNNs, LSTMs and GRUs.
 
 Vision-language checkpoints (Qwen3-VL, GLM-4.1V, Qwen3.5, Gemma 3) load with
-their vision tower; the tools work on the language model with text prompts.
+their vision tower and processor, and take text, image and video prompts.
 
 ## Development
 

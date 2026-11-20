@@ -79,6 +79,9 @@ class SessionManager:
             record.tier = "cold"
             if record.status == "starting":  # nothing is queued across a restart
                 record.status = "idle"
+            if record.lab_since is not None:  # its lab did not survive the restart: count it all
+                record.lab_seconds = record.lab_used(time.time())
+                record.lab_since = None
             self.records[record.id] = record
 
     # ------------------------------------------------------------------ sessions
@@ -98,11 +101,18 @@ class SessionManager:
         keep_warm: str = "auto",
         project: str = "",
         snapshot: str | None = None,
+        tools_deny: list[str] | None = None,
+        max_lab_s: float | None = None,
     ) -> SessionRecord:
         if self.halted:
             raise WspxError("wspx is halted; `wspx resume` first")
         if snapshot is not None and not self.store.objects.has(snapshot):
             raise WspxError(f"project snapshot {snapshot[:12]} was not uploaded")
+        unknown = sorted(set(tools_deny or []) - set(TOOLS))
+        if unknown:
+            raise WspxError(f"no tool {unknown[0]!r} to turn off; tools: {', '.join(TOOLS)}")
+        if max_lab_s is not None and max_lab_s <= 0:
+            raise WspxError("the GPU time limit must be positive")
         sid = "s_" + secrets.token_hex(4)
         record = SessionRecord(
             sid,
@@ -120,11 +130,24 @@ class SessionManager:
             snapshot=snapshot,
             created=time.time(),
             status="starting" if driver else "idle",
+            tools_deny=sorted(set(tools_deny or [])),
+            max_lab_s=max_lab_s,
         )
         self.records[sid] = record
         self._save(record)
         self.trace.event(
-            sid, "session", {"status": "created", "model": model, "driver": driver, "task": task}
+            sid,
+            "session",
+            {
+                "status": "created",
+                "model": model,
+                "driver": driver,
+                "task": task,
+                "gpu": gpu,
+                "grace_s": grace_s,
+                "tools_deny": record.tools_deny,
+                "max_lab_s": max_lab_s,
+            },
         )
         self.touch(sid)
         threading.Thread(target=self._prewarm, args=(sid,), daemon=True).start()
@@ -165,6 +188,7 @@ class SessionManager:
             "WSPX_GATEWAY_URL": self.gateway_url,
             "WSPX_RUNNER_TOKEN": mint(self.secret, sid, scope="runner"),
             "WSPX_LLM_TOKEN": mint(self.secret, sid, scope="llm"),
+            "WSPX_TOOLS_DENY": ",".join(record.tools_deny),
         }
         with self._lock:
             runner = self.runners.get(sid)
@@ -192,28 +216,47 @@ class SessionManager:
             if self._lab_gen[sid] != gen:
                 raise LabCancelled(self._lab_why.get(sid, f"{sid}'s lab was stopped"))
             record = self.get(sid)
+            if record.max_lab_s is not None and record.lab_seconds >= record.max_lab_s:
+                raise LabUnavailable(
+                    f"{sid} has used its GPU time ({_minutes(record.max_lab_s)}); "
+                    "start a new session to continue"
+                )
             self.trace.event(sid, "lab", {"tier": "starting"})
             started = time.time()
             try:
                 handle = self.backend.start_lab(record, cancelled=lambda: self._lab_gen[sid] != gen)
             except LabCancelled:
+                record.lab_seconds += time.time() - started
+                self._save(record)
                 self.trace.event(sid, "lab", {"tier": "cold", "reason": "start cancelled"})
                 raise
             except Exception as exc:
                 # fail the calls queued behind this start too, rather than each starting a lab
+                record.lab_seconds += time.time() - started
+                self._save(record)
                 self._lab_why[sid] = f"the lab failed to start: {exc}"
                 self._lab_gen[sid] += 1
                 self.trace.event(sid, "lab", {"tier": "cold", "reason": self._lab_why[sid]})
                 raise LabUnavailable(self._lab_why[sid]) from exc
             record.load_seconds = time.time() - started
             record.tier = "hot"
+            record.lab_since = started
             self.labs[sid] = handle
             self._save(record)
-            self._persist(sid, handle.heartbeat(LEASE_S))
-            self.trace.event(sid, "lab", {"tier": "hot", "load_seconds": record.load_seconds})
+            beat = handle.heartbeat(LEASE_S)
+            self._persist(sid, beat)
+            self.trace.event(
+                sid,
+                "lab",
+                {
+                    "tier": "hot",
+                    "load_seconds": record.load_seconds,
+                    **({"network": beat["network"]} if beat.get("network") else {}),
+                },
+            )
             return handle
 
-    def stop_lab(self, sid: str, reason: str) -> None:
+    def stop_lab(self, sid: str, reason: str, *, now: float | None = None) -> None:
         self._lab_why[sid] = f"{sid}'s lab was stopped"
         self._lab_gen[sid] += 1  # before the lock: a start in progress holds it until it gives up
         with self._lab_locks[sid]:
@@ -225,8 +268,12 @@ class SessionManager:
             handle.stop()
             record = self.get(sid)
             record.tier = "cold"
+            record.lab_seconds = record.lab_used(now or time.time())
+            record.lab_since = None
             self._save(record)
-            self.trace.event(sid, "lab", {"tier": "cold", "reason": reason})
+            self.trace.event(
+                sid, "lab", {"tier": "cold", "reason": reason, "gpu_seconds": record.lab_seconds}
+            )
 
     def _persist(self, sid: str, response: dict[str, Any]) -> None:
         journal = response.get("journal")
@@ -266,6 +313,19 @@ class SessionManager:
         if source == "driver" and record.status == "stopped":
             # a driver call still in flight when the session was stopped must not wake the lab
             return {"summary": f"{sid} was stopped", "ok": False, "handles": [], "data": {}}
+        if source == "driver" and name in record.tools_deny:
+            denied_id = call_id or "c_" + secrets.token_hex(5)
+            refusal: dict[str, Any] = {
+                "summary": f"{name} is turned off for this session",
+                "ok": False,
+                "handles": [],
+                "data": {},
+                "call_id": denied_id,
+            }
+            self.trace.tool_call(
+                sid, denied_id, name, args, refusal, turn=turn, latency=0.0, source=source
+            )
+            return refusal
         call_id = call_id or "c_" + secrets.token_hex(5)
         self.touch(sid)
         started = time.time()
@@ -286,6 +346,11 @@ class SessionManager:
             if note:
                 note = note.format(time.time() - started)
         latency = time.time() - started
+        if source == "driver" and record.max_lab_s is not None:
+            left = max(0.0, record.max_lab_s - record.lab_used(time.time()))
+            note = (note + " · " if note else "") + (
+                f"[GPU time left: {_minutes(left)} of {_minutes(record.max_lab_s)}]"
+            )
         result["summary"] = (result.get("summary") or "") + (f"\n{note}" if note else "")
         result["call_id"] = call_id
         result["summary"] += self._observe(sid, name, args, result, source)
@@ -430,6 +495,18 @@ class SessionManager:
             if record.driver:
                 self.start_driver(s)
 
+    def _end_driver(self, sid: str, reason: str) -> None:
+        """Stop the session's driver for good (its GPU time is used up)."""
+        record = self.get(sid)
+        record.status, record.reason = "stopped", reason
+        self._save(record)
+        self.command(sid, "stop", source="wspx")
+        with self._lock:
+            runner = self.runners.pop(sid, None)
+        if runner is not None:
+            runner.stop()
+        self.trace.event(sid, "session", {"status": "stopped", "reason": reason})
+
     def kill(self, sid: str | None = None) -> int:
         """Stop drivers, revoke leases and terminate labs. ``None`` kills everything and halts."""
         targets = [sid] if sid else list(self.records)
@@ -488,6 +565,13 @@ class SessionManager:
         now = now or time.time()
         for sid in list(self.labs):
             record = self.records[sid]
+            if record.max_lab_s is not None and record.lab_used(now) >= record.max_lab_s:
+                reason = f"used its GPU time ({_minutes(record.max_lab_s)})"
+                self._end_driver(sid, reason)
+                self.stop_lab(sid, reason, now=now)
+                record.lab_seconds = max(record.lab_seconds, record.max_lab_s)
+                self._save(record)
+                continue
             if self.active(sid, now) or record.keep_warm == "always":
                 self.idle_since.pop(sid, None)
                 record.tier = "hot"
@@ -508,3 +592,7 @@ class SessionManager:
                 self._missed.pop(sid, None)
                 # terminate it rather than forget it, or it keeps its GPU until the lease lapses
                 self.stop_lab(sid, f"lost: no heartbeat answered {MISSED_HEARTBEATS} times ({exc})")
+
+
+def _minutes(seconds: float) -> str:
+    return f"{seconds / 60:.0f} min" if seconds >= 60 else f"{seconds:.0f} s"

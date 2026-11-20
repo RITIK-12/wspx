@@ -39,6 +39,17 @@ class SessionRecord:
     reason: str = ""
     load_seconds: float | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+    tools_deny: list[str] = field(default_factory=list)
+    """Tools the driver may not call (it is not offered them either)."""
+    max_lab_s: float | None = None
+    """GPU time this session may use, over all its labs, load time included."""
+    lab_seconds: float = 0.0
+    """GPU time used by labs that have stopped."""
+    lab_since: float | None = None
+    """When the current lab started (None while cold)."""
+
+    def lab_used(self, now: float) -> float:
+        return self.lab_seconds + (now - self.lab_since if self.lab_since is not None else 0.0)
 
     def to_dict(self) -> dict[str, Any]:
         return dict(self.__dict__)

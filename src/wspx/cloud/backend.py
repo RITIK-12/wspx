@@ -106,7 +106,7 @@ class ModalBackend:
             image=lab_image,
             gpu=record.gpu,
             timeout=SANDBOX_MAX_S,
-            idle_timeout=int(record.grace_s) + 600,
+            idle_timeout=int(record.grace_s) + 120,  # a backstop: the control plane stops it first
             volumes={"/models": models_volume.read_only(), "/store": self.store_volume.read_only()},
             outbound_cidr_allowlist=[],  # an empty allowlist: no outbound network at all
             outbound_domain_allowlist=[],
