@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import traceback
-from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
@@ -19,8 +18,6 @@ def call(
     lab: Lab,
     name: str,
     arguments: dict[str, Any] | None = None,
-    *,
-    jobs: Callable[[str | None], ToolResult] | None = None,
 ) -> ToolResult:
     from wspx.lab.session import ToolResult
 
@@ -35,7 +32,7 @@ def call(
         )
         return ToolResult(f"{name}: invalid arguments: {problems}", ok=False)
     try:
-        return _run(lab, name, args, jobs)
+        return _run(lab, name, args)
     except CheckFailed as exc:
         text = "\n".join(d.render() for d in exc.diagnostics)
         return ToolResult(
@@ -50,9 +47,7 @@ def call(
         return ToolResult(f"{name} failed: {type(exc).__name__}: {exc}", ok=False)
 
 
-def _run(
-    lab: Lab, name: str, a: Any, jobs: Callable[[str | None], ToolResult] | None
-) -> ToolResult:
+def _run(lab: Lab, name: str, a: Any) -> ToolResult:
     from wspx.lab.session import ToolResult
 
     if name == "info":
@@ -87,10 +82,6 @@ def _run(
         return ToolResult(report.summary(), report.model_dump(mode="json"), ok=report.ok)
     if name == "test":
         return lab.test(a.suite, vs=a.vs)
-    if name == "jobs":
-        if jobs is None:
-            return ToolResult("no background jobs in a local session")
-        return jobs(a.job)
     if name == "vcs":
         return _vcs(lab, a)
     if name == "export":

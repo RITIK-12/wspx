@@ -73,7 +73,6 @@ wspx vcs commit -m "Project out the loop direction in L15/L19 down_proj"
 | `vcs` | `status`, `diff`, `commit`, `log`, `checkout`, `branch`, `revert`, `bisect`, `blame`, `merge` (strategies include `orthogonalize`) |
 | `export` | Merged safetensors, PEFT adapter, GGUF or a portable bundle |
 | `run` | A Python script in the lab, with the SDK loaded |
-| `jobs` | Status and results of long-running jobs |
 
 Weights are addressed by role, derived from the model's actual computation:
 `L19.mlp.down[:, 8812]`, `L7.attn.q.h3`, `L12.moe.e5.up`, `embed[" Wait"]`.

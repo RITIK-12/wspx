@@ -18,6 +18,7 @@ from wspx.control.backend import LocalBackend, SessionRecord
 from wspx.lab.ir.capture import build_ir
 from wspx.lab.session import Lab
 from wspx.store import Store
+from wspx.tools import TOOLS
 from wspx.vcs import Repo
 
 TOKEN = "user-token"
@@ -239,7 +240,7 @@ def test_mcp_endpoint(tmp_path: Path) -> None:
         assert listed.status_code == 200, listed.text
         names = [t["name"] for t in listed.json()["result"]["tools"]]
         assert "grep" in names
-        assert len(names) == 14
+        assert len(names) == len(TOOLS)
         res = client.post(
             "/mcp/",
             json={

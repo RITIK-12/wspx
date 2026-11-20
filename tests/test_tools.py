@@ -18,7 +18,6 @@ def test_every_tool_from_the_design_is_present() -> None:
         "edit",
         "check",
         "test",
-        "jobs",
         "vcs",
         "export",
         "run",

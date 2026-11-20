@@ -133,10 +133,6 @@ class TestArgs(_Args):
     )
 
 
-class JobsArgs(_Args):
-    job: str | None = Field(None, description="A job id; default: list jobs.")
-
-
 class VcsArgs(_Args):
     action: Literal[
         "status",
@@ -257,7 +253,6 @@ TOOLS: dict[str, ToolSpec] = {
             "Run suites on the working tree; paired deltas with --vs. Held-out suites "
             "return aggregates only.",
         ),
-        ToolSpec("jobs", JobsArgs, "Status and results of long-running jobs.", lab=False),
         ToolSpec(
             "vcs",
             VcsArgs,
