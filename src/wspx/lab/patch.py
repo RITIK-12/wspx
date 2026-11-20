@@ -32,6 +32,8 @@ from wspx.lab.tensors import Index, Selector, assign, select
 from wspx.store.objects import canonical_json, oid_of
 
 KINDS = ("lowrank", "sparse", "dense", "scale", "set")
+LOWRANK_CHUNK = 1 << 24
+"""Elements per row chunk when a low-rank delta is added into a tensor."""
 FORMAT = "wspx.delta/1"
 
 
@@ -143,19 +145,25 @@ class TensorDelta:
 
     # ------------------------------------------------------------------ apply
 
+    def _lowrank_rows(self, start: int, stop: int, device: torch.device | str) -> torch.Tensor:
+        """Rows ``start:stop`` of a low-rank block: Σ_k outer(u_k, v_k), then the scale."""
+        assert self.u is not None
+        assert self.v is not None
+        u = self.u[start:stop].to(device)
+        v = self.v.to(device)
+        out = torch.zeros(u.shape[0], v.shape[0], dtype=torch.float32, device=device)
+        for k in range(u.shape[1]):
+            out.add_(torch.outer(u[:, k], v[:, k]))
+        if self.scale != 1.0:
+            out.mul_(self.scale)
+        return out
+
     def block(self, device: torch.device | str = "cpu") -> torch.Tensor:
         """The delta over its block (lowrank/dense kinds), fp32."""
         if self.kind == "lowrank":
             assert self.u is not None
             assert self.v is not None
-            u = self.u.to(device)
-            v = self.v.to(device)
-            out = torch.zeros(u.shape[0], v.shape[0], dtype=torch.float32, device=device)
-            for k in range(u.shape[1]):
-                out.add_(torch.outer(u[:, k], v[:, k]))
-            if self.scale != 1.0:
-                out.mul_(self.scale)
-            return out
+            return self._lowrank_rows(0, self.u.shape[0], device)
         if self.kind == "sparse":
             raise PatchError("sparse deltas have no block form")
         assert self.delta is not None
@@ -173,8 +181,28 @@ class TensorDelta:
             flat = acc.view(-1)
             flat.index_add_(0, self.indices.to(acc.device), self.values.to(acc.device))
             return
-        block = self.block(acc.device)
         target = select(acc, self.index)
+        if (
+            self.kind == "lowrank"
+            and target.dim() == 2
+            and (self.index is None or not any(isinstance(s, list) for s in self.index))
+        ):
+            assert self.u is not None
+            assert self.v is not None
+            if tuple(target.shape) != (self.u.shape[0], self.v.shape[0]):
+                raise PatchError(
+                    f"{self.tensor}: block {(self.u.shape[0], self.v.shape[0])} does not match "
+                    f"selection {tuple(target.shape)}"
+                )
+            # in row chunks: a full-size temporary of an embedding is gigabytes on the GPU.
+            # Each chunk runs the same element-wise sums as the whole block, so the bits
+            # (and every commit's stored hashes) are unchanged.
+            rows = max(1, LOWRANK_CHUNK // max(1, self.v.shape[0]))
+            for start in range(0, self.u.shape[0], rows):
+                stop = min(start + rows, self.u.shape[0])
+                target[start:stop].add_(self._lowrank_rows(start, stop, acc.device))
+            return
+        block = self.block(acc.device)
         if tuple(target.shape) != tuple(block.shape):
             raise PatchError(
                 f"{self.tensor}: block {tuple(block.shape)} does not match selection {tuple(target.shape)}"

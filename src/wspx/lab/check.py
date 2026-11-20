@@ -221,6 +221,10 @@ def _fused_boundaries(ir: ModelIR, name: str, deltas: list[TensorDelta], report:
 # --------------------------------------------------------------------------- numeric
 
 
+CPU_CHECK_NUMEL = 1 << 27
+"""Tensors above this many values (embeddings of large vocabularies) are checked on the CPU."""
+
+
 def numeric_check(ir: ModelIR, tree: WorkingTree, plan: EditPlan, cfg: CheckSection) -> Report:
     report = Report(levels=["numeric"])
     add = report.diagnostics.append
@@ -237,7 +241,9 @@ def numeric_check(ir: ModelIR, tree: WorkingTree, plan: EditPlan, cfg: CheckSect
         dtype = torch.float32 if plan.precision == "promote" else old.dtype
         if plan.precision == "adapter":
             continue
-        new = tree.preview(name, deltas, dtype=dtype)
+        if old.is_cuda and old.numel() > CPU_CHECK_NUMEL:
+            old = old.cpu()  # fp32 copies of an embedding would not fit beside the model
+        new = tree.preview(name, deltas, dtype=dtype, device=old.device)
         intended = torch.zeros(old.shape, dtype=torch.float32, device=old.device)
         for d in deltas:
             d.add_into(intended)

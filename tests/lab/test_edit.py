@@ -102,6 +102,14 @@ class TestMaterialize:
         out = materialize(base, [d])
         assert torch.allclose(out, base + d.dense(), atol=0, rtol=0)
 
+    def test_chunked_lowrank_adds_are_bit_identical(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Chunking (for embedding-sized tensors) must not change a bit: commits store hashes."""
+        base = torch.randn(37, 16)
+        d = patch.lowrank("w", (37, 16), "b", torch.randn(37, 3), torch.randn(16, 3), scale=0.7)
+        whole = materialize(base, [d])
+        monkeypatch.setattr(patch, "LOWRANK_CHUNK", 16 * 5)  # five rows at a time
+        assert torch.equal(materialize(base, [d]), whole)
+
 
 class TestWorkingTree:
     def test_stage_and_restore_bit_exact(self) -> None:

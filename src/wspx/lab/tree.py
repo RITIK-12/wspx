@@ -159,12 +159,18 @@ class WorkingTree:
     # ------------------------------------------------------------------ apply
 
     def preview(
-        self, name: str, extra: list[TensorDelta], *, dtype: torch.dtype | None = None
+        self,
+        name: str,
+        extra: list[TensorDelta],
+        *,
+        dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
     ) -> torch.Tensor:
         """What ``name`` would hold with ``extra`` deltas added, without touching the model."""
         deltas = [self.delta(o) for o in self.state.merged.get(name, ())] + extra
         target = dtype or (torch.float32 if name in self.state.promote else self._dtype[name])
-        return materialize(self.base(name), deltas, dtype=target)
+        base = self.base(name)
+        return materialize(base.to(device) if device is not None else base, deltas, dtype=target)
 
     def materialize_state(
         self, name: str, state: TreeState, *, dtype: torch.dtype | None = None
