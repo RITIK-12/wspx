@@ -141,6 +141,25 @@ class Commit:
 EMPTY_TREE: dict[str, Any] = {"type": "tree", "merged": {}, "adapter": {}, "promote": []}
 
 
+def normalize_tree(tree: dict[str, Any] | None) -> dict[str, Any]:
+    """The canonical form of a tree: sorted, empty entries dropped, no type tag."""
+    tree = tree or {}
+    return {
+        "merged": {k: sorted(v) for k, v in sorted((tree.get("merged") or {}).items()) if v},
+        "adapter": {k: sorted(v) for k, v in sorted((tree.get("adapter") or {}).items()) if v},
+        "promote": sorted(tree.get("promote") or []),
+    }
+
+
+def tree_key(tree: dict[str, Any] | None) -> str:
+    """Short hash of the weights a tree describes: the eval-cache key (same weights, same key)."""
+    import hashlib
+
+    from wspx.store import canonical_json
+
+    return hashlib.sha256(canonical_json(normalize_tree(tree))).hexdigest()[:16]
+
+
 class Repo:
     def __init__(self, store: Store, base: str) -> None:
         self.store = store

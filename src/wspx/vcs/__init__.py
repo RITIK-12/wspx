@@ -12,6 +12,6 @@ Objects (content-addressed JSON in the store):
             check report, evals, author (driver, session, calls) and message
 """
 
-from wspx.vcs.repo import Commit, PatchRecord, Repo, short_id
+from wspx.vcs.repo import Commit, PatchRecord, Repo, normalize_tree, short_id, tree_key
 
-__all__ = ["Commit", "PatchRecord", "Repo", "short_id"]
+__all__ = ["Commit", "PatchRecord", "Repo", "normalize_tree", "short_id", "tree_key"]

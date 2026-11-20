@@ -66,7 +66,7 @@ from wspx.store import Store, canonical_json, short
 from wspx.testing import runner
 from wspx.testing.api import Suite
 from wspx.testing.builtin import BUILTIN, CANARY_PROMPTS
-from wspx.vcs import Commit, PatchRecord, Repo
+from wspx.vcs import Commit, PatchRecord, Repo, tree_key
 
 DEFAULT_TOP = 20
 MAX_TOP = 200
@@ -282,8 +282,7 @@ class Lab:
         return self.at_state(TreeState())
 
     def tree_key(self, state: TreeState | None = None) -> str:
-        data = (state or self.tree.state).to_dict()
-        return hashlib.sha256(canonical_json(data)).hexdigest()[:16]
+        return tree_key((state or self.tree.state).to_dict())
 
     # ------------------------------------------------------------------ info / ls
 
