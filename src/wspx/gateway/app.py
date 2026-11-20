@@ -579,3 +579,8 @@ def stream_tracker(provider: str, path: str) -> Any:
     if provider == "google":
         return GeminiStream()
     return OpenAIStream()
+
+
+def create_app_from_env() -> Starlette:
+    """Factory for ``uvicorn --factory`` (self-hosting)."""
+    return create_app(GatewayConfig.from_env())
