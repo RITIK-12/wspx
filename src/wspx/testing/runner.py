@@ -74,6 +74,7 @@ def _load_yaml(path: Path) -> Suite:
         items=list(data["items"]),
         path=str(path),
         threshold=data.get("threshold"),
+        blind=bool(data.get("blind", False)),
     )
 
 
@@ -107,6 +108,12 @@ class RunResult:
     seconds: float = 0.0
     data_hashes: dict[str, str] = field(default_factory=dict)
     cached: bool = False
+    blind: bool = False
+    """Aggregates only for the driver (a blind or held-out suite)."""
+
+    @property
+    def aggregate_only(self) -> bool:
+        return self.blind or self.split == "heldout"
 
     @property
     def pass_rate(self) -> float:
@@ -160,7 +167,27 @@ def run_suite(
         checks=checks,
         seconds=time.perf_counter() - started,
         data_hashes=dict(api._DATA_HASHES),
+        blind=suite.blind,
     )
+
+
+def groups(result: RunResult) -> dict[str, tuple[int, int]]:
+    """Passed and total per check group, in first-seen order (empty when the suite has none)."""
+    out: dict[str, list[int]] = {}
+    for c in result.checks:
+        g = c.get("group")
+        if g is None:
+            continue
+        row = out.setdefault(str(g), [0, 0])
+        row[0] += int(bool(c["passed"]))
+        row[1] += 1
+    return {g: (p, n) for g, (p, n) in out.items()}
+
+
+def balanced(result: RunResult) -> float:
+    """Mean of the groups' pass rates (balanced accuracy when the groups are the classes)."""
+    rates = [p / n for p, n in groups(result).values() if n]
+    return sum(rates) / len(rates) if rates else math.nan
 
 
 # --------------------------------------------------------------------------- paired statistics
@@ -175,6 +202,9 @@ class Paired:
     flips_up: int
     """Items that failed on the reference and pass now."""
     flips_down: int
+    balanced_delta: float = math.nan
+    balanced_low: float = math.nan
+    balanced_high: float = math.nan
 
 
 def paired(
@@ -202,9 +232,25 @@ def paired(
     n = len(deltas)
     means = sorted(sum(rng.choice(deltas) for _ in range(n)) / n for _ in range(resamples))
     mean = sum(deltas) / n
-    return Paired(
-        n, mean, means[int(0.025 * resamples)], means[int(0.975 * resamples) - 1], up, down
-    )
+    lo, hi = means[int(0.025 * resamples)], means[int(0.975 * resamples) - 1]
+    out = Paired(n, mean, lo, hi, up, down)
+    by_group: dict[str, list[float]] = {}
+    for a, b in pairs:
+        if a.get("group") is not None:
+            by_group.setdefault(str(a["group"]), []).append(float(a["passed"]) - float(b["passed"]))
+    if len(by_group) > 1:
+        # balanced accuracy's change, resampled within each group (the classes keep their sizes)
+        def stat(rows: dict[str, list[float]]) -> float:
+            return sum(sum(v) / len(v) for v in rows.values()) / len(rows)
+
+        boots = sorted(
+            stat({g: [rng.choice(v) for _ in v] for g, v in by_group.items()})
+            for _ in range(resamples)
+        )
+        out.balanced_delta = stat(by_group)
+        out.balanced_low = boots[int(0.025 * resamples)]
+        out.balanced_high = boots[int(0.975 * resamples) - 1]
+    return out
 
 
 # --------------------------------------------------------------------------- reporting
@@ -214,6 +260,7 @@ MEASURES = {
     "kl": "KL vs base (lower is better)",
     "logit_diff": "logit difference",
     "judge": "judge score",
+    "margin": "margin (log-odds of the right answer)",
 }
 
 
@@ -228,13 +275,22 @@ def summary(
     kinds = {c["kind"] for c in result.checks}
     # a mean is only meaningful over items scored the same way (not perplexity with pass/fail)
     measure = MEASURES.get(next(iter(kinds))) if len(kinds) == 1 else None
+    unscored = sum(1 for c in result.checks if math.isnan(float(c["score"])))
     head = (
-        f"{result.suite} [{result.split}] {result.passed}/{result.n} passed "
-        f"({result.pass_rate:.1%})"
+        f"{result.suite} [{result.split}{', blind' if result.blind else ''}] "
+        f"{result.passed}/{result.n} passed ({result.pass_rate:.1%})"
         + (f" · mean {measure} {result.mean_score:.3f}" if measure else "")
+        + (f" · {unscored} without an answer" if unscored and measure else "")
         + (" · cached" if result.cached else f" · {result.seconds:.1f}s")
     )
     lines = [head]
+    slices = groups(result)
+    if slices:
+        lines.append(
+            "  by group: "
+            + " · ".join(f"{g} {p}/{n} ({p / n:.1%})" for g, (p, n) in slices.items())
+            + (f" · balanced {balanced(result):.1%}" if len(slices) > 1 else "")
+        )
     if vs is not None:
         p = paired(result, vs)
         label = vs_label or vs.tree[:9]
@@ -245,8 +301,16 @@ def summary(
             + (", where a higher KL is worse" if kinds == {"kl"} else "")
             + f") · {p.flips_up} fixed, {p.flips_down} broken (n={p.n})"
         )
+        if not math.isnan(p.balanced_delta):
+            lines.append(
+                f"  balanced vs {label}: Δ {p.balanced_delta:+.1%} "
+                f"[95% CI {p.balanced_low:+.1%}, {p.balanced_high:+.1%}]"
+            )
     if result.split == "heldout":
         lines.append("  (held-out: per-item results are visible in the UI only)")
+        return "\n".join(lines)
+    if result.blind:
+        lines.append("  (blind: aggregates only; items, outputs and answers stay hidden)")
         return "\n".join(lines)
     failures = [c for c in result.checks if not c["passed"]][:show_failures]
     for c in failures:
@@ -259,17 +323,22 @@ def summary(
 
 
 def driver_view(result: RunResult) -> dict[str, Any]:
-    """The result as the driver may see it. Held-out runs carry aggregates only."""
-    data = {k: v for k, v in result.__dict__.items() if k != "checks"}
-    if result.split != "heldout":
+    """The result as the driver may see it. Held-out and blind runs carry aggregates only."""
+    data = {k: v for k, v in result.__dict__.items() if k not in ("checks", "data_hashes")}
+    slices = groups(result)
+    if slices:
+        data["groups"] = {g: {"passed": p, "n": n} for g, (p, n) in slices.items()}
+        data["balanced"] = balanced(result)
+    if not result.aggregate_only:
         data["failures"] = [c for c in result.checks if not c["passed"]][:PREVIEW_FAILURES]
+        data["data_hashes"] = result.data_hashes
     return data
 
 
 def heldout_items(result: RunResult, *, caller: str) -> list[dict[str, Any]]:
-    """Per-item held-out data, for the UI only."""
-    if result.split == "heldout" and caller != "ui":
-        raise HeldOutAccess("held-out items and outputs are visible in the UI only")
+    """Per-item held-out and blind data, for the UI only."""
+    if result.aggregate_only and caller != "ui":
+        raise HeldOutAccess("held-out and blind items and outputs are visible in the UI only")
     return result.checks
 
 

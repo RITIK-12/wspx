@@ -16,6 +16,7 @@ import torch
 from wspx.errors import WspxError
 from wspx.lab.index import tensor_stats
 from wspx.lab.ir.model_ir import ModelIR, Target
+from wspx.lab.media import is_media
 from wspx.lab.probe import Probe, writer_units
 from wspx.lab.tensors import select
 from wspx.lab.text import Prompt, Text
@@ -117,12 +118,20 @@ def _vocab_of_vector(
 # --------------------------------------------------------------------------- forward helpers
 
 
+MEDIA_BATCH = 4
+"""Prompts per forward pass when they carry images or video (text batches take 16)."""
+
+
 def forward(
-    model: torch.nn.Module, ir: ModelIR, ids: torch.Tensor, mask: torch.Tensor
+    model: torch.nn.Module,
+    ir: ModelIR,
+    ids: torch.Tensor,
+    mask: torch.Tensor,
+    extra: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """Logits for a padded batch, called the way the IR was captured."""
+    """Logits for a padded batch, called the way the IR was captured (plus any pixel inputs)."""
     if ir.is_lm:
-        out = model(input_ids=ids, attention_mask=mask, use_cache=False)
+        out = model(input_ids=ids, attention_mask=mask, use_cache=False, **(extra or {}))
         logits: torch.Tensor = getattr(out, "logits", out)
         return logits
     raise WspxError("this tool needs a language model; call the model directly for other classes")
@@ -201,11 +210,14 @@ def _residuals(
 ) -> torch.Tensor:
     device = next(model.parameters()).device
     rows = []
+    if any(is_media(p) for p in prompts):
+        batch_size = min(batch_size, MEDIA_BATCH)
     with torch.no_grad():
         for start in range(0, len(prompts), batch_size):
-            ids, mask = text.batch(prompts[start : start + batch_size], device)
+            b = text.batch(prompts[start : start + batch_size], device)
+            ids, mask = b
             with probe.capture([point]) as cap:
-                forward(model, ir, ids, mask)
+                forward(model, ir, ids, mask, b.extra)
             acts = cap.points[point].float()
             if position == "mean":
                 m = mask.unsqueeze(-1).to(acts.dtype)
@@ -228,17 +240,70 @@ def generate(
     top_p: float = 1.0,
     seed: int = 0,
 ) -> list[list[int]]:
+    return [
+        g[0]
+        for g in generate_scored(
+            model,
+            text,
+            prompts,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            seed=seed,
+        )
+    ]
+
+
+def generate_scored(
+    model: torch.nn.Module,
+    text: Text,
+    prompts: Sequence[Prompt],
+    *,
+    max_tokens: int = 64,
+    temperature: float = 0.0,
+    top_p: float = 1.0,
+    seed: int = 0,
+    watch: Sequence[int] = (),
+) -> list[tuple[list[int], list[list[float]]]]:
+    """Generated ids per prompt, and the log-probability of each ``watch`` token at every step.
+
+    The log-probabilities are of the distribution generation chose from (the model's logits
+    after its configured processors, such as a repetition penalty), so a suite can score how
+    sure the model was of an answer it wrote. Only the watched tokens are kept, step by step.
+    """
     device = next(model.parameters()).device
-    ids, mask = text.batch(prompts, device)
+    b = text.batch(prompts, device)
+    ids, mask = b
     torch.manual_seed(seed)
     kwargs: dict[str, Any] = {"max_new_tokens": max_tokens, "pad_token_id": text.pad_id}
     if temperature > 0:
-        kwargs.update(do_sample=True, temperature=temperature, top_p=top_p)
+        kwargs.update(do_sample=True, temperature=temperature, top_p=top_p, top_k=0)
     else:
-        kwargs.update(do_sample=False)
+        kwargs.update(do_sample=False, temperature=None, top_p=None, top_k=None)
+    steps: list[torch.Tensor] = []
+    if watch:
+        from transformers import LogitsProcessorList
+
+        index = torch.tensor(list(watch), device=device)
+
+        def record(_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+            steps.append(torch.log_softmax(scores.float(), dim=-1)[:, index])
+            return scores
+
+        kwargs["logits_processor"] = LogitsProcessorList([record])
     with torch.no_grad():
-        out = model.generate(input_ids=ids, attention_mask=mask, **kwargs)  # type: ignore[operator]
-    return [row[ids.shape[1] :].tolist() for row in out]
+        sequences = model.generate(  # type: ignore[operator]
+            input_ids=ids, attention_mask=mask, **b.extra, **kwargs
+        )
+    watched: list[list[list[float]]] = [[] for _ in range(len(prompts))]
+    if steps:
+        table = torch.stack(steps, dim=1).cpu().tolist()  # (rows, steps, watched)
+        watched = [list(row) for row in table]
+    rows = []
+    for row, seq in enumerate(sequences):
+        new = seq[ids.shape[1] :].tolist()
+        rows.append((new, watched[row][: len(new)]))
+    return rows
 
 
 # --------------------------------------------------------------------------- traces
@@ -276,12 +341,13 @@ def forward_trace(
     model: torch.nn.Module, ir: ModelIR, probe: Probe, text: Text, prompt: Prompt, *, top: int = 5
 ) -> Trace:
     device = next(model.parameters()).device
-    ids, mask = text.batch([prompt], device)
+    batch = text.batch([prompt], device)
+    ids, mask = batch
     resid_points = [f"resid.L{b.index}" for b in ir.semantics.blocks]
     attn_points = [p for p in probe.points if p.startswith(("attn.", "route."))]
     units = writer_units(ir)
     with torch.no_grad(), probe.capture(resid_points + attn_points, units=units) as cap:
-        logits = forward(model, ir, ids, mask)
+        logits = forward(model, ir, ids, mask, batch.extra)
     norm, unembed = _norm_and_unembed(model, ir)
     lens_ids, lens_p, resid_norm = [], [], []
     with torch.no_grad():
@@ -381,14 +447,15 @@ def diff_trace(
 ) -> Trace:
     """The same input on two weight states. ``switch`` is a context manager that swaps to the other state."""
     device = next(model.parameters()).device
-    ids, mask = text.batch([prompt], device)
+    batch = text.batch([prompt], device)
+    ids, mask = batch
     points = [f"resid.L{b.index}" for b in ir.semantics.blocks]
     units = writer_units(ir)
     with torch.no_grad():
         with probe.capture(points, units=units) as here:
-            logits_here = forward(model, ir, ids, mask)
+            logits_here = forward(model, ir, ids, mask, batch.extra)
         with switch, probe.capture(points, units=units) as there:
-            logits_there = forward(model, ir, ids, mask)
+            logits_there = forward(model, ir, ids, mask, batch.extra)
     divergence = []
     for p in points:
         a, b = here.points[p][0, -1].float(), there.points[p][0, -1].float()
@@ -441,16 +508,18 @@ def attribution_trace(
     """Score writer units by (activation difference) × (gradient) on the failing input: a stack trace."""
     device = next(model.parameters()).device
     units = writer_units(ir)
-    ids_f, mask_f = text.batch([failing], device)
-    ids_r, mask_r = text.batch([reference], device)
+    batch_f = text.batch([failing], device)
+    batch_r = text.batch([reference], device)
+    ids_f, mask_f = batch_f
+    ids_r, mask_r = batch_r
     with torch.no_grad(), probe.capture([], units=units) as ref:
-        ref_logits = forward(model, ir, ids_r, mask_r)
+        ref_logits = forward(model, ir, ids_r, mask_r, batch_r.extra)
     requires = {n: p.requires_grad for n, p in model.named_parameters()}
     for p in model.parameters():
         p.requires_grad_(False)
     try:
         with torch.enable_grad(), probe.capture([], units=units, grad_units=True) as fail:
-            logits = _forward_with_grad(model, ir, ids_f, mask_f)
+            logits = _forward_with_grad(model, ir, ids_f, mask_f, batch_f.extra)
             logp = torch.log_softmax(logits[0, -1].float(), dim=-1)
             tid = text.token_id(target) if target is not None else int(logp.argmax())
             logp[tid].backward()  # type: ignore[no-untyped-call]
@@ -485,15 +554,30 @@ def attribution_trace(
 
 
 def _forward_with_grad(
-    model: torch.nn.Module, ir: ModelIR, ids: torch.Tensor, mask: torch.Tensor
+    model: torch.nn.Module,
+    ir: ModelIR,
+    ids: torch.Tensor,
+    mask: torch.Tensor,
+    extra: dict[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    """Forward pass whose unit activations carry gradients (weights stay frozen)."""
+    """Forward pass whose unit activations carry gradients (weights stay frozen).
+
+    The token embeddings are made to require grad as they leave the embedding layer, so the
+    model still gets its ids (vision-language models place image features by them).
+    """
     getter: Any = getattr(model, "get_input_embeddings", None)
     embed: Any = getter() if callable(getter) else None
     if embed is None:
         raise WspxError("attribution needs a model with input embeddings")
-    inputs = embed(ids).detach().requires_grad_(True)
-    out = model(inputs_embeds=inputs, attention_mask=mask, use_cache=False)
+
+    def leaf(_module: Any, _inputs: Any, output: torch.Tensor) -> torch.Tensor:
+        return output.detach().requires_grad_(True)
+
+    handle = embed.register_forward_hook(leaf)
+    try:
+        out = model(input_ids=ids, attention_mask=mask, use_cache=False, **(extra or {}))
+    finally:
+        handle.remove()
     del ir
     logits: torch.Tensor = getattr(out, "logits", out)
     return logits

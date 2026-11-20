@@ -4,12 +4,42 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, Required
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, with_config
+from typing_extensions import TypedDict
 
-Prompt = str | list[int]
-"""A prompt is text, or a list of token ids for models without a tokenizer."""
+
+@with_config(ConfigDict(extra="forbid"))
+class ContentPart(TypedDict, total=False):
+    """One piece of a message: text, an image file or a video (a file, or a list of frame files)."""
+
+    type: Required[Literal["text", "image", "video"]]
+    text: str
+    image: str
+    video: str | list[str]
+    fps: float
+
+
+@with_config(ConfigDict(extra="forbid"))
+class ChatMessage(TypedDict):
+    role: Literal["system", "user", "assistant"]
+    content: str | list[ContentPart]
+
+
+@with_config(ConfigDict(extra="forbid"))
+class MediaPrompt(TypedDict, total=False):
+    """An image or video prompt (vision-language models): chat ``messages``, rendered with the
+    model's chat template, plus an optional ``reply`` the answer starts with. Or a stored prompt:
+    ``{"item": "<set>/<n>"}`` (``info`` lists the sets). File paths are relative to the project."""
+
+    messages: list[ChatMessage]
+    reply: str
+    item: str
+
+
+Prompt = str | list[int] | MediaPrompt
+"""A prompt is text, a list of token ids (models without a tokenizer), or an image/video prompt."""
 
 
 class _Args(BaseModel):
@@ -46,7 +76,8 @@ class GrepArgs(_Args):
     )
     fires_on: list[Prompt] | str | None = Field(
         None,
-        description="Activation grep: rank writer units by activation on these prompts (or a .jsonl path).",
+        description="Activation grep: rank writer units by activation on these prompts (text, "
+        "image or video prompts) or a .jsonl path.",
     )
 
 
@@ -72,14 +103,20 @@ class ContrastArgs(_Args):
 
 
 class GenerateArgs(_Args):
-    prompt: Prompt | list[Prompt]
+    prompt: Prompt | list[Prompt] = Field(
+        description="A prompt or a list of them: text, token ids, or an image/video prompt "
+        '({"messages": [...]} or a stored {"item": "<set>/<n>"}).'
+    )
     max_tokens: int = Field(64, ge=1, le=4096)
     temperature: float = Field(0.0, ge=0.0, le=2.0)
     seed: int = 0
 
 
 class TraceArgs(_Args):
-    prompt: Prompt
+    prompt: Prompt = Field(
+        description='Text, token ids, or an image/video prompt ({"messages": [...]} or '
+        '{"item": "<set>/<n>"}).'
+    )
     vs: str | None = Field(None, description="Diff trace against a commit, branch or 'base'.")
     reference: Prompt | None = Field(
         None, description="Attribution trace: a reference input that behaves well."

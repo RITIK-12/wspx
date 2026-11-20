@@ -59,8 +59,13 @@ def open_lab(
     dtype: str = "bfloat16",
     trust_remote_code: bool = False,
     workdir: str | Path | None = None,
+    processor: Any = None,
 ) -> Lab:
-    """Load (or take) a model, build or reuse its IR from the store, and open a session."""
+    """Load (or take) a model, build or reuse its IR from the store, and open a session.
+
+    ``processor`` (image and video inputs) is loaded with a vision-language checkpoint; pass
+    one with a model object.
+    """
     st = Store(store)
     base_reader = None
     hashes = None
@@ -70,6 +75,7 @@ def open_lab(
 
         loaded = load_hf(model, revision=revision, dtype=dtype, trust_remote_code=trust_remote_code)
         module, tokenizer = loaded.model, tokenizer or loaded.tokenizer
+        processor = processor or loaded.processor
         fingerprint = loaded.fingerprint
         readable = loaded.readable
         if readable:
@@ -96,6 +102,7 @@ def open_lab(
         config=config or WspxConfig.discover(workdir),
         base_reader=base_reader,
         workdir=Path(workdir) if workdir else None,
+        processor=processor,
     )
 
 

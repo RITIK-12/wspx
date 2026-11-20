@@ -28,6 +28,9 @@ class Check:
     output: str | None = None
     deferred: dict[str, Any] | None = None
     """Set for checks resolved outside the lab (LLM judge)."""
+    group: str | None = None
+    """A slice of the suite (a class, a source): results report each group's pass rate and
+    their mean (balanced accuracy, when the groups are the classes)."""
 
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in self.__dict__.items() if v is not None}
@@ -45,10 +48,17 @@ class Suite:
     """For YAML suites: the cases themselves."""
     path: str = ""
     threshold: float | None = None
+    blind: bool = False
+    """Aggregates only, like a held-out suite, but meant to be run as often as needed: the
+    driver never sees an item, an output or an expected answer."""
 
     @property
     def heldout(self) -> bool:
         return self.split == "heldout"
+
+    @property
+    def aggregate_only(self) -> bool:
+        return self.heldout or self.blind
 
     @property
     def hash(self) -> str:
@@ -58,6 +68,8 @@ class Suite:
         h.update(str(self.seed).encode())
         h.update(self.source.encode())
         h.update(json.dumps(self.items, sort_keys=True).encode())
+        if self.blind:
+            h.update(b"blind")
         return h.hexdigest()[:16]
 
 
@@ -71,8 +83,9 @@ def suite(
     seed: int = 0,
     name: str | None = None,
     threshold: float | None = None,
+    blind: bool = False,
 ) -> Any:
-    """Register a generator of checks as a suite."""
+    """Register a generator of checks as a suite. ``blind=True`` shows the driver aggregates only."""
 
     def wrap(func: Callable[[Any], Iterator[Check]]) -> Callable[[Any], Iterator[Check]]:
         import inspect
@@ -81,7 +94,9 @@ def suite(
             source = inspect.getsource(func)
         except (OSError, TypeError):
             source = func.__qualname__
-        s = Suite(name or func.__name__, func, split, seed, source, threshold=threshold)
+        s = Suite(
+            name or func.__name__, func, split, seed, source, threshold=threshold, blind=blind
+        )
         _REGISTRY.append(s)
         func.__wspx_suite__ = s  # type: ignore[attr-defined]
         return func
@@ -134,11 +149,29 @@ class _Expect:
         """Pass when KL vs base (from ``model.kl_vs_base``) stays within ``at_most``."""
         return Check(value <= at_most, value, "kl", f"≤ {at_most}")
 
-    def true(self, condition: bool, detail: str = "", *, score: float | None = None) -> Check:
+    def true(
+        self,
+        condition: bool,
+        detail: str = "",
+        *,
+        score: float | None = None,
+        group: str | None = None,
+    ) -> Check:
         """A custom Python check."""
         return Check(
-            bool(condition), float(condition) if score is None else score, "custom", detail
+            bool(condition),
+            float(condition) if score is None else score,
+            "custom",
+            detail,
+            group=group,
         )
+
+    def margin(
+        self, correct: bool, value: float, *, group: str | None = None, detail: str = ""
+    ) -> Check:
+        """A verdict and how sure the model was: ``value`` is the log-odds of the right answer
+        (positive when it leaned the right way; NaN when it gave no answer)."""
+        return Check(bool(correct), float(value), "margin", detail, group=group)
 
     def judge(self, output: str, rubric: str, *, model: str | None = None) -> Check:
         """An LLM judge. The lab has no network, so this is resolved by the control plane."""

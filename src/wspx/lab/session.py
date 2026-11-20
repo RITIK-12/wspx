@@ -56,6 +56,7 @@ from wspx.lab.evaluate import SuiteModel
 from wspx.lab.grep import Environment, GrepResult, Hit, grep
 from wspx.lab.index import ModelIndex, build_index
 from wspx.lab.ir.model_ir import ModelIR, Target
+from wspx.lab.media import Media, is_media
 from wspx.lab.ops import OpContext
 from wspx.lab.patch import TensorDelta, materialize
 from wspx.lab.probe import Probe
@@ -107,6 +108,7 @@ class Lab:
         base_reader: Callable[[str], torch.Tensor] | None = None,
         workdir: Path | None = None,
         cache_bytes: int | None = None,
+        processor: Any = None,
     ) -> None:
         self.model = model
         self.ir = ir
@@ -115,7 +117,15 @@ class Lab:
         self.config = config or WspxConfig()
         self.workdir = Path(workdir or Path.cwd())
         self.repo = Repo(store, ir.fingerprint)
-        self.text = Text(tokenizer, vocab_size=ir.vocab_size)
+        media = None
+        if processor is not None:
+            media = Media(
+                processor,
+                self.workdir,
+                prompt_dir=self.config.tests.prompts.rstrip("/"),
+                forbidden=tuple(self.workdir / p for p in self.config.tests.paths),
+            )
+        self.text = Text(tokenizer, vocab_size=ir.vocab_size, media=media)
         self.tree = WorkingTree(
             model, ir, load_delta=self._load_delta, base_reader=base_reader, cache_bytes=cache_bytes
         )
@@ -299,6 +309,18 @@ class Lab:
             self.ir.render_info(),
             f"branch {branch} · HEAD {short(head) if head else '(base)'} · {len(self.staged)} staged patch(es)",
         ]
+        if self.text.media is not None:
+            lines.append(
+                'inputs: text, and images or video as {"messages": [...]} prompts '
+                "(see the prompt argument of generate or trace)"
+            )
+            stored = self.text.media.sets()
+            if stored:
+                lines.append(
+                    "stored prompts: "
+                    + ", ".join(f"{name} ({n})" for name, n in stored.items())
+                    + ' · use {"item": "<set>/<n>"}, n from 0'
+                )
         if self.heldout_queries:
             lines.append(f"held-out queries so far: {self.heldout_queries}")
         if handles:
@@ -393,15 +415,23 @@ class Lab:
         if not units:
             raise GrepError("--fires-on ranks writer units; the scope has none")
         started = time.perf_counter()
-        ids, mask = self.text.batch(prompts, self.device)
-        with torch.no_grad(), self.probe.capture([], units=units) as cap:
-            analysis.forward(self.model, self.ir, ids, mask)
+        size = analysis.MEDIA_BATCH if any(is_media(p) for p in prompts) else 16
+        totals: dict[str, torch.Tensor] = {}
+        count = 0.0
+        for start in range(0, len(prompts), size):
+            batch = self.text.batch(prompts[start : start + size], self.device)
+            ids, mask = batch
+            with torch.no_grad(), self.probe.capture([], units=units) as cap:
+                analysis.forward(self.model, self.ir, ids, mask, batch.extra)
+            m = mask.unsqueeze(-1).float()
+            count += float(m.sum())
+            for param in units:
+                part = (cap.units[param].float().abs() * m).sum((0, 1))
+                totals[param] = totals[param] + part if param in totals else part
         scores: list[Hit] = []
-        m = mask.unsqueeze(-1).float()
         for param in units:
             role = self.ir.primary_role(param)
-            acts = cap.units[param].float()
-            mean = ((acts.abs() * m).sum((0, 1)) / m.sum()).tolist()
+            mean = (totals[param] / count).tolist()
             addr = role.address if role else param
             scores.extend(Hit(f"{addr}[:, {j}]", param, None, j, s) for j, s in enumerate(mean))
         scores.sort(key=lambda h: -h.score)
@@ -417,19 +447,38 @@ class Lab:
 
     def _prompts(self, value: Sequence[Prompt] | str) -> list[Prompt]:
         if isinstance(value, str):
-            path = self.workdir / value
-            if not path.exists():
-                raise WspxError(f"{value}: no such prompt file")
+            path = self._readable(value)
             rows: list[Any] = [
                 json.loads(line) for line in path.read_text().splitlines() if line.strip()
             ]
             prompts: list[Any] = [
-                r.get("prompt", r.get("text")) if isinstance(r, dict) else r for r in rows
+                r
+                if is_media(r) and "messages" in r
+                else r.get("prompt", r.get("text"))
+                if isinstance(r, dict)
+                else r
+                for r in rows
             ]
             if any(p is None for p in prompts):
-                raise WspxError(f"{value}: each line needs a 'prompt' or 'text' field")
+                raise WspxError(f"{value}: each line needs 'messages', 'prompt' or 'text'")
             return prompts
         return list(value)
+
+    def _readable(self, rel: str) -> Path:
+        """A project file tools may read: inside the project and outside the test folders."""
+        root = self.workdir.resolve()
+        path = (root / rel).resolve()
+        if not path.is_relative_to(root):
+            raise WspxError(f"{rel}: prompt files must be inside the project")
+        for folder in self.config.tests.paths:
+            if path.is_relative_to((root / folder).resolve()):
+                raise WspxError(
+                    f"{rel}: {folder.rstrip('/')}/ holds test data, which tools cannot read; "
+                    f"keep prompts in {self.config.tests.prompts}"
+                )
+        if not path.is_file():
+            raise WspxError(f"{rel}: no such prompt file")
+        return path
 
     # ------------------------------------------------------------------ show / generate
 
@@ -458,7 +507,11 @@ class Lab:
         temperature: float = 0.0,
         seed: int = 0,
     ) -> ToolResult:
-        single = isinstance(prompts, str) or (bool(prompts) and isinstance(prompts[0], int))
+        single = (
+            isinstance(prompts, str)
+            or is_media(prompts)
+            or (bool(prompts) and isinstance(next(iter(prompts)), int))
+        )
         batch: list[Any] = [prompts] if single else list(prompts)
         outs = analysis.generate(
             self.model, self.text, batch, max_tokens=max_tokens, temperature=temperature, seed=seed
@@ -717,7 +770,8 @@ class Lab:
 
     def _canary(self) -> tuple[torch.Tensor, torch.Tensor]:
         if self.text.tokenizer is not None:
-            return self.text.batch(CANARY_PROMPTS, self.device)
+            ids, mask = self.text.batch(CANARY_PROMPTS, self.device)
+            return ids, mask
         gen = torch.Generator().manual_seed(1234)
         vocab = self.ir.vocab_size or 2
         ids = torch.randint(0, vocab, (8, 16), generator=gen).to(self.device)
@@ -801,7 +855,7 @@ class Lab:
                 cached.cached = True
                 return cached
         with self.at_state(state):
-            model = SuiteModel(self.model, self.ir, self.text, self.at_base)
+            model = SuiteModel(self.model, self.ir, self.text.unrestricted(), self.at_base)
             result = runner.run_suite(suite, model, key)
         self.store.write_file(rel, result.to_json())
         return result

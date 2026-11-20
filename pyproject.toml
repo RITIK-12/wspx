@@ -63,13 +63,16 @@ gateway = [
 ]
 lab = [
     "accelerate>=1.16",
+    "av>=14",
     "gguf>=0.19",
     "huggingface_hub>=2.4",
     "numpy>=2.0",
+    "pillow>=11",
     "pyarrow>=26",
     "safetensors>=0.8",
     "starlette>=1.10",
     "torch>=2.15",
+    "torchvision",
     "transformers>=5.23",
     "uvicorn>=0.54",
 ]
@@ -149,7 +152,7 @@ mypy_path = "src"
 packages = ["wspx"]
 
 [[tool.mypy.overrides]]
-module = ["modal.*", "gguf.*", "pyarrow.*", "peft.*", "accelerate.*"]
+module = ["modal.*", "gguf.*", "pyarrow.*", "peft.*", "accelerate.*", "av.*", "PIL.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

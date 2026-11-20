@@ -37,6 +37,16 @@ statistics and handles; heavy computation happens next to the weights.
 - `info --handles` lists every live handle with what it holds. Trust the id,
   not your memory of what it was.
 
+## Image and video prompts
+
+On a vision-language model, every tool that takes a prompt (`generate`, `trace`,
+`contrast`, `grep --fires-on`) also takes chat messages with images or video:
+`{"messages": [{"role": "user", "content": [{"type": "image", "image": "prompts/a.png"},
+{"type": "text", "text": "..."}]}]}`. A video is a file or a list of frames:
+`{"type": "video", "video": "clip.mp4"}`. Stored prompts are referenced as
+`{"item": "<set>/<n>"}`; `info` lists the sets. A trace of an image prompt reads
+the last token, so put the question last.
+
 ## Rules
 
 - Never dump weight values; ask for summaries. Raw values are capped.
@@ -45,8 +55,8 @@ statistics and handles; heavy computation happens next to the weights.
   loss) means the change is too small for the stored dtype; `E105` means the
   edit changed nothing.
 - Measure behaviour with paired tests (`test --vs`), not single runs.
-- Held-out suites return aggregates only. Never try to read held-out items or
-  outputs, or to infer them.
+- Held-out and blind suites return aggregates only. Never try to read their items,
+  outputs or answers, or to infer them; files in the test folders are not readable.
 - If you are told something is repeating, it will not change by repeating it:
   change the approach.
 - Keep edits small and targeted; prefer low-rank edits on writers.

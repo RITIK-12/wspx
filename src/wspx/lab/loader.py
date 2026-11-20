@@ -36,6 +36,8 @@ class Loaded:
     path: Path | None
     readable: dict[str, tuple[Path, str]] = field(default_factory=dict)
     """Parameter → (safetensors file, key) for tensors stored verbatim."""
+    processor: Any = None
+    """Image and video preprocessing, for vision-language models."""
 
     def base_reader(self, name: str) -> torch.Tensor:
         from safetensors import safe_open
@@ -122,7 +124,24 @@ def load_hf(
     except Exception:
         tokenizer = None
     readable = _verbatim_tensors(path, model)
-    return Loaded(model, tokenizer, fingerprint(path, source, revision), source, path, readable)
+    processor = _processor(path, auto, trust_remote_code) if tokenizer is not None else None
+    return Loaded(
+        model, tokenizer, fingerprint(path, source, revision), source, path, readable, processor
+    )
+
+
+def _processor(path: Path, auto: Any, trust_remote_code: bool) -> Any:
+    """The checkpoint's image/video processor, when it is a vision-language model."""
+    from transformers import AutoModelForImageTextToText, AutoProcessor
+
+    if auto is not AutoModelForImageTextToText:
+        return None
+    try:
+        return AutoProcessor.from_pretrained(  # type: ignore[no-untyped-call]
+            str(path), trust_remote_code=trust_remote_code
+        )
+    except Exception:
+        return None
 
 
 def _auto_class(config: Any) -> Any:

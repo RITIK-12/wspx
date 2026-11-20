@@ -84,13 +84,19 @@ class ModelSection(_Section):
 
 class DriverSection(_Section):
     model: str | None = None
+    deny_tools: list[str] = Field(default_factory=list)
+    """Tools the driver is not offered and may not call, e.g. ``["run", "export"]``."""
 
 
 class LabSection(_Section):
     gpu: str | None = None
     """``None`` runs on CPU; otherwise a Modal GPU spec such as ``"H100"`` or ``"H100:8"``."""
     grace: Duration = 15 * 60
+    """How long an idle lab keeps its GPU before it is released."""
     keep_warm: Literal["auto", "always"] = "auto"
+    max_gpu_time: Duration | None = None
+    """GPU time a session may use over all its labs, load time included; then its driver and
+    lab stop."""
 
 
 class LoopGuardSection(_Section):
@@ -111,6 +117,9 @@ class CheckSection(_Section):
 
 class TestsSection(_Section):
     paths: list[str] = Field(default_factory=lambda: ["wtests/"])
+    """Suite folders. Tools cannot read files in them, so a suite's answers stay hidden."""
+    prompts: str = "prompts/"
+    """Stored prompts tools may use: ``{"item": "<set>/<n>"}`` is line n of ``<set>.jsonl`` here."""
 
 
 class PolicySection(_Section):
