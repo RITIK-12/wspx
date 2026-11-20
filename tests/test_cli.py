@@ -92,6 +92,20 @@ def test_tool_commands_and_edit_arguments(monkeypatch: pytest.MonkeyPatch) -> No
     assert fake.calls[-1][2] == {"action": "commit", "message": "msg", "force": False}
     runner.invoke(main.app, ["vcs", "checkout", "HEAD~1"])
     assert fake.calls[-1][2]["rev"] == "HEAD~1"
+    merge = ["vcs", "merge", "exp", "--strategy", "L12.mlp.down=orthogonalize"]
+    assert runner.invoke(main.app, merge).exit_code == 0
+    assert fake.calls[-1][2]["strategies"] == {"L12.mlp.down": "orthogonalize"}
+    assert runner.invoke(main.app, [*merge[:3], "--strategy", "orthogonalize"]).exit_code == 1
+    runner.invoke(main.app, ["vcs", "bisect", "facts", "--good", "base", "--bad", "HEAD"])
+    assert (
+        fake.calls[-1][2] | {"good": "base", "bad": "HEAD", "suite": "facts"} == fake.calls[-1][2]
+    )
+    runner.invoke(main.app, ["vcs", "diff", "HEAD~1", "HEAD"])
+    assert (fake.calls[-1][2]["a"], fake.calls[-1][2]["b"]) == ("HEAD~1", "HEAD")
+    runner.invoke(main.app, ["vcs", "log", "-n", "3"])
+    assert fake.calls[-1][2]["n"] == 3
+    runner.invoke(main.app, ["run", "scripts/probe.py", "a", "b"])
+    assert fake.calls[-1][2] == {"script": "scripts/probe.py", "args": ["a", "b"]}
     assert "no limits are set" in runner.invoke(main.app, ["limits"]).output
 
 
@@ -172,3 +186,10 @@ def test_a_stopped_deployment_is_a_clear_error() -> None:
     control = Control("http://control", "t", transport=httpx.MockTransport(stopped))
     with pytest.raises(WspxError, match="wspx deploy"):
         control.sessions()
+
+
+def test_every_tool_is_a_command() -> None:
+    from wspx.tools import TOOLS
+
+    commands = {c.name or c.callback.__name__ for c in main.app.registered_commands}  # type: ignore[union-attr]
+    assert set(TOOLS) <= commands

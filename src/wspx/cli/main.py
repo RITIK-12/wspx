@@ -552,8 +552,22 @@ def vcs(
         ),
     ],
     target: Annotated[str | None, typer.Argument(help="revision, branch, address or suite")] = None,
+    other: Annotated[
+        str | None, typer.Argument(help="diff: the second revision (default: working tree)")
+    ] = None,
     session: Session = None,
     message: Annotated[str | None, typer.Option("--message", "-m")] = None,
+    strategy: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--strategy",
+            help="merge: ADDRESS=STRATEGY (sum, rebase, orthogonalize, ties, pick:ours, "
+            "pick:theirs); repeatable.",
+        ),
+    ] = None,
+    good: Annotated[str | None, typer.Option(help="bisect: a revision that passes.")] = None,
+    bad: Annotated[str | None, typer.Option(help="bisect: a revision that fails.")] = None,
+    count: Annotated[int | None, typer.Option("-n", help="log: how many commits.")] = None,
     force: Annotated[bool, typer.Option("--force")] = False,
 ) -> None:
     """Version control of weight edits."""
@@ -570,6 +584,16 @@ def vcs(
     }.get(action)
     if key and target:
         args[key] = target
+    if other:
+        args["b"] = other
+    if strategy:
+        pairs = [s.partition("=") for s in strategy]
+        if any(not address or not sep or not how for address, sep, how in pairs):
+            _fail(WspxError("--strategy takes ADDRESS=STRATEGY, e.g. L12.mlp.down=orthogonalize"))
+            return
+        args["strategies"] = {address: how for address, _, how in pairs}
+    extra = {"good": good, "bad": bad, "n": count}
+    args.update({k: v for k, v in extra.items() if v is not None})
     _tool(session, "vcs", args)
 
 
@@ -584,9 +608,13 @@ def export(
 
 
 @app.command()
-def run(script: Annotated[str, typer.Argument()], session: Session = None) -> None:
+def run(
+    script: Annotated[str, typer.Argument()],
+    args: Annotated[list[str] | None, typer.Argument(help="Passed to the script.")] = None,
+    session: Session = None,
+) -> None:
     """Run a script in the lab with the SDK preloaded."""
-    _tool(session, "run", {"script": script})
+    _tool(session, "run", {"script": script, "args": args or []})
 
 
 # ---------------------------------------------------------------------- spend and safety
