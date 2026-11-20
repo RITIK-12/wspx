@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { post, stream, type Session, type TimelineEvent } from "../api";
+import { formatTokens, post, stream, type Session, type TimelineEvent } from "../api";
 
 export function SessionView({ session, onChange }: { session: Session; onChange: () => void }) {
   const [events, setEvents] = useState<TimelineEvent[]>([]);
@@ -72,7 +72,7 @@ function Event({ event }: { event: TimelineEvent }) {
     return (
       <li className="ev turn">
         <div className="meta">
-          turn {p.turn} · {p.model} · {p.usage?.input ?? 0}→{p.usage?.output ?? 0} tok · {(p.latency ?? 0).toFixed(1)} s · {time}
+          turn {p.turn} · {p.model} · {formatTokens(p.usage)} tokens · {(p.latency ?? 0).toFixed(1)} s · {time}
         </div>
         {p.reasoning ? (
           <details>
@@ -102,8 +102,17 @@ function Event({ event }: { event: TimelineEvent }) {
       </li>
     );
   }
+  if (event.kind === "notes") {
+    return (
+      <li className="ev note notes">
+        delivered to the model: <pre className="result">{(p.notes ?? []).join("\n\n")}</pre>
+      </li>
+    );
+  }
   const label =
-    event.kind === "lab"
+    event.kind === "start"
+      ? `driver started · ${p.provider}:${p.model} · effort ${p.effort}`
+      : event.kind === "lab"
       ? `lab ${p.tier}${p.load_seconds ? ` (${p.load_seconds.toFixed(0)} s)` : ""}${p.reason ? `: ${p.reason}` : ""}`
       : event.kind === "loop"
         ? `loop ${p.action}: ${p.message}`

@@ -162,6 +162,19 @@ def test_scripted_driver_runs_through_the_control_plane(tmp_path: Path) -> None:
         repo = Repo(Store(tmp_path / "store"), manager.get(sid).fingerprint)
         assert repo.log(repo.head(sid))[0].message == "driver edit"
 
+        # the record starts at the start: what the model was given, then everything after it
+        export = client.get(f"/api/sessions/{sid}/export", headers=USER).json()
+        assert export["format"] == "wspx-session/1"
+        kinds = [e["kind"] for e in export["events"]]
+        assert kinds[0] == "session"
+        (start,) = [e["payload"] for e in export["events"] if e["kind"] == "start"]
+        assert start["system"]
+        assert start["message"].startswith("ablate unit 4")
+        assert "edit" in start["tools"]
+        calls = [e["payload"] for e in export["events"] if e["kind"] == "tool_call"]
+        assert calls[1]["data"]["handle"].startswith("p_")  # results in full, data included
+        assert [c["message"] for c in export["commits"]["commits"]] == ["driver edit"]
+
 
 def test_tokens_are_scoped(tmp_path: Path) -> None:
     client, manager = make(tmp_path)

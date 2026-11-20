@@ -353,6 +353,30 @@ def create_app(
     def runs(sid: str) -> dict[str, Any]:
         return views.runs(store, _fp(sid), sid)
 
+    @app.get("/api/sessions/{sid}/export", dependencies=[Depends(user)])
+    def export_session(sid: str) -> dict[str, Any]:
+        """The session's whole record: its trace from the start, commits, evals and spend."""
+        record = guarded(lambda: manager.get(sid))
+        out: dict[str, Any] = {
+            "format": "wspx-session/1",
+            "wspx": __version__,
+            "exported": time.time(),
+            "session": record.to_dict(),
+            "events": trace.trace(sid),
+        }
+        parts: dict[str, Callable[[], Any]] = {
+            "commits": lambda: views.commits(store, _fp(sid), sid),
+            "evals": lambda: views.runs(store, _fp(sid), sid),
+        }
+        if manager.gateway is not None:
+            parts["usage"] = lambda: manager.gateway.usage(session=sid)  # type: ignore[union-attr]
+        for key, part in parts.items():
+            try:
+                out[key] = part()
+            except Exception as exc:  # a missing part must not lose the rest of the record
+                out[key] = {"error": str(exc)}
+        return out
+
     @app.get("/api/sessions/{sid}/handles", dependencies=[Depends(user)])
     def handles(sid: str) -> dict[str, Any]:
         return views.handles(store, sid)

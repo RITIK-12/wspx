@@ -61,6 +61,11 @@ class Control:
         data: dict[str, Any] = self._req("POST", "/api/sessions", json=body)
         return data
 
+    def export_session(self, sid: str) -> dict[str, Any]:
+        """The session's whole record (``wspx-session/1``): trace, commits, evals, spend."""
+        data: dict[str, Any] = self._req("GET", f"/api/sessions/{sid}/export")
+        return data
+
     def session(self, sid: str) -> dict[str, Any]:
         data: dict[str, Any] = self._req("GET", f"/api/sessions/{sid}")
         return data

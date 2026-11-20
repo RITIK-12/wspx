@@ -53,10 +53,26 @@ export async function api<T = any>(path: string, init: RequestInit = {}): Promis
 export const post = <T = any>(path: string, body: unknown = {}) =>
   api<T>(path, { method: "POST", body: JSON.stringify(body) });
 
+// Every kind the trace records; the stream names each event by its kind.
+export const EVENT_KINDS = [
+  "session", "start", "turn", "tool_call", "notes", "compaction", "lab", "loop", "command", "error", "hook", "end",
+];
+
+/** "in 6,054 (6,000 cache read, 50 written) → out 90 tokens" */
+export function formatTokens(u: any): string {
+  const read = u?.cache_read ?? 0;
+  const written = u?.cache_write ?? 0;
+  let text = `in ${((u?.input ?? 0) + read + written).toLocaleString()}`;
+  if (read || written) text += ` (${read.toLocaleString()} cache read, ${written.toLocaleString()} written)`;
+  text += ` → out ${(u?.output ?? 0).toLocaleString()}`;
+  if (u?.reasoning) text += ` (${u.reasoning.toLocaleString()} reasoning)`;
+  return text;
+}
+
 export function stream(session: string, since: number, onEvent: (e: TimelineEvent) => void): () => void {
   const source = new EventSource(`/api/sessions/${session}/stream?since=${since}&token=${encodeURIComponent(token)}`);
   const handler = (msg: MessageEvent) => onEvent(JSON.parse(msg.data));
-  for (const kind of ["turn", "tool_call", "lab", "loop", "command", "session", "error", "compaction", "hook", "end"]) {
+  for (const kind of EVENT_KINDS) {
     source.addEventListener(kind, handler as EventListener);
   }
   return () => source.close();

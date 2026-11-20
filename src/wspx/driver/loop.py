@@ -22,6 +22,7 @@ from typing import Any, Literal
 
 from wspx.driver.messages import Message, ToolOutput, Turn
 from wspx.driver.providers import Provider
+from wspx.tools import TOOLS
 
 Status = Literal["done", "stopped", "paused", "refused", "halted", "error"]
 _CODE_RE = re.compile(r"\b([EW]\d{3})\b")
@@ -85,6 +86,19 @@ class Runner:
         workspace = self.hooks.workspace()
         first = self.config.task + (f"\n\nWorkspace:\n{workspace}" if workspace else "")
         self.history = [Message("user", text=first)]
+        self.hooks.event(  # the trace starts with everything the model is given
+            {
+                "type": "start",
+                "provider": self.provider.name,
+                "model": getattr(self.provider, "model", None),
+                "effort": self.config.effort,
+                "max_tokens": self.config.max_tokens,
+                "compact_at": self.config.compact_at,
+                "tools": sorted(TOOLS),
+                "system": self.config.system,
+                "message": first,
+            }
+        )
         pending: list[str] = []
         while True:
             state = self.hooks.gateway_state() or {}
@@ -106,6 +120,7 @@ class Runner:
                 )
             if pending:
                 self.history[-1].notes.extend(pending)
+                self.hooks.event({"type": "notes", "turn": self.turns, "notes": pending})
                 pending = []
 
             try:
@@ -241,6 +256,8 @@ class Runner:
                 "turn": self.turns,
                 "summary": summary.text,
                 "dropped_messages": len(old),
+                "usage": summary.usage.__dict__,
+                "model": summary.model,
             }
         )
         head = Message(
@@ -251,5 +268,7 @@ class Runner:
             head.notes.extend(self.history[1].notes)
 
     def _end(self, status: Status, reason: str, text: str = "") -> RunResult:
-        self.hooks.event({"type": "end", "status": status, "reason": reason, "turns": self.turns})
+        self.hooks.event(
+            {"type": "end", "status": status, "reason": reason, "turns": self.turns, "text": text}
+        )
         return RunResult(status, self.turns, reason, text, self.history)

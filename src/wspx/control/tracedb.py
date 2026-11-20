@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS turns (id INTEGER PRIMARY KEY AUTOINCREMENT, session 
     role TEXT, text TEXT, reasoning TEXT, reasoning_available INTEGER, tokens TEXT, cost REAL, latency REAL,
     ts REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS tool_calls (call_id TEXT PRIMARY KEY, session TEXT NOT NULL, turn INTEGER,
-    tool TEXT NOT NULL, args TEXT, summary TEXT, ok INTEGER, latency REAL, error TEXT, source TEXT, ts REAL);
+    tool TEXT NOT NULL, args TEXT, summary TEXT, ok INTEGER, latency REAL, error TEXT, source TEXT, ts REAL,
+    data TEXT);
 CREATE TABLE IF NOT EXISTS artefacts (id TEXT NOT NULL, kind TEXT NOT NULL, call_id TEXT, session TEXT,
     ts REAL, PRIMARY KEY (id, call_id));
 CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT NOT NULL,
@@ -43,6 +44,19 @@ def _kind_of(handle: str) -> str:
     return "commit"
 
 
+MAX_DATA_BYTES = 1 << 20
+"""Structured results above this are kept as a note; their full form is in the store."""
+
+
+def _data_json(data: Any) -> str | None:
+    if not data:
+        return None
+    text = json.dumps(data, default=str)
+    if len(text) > MAX_DATA_BYTES:
+        return json.dumps({"omitted": f"{len(text):,} bytes; the full result is in the store"})
+    return text
+
+
 class TraceDB:
     def __init__(self, path: str | Path) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -52,6 +66,9 @@ class TraceDB:
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.executescript(SCHEMA)
+        columns = {r["name"] for r in self._db.execute("PRAGMA table_info(tool_calls)")}
+        if "data" not in columns:  # trace databases from before results were kept in full
+            self._db.execute("ALTER TABLE tool_calls ADD COLUMN data TEXT")
         self._lock = threading.Lock()
 
     def _exec(self, sql: str, args: tuple[Any, ...] = ()) -> sqlite3.Cursor:
@@ -85,12 +102,26 @@ class TraceDB:
         )
         return int(cur.lastrowid or 0)
 
-    def events(self, session: str, since: int = 0, limit: int = 500) -> list[dict[str, Any]]:
+    def events(self, session: str, since: int = 0, limit: int | None = 500) -> list[dict[str, Any]]:
         rows = self._exec(
             "SELECT * FROM events WHERE session = ? AND id > ? ORDER BY id LIMIT ?",
-            (session, since, limit),
+            (session, since, -1 if limit is None else limit),
         ).fetchall()
         return [dict(r) | {"payload": json.loads(r["payload"])} for r in rows]
+
+    def trace(self, session: str) -> list[dict[str, Any]]:
+        """Every event of the session from its start, each tool call with its full result."""
+        data = {
+            r["call_id"]: json.loads(r["data"]) if r["data"] else None
+            for r in self._exec(
+                "SELECT call_id, data FROM tool_calls WHERE session = ?", (session,)
+            ).fetchall()
+        }
+        events = self.events(session, limit=None)
+        for e in events:
+            if e["kind"] == "tool_call":
+                e["payload"]["data"] = data.get(e["payload"].get("call_id"))
+        return events
 
     def turn(self, session: str, data: dict[str, Any]) -> int:
         self._exec(
@@ -124,19 +155,21 @@ class TraceDB:
         source: str,
     ) -> int:
         self._exec(
-            "INSERT OR REPLACE INTO tool_calls VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO tool_calls (call_id, session, turn, tool, args, summary, ok, "
+            "latency, error, source, ts, data) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 call_id,
                 session,
                 turn,
                 tool,
                 json.dumps(args, default=str),
-                result.get("summary", "")[:20000],
+                result.get("summary", ""),
                 int(bool(result.get("ok"))),
                 latency,
                 None if result.get("ok") else result.get("summary", "")[:500],
                 source,
                 time.time(),
+                _data_json(result.get("data")),
             ),
         )
         for handle in result.get("handles") or []:
@@ -159,7 +192,7 @@ class TraceDB:
                 "args": args,
                 "turn": turn,
                 "ok": result.get("ok"),
-                "summary": result.get("summary", "")[:4000],
+                "summary": result.get("summary", ""),
                 "handles": result.get("handles") or [],
                 "latency": latency,
             },

@@ -31,6 +31,10 @@ limits_app = typer.Typer(
     invoke_without_command=True,
 )
 hook_app = typer.Typer(help="Hook adapters for external agents.", no_args_is_help=True)
+sessions_app = typer.Typer(
+    help="This project's sessions, and their full records.", invoke_without_command=True
+)
+app.add_typer(sessions_app, name="sessions")
 app.add_typer(keys_app, name="keys")
 app.add_typer(limits_app, name="limits")
 app.add_typer(hook_app, name="hook")
@@ -311,11 +315,14 @@ def new(
     )
 
 
-@app.command()
+@sessions_app.callback()
 def sessions(
+    ctx: typer.Context,
     all_: Annotated[bool, typer.Option("--all", help="Include other projects' sessions.")] = False,
 ) -> None:
     """List this project's sessions (or every session with --all)."""
+    if ctx.invoked_subcommand is not None:
+        return
     from wspx.project import Project
 
     try:
@@ -333,6 +340,26 @@ def sessions(
             f"{mark} {r['id']}  {r['status']:<8} {r['tier']:<5} {r.get('project') or '-':<16} "
             f"{r['model']}  {r.get('driver') or ''}"
         )
+
+
+@sessions_app.command("export")
+def sessions_export(
+    session: Annotated[
+        str | None, typer.Argument(help="Session id (default: the current one).")
+    ] = None,
+    out: Annotated[Path, typer.Option("--out", "-o", help="Folder to write into.")] = Path(
+        "wspx-sessions"
+    ),
+) -> None:
+    """Write a session's full record: trace.jsonl, transcript.md and session.json."""
+    from wspx import transcript
+
+    try:
+        folder = transcript.write(_control().export_session(_session(session)), out)
+    except WspxError as exc:
+        _fail(exc)
+        return
+    typer.echo(f"wrote {folder}/ (trace.jsonl, transcript.md, session.json)")
 
 
 @app.command("open")

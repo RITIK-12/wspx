@@ -231,3 +231,76 @@ def test_the_runner_follows_modals_redirect_too() -> None:
 
     hooks = ControlHooks("http://c", "", "s_1", "rt", "lt", transport=httpx.MockTransport(modal))
     assert hooks.tool("ls", {}, "call_1").text == "listed"
+
+
+EXPORT = {
+    "format": "wspx-session/1",
+    "wspx": "0.0.0",
+    "exported": 1795150000.0,
+    "session": {"id": "s_1", "model": "m", "driver": "anthropic:x", "task": "find loops"},
+    "events": [
+        {"id": 1, "kind": "session", "source": "wspx", "ts": 1.0, "payload": {"status": "created"}},
+        {
+            "id": 2,
+            "kind": "start",
+            "source": "driver",
+            "ts": 2.0,
+            "payload": {
+                "provider": "anthropic",
+                "model": "x",
+                "system": "SYSTEM",
+                "message": "find",
+            },
+        },
+        {
+            "id": 3,
+            "kind": "turn",
+            "source": "driver",
+            "ts": 3.0,
+            "payload": {
+                "turn": 1,
+                "model": "x",
+                "reasoning": "I should grep first",
+                "text": "",
+                "tool_calls": [{"id": "c1", "name": "grep", "args": {"expression": "x"}}],
+                "usage": {"input": 4, "output": 90, "cache_read": 6000, "cache_write": 50},
+                "latency": 2.0,
+            },
+        },
+        {
+            "id": 4,
+            "kind": "tool_call",
+            "source": "driver",
+            "ts": 4.0,
+            "payload": {
+                "tool": "grep",
+                "call_id": "c1",
+                "ok": True,
+                "summary": "L3.mlp.down[:, 7]",
+            },
+        },
+    ],
+    "usage": {"groups": [{"provider": "anthropic", "model": "x", "n": 1, "c": 0.01}]},
+}
+
+
+def test_sessions_export_writes_the_whole_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import json
+
+    fake = FakeControl()
+    fake.export_session = lambda sid: {**EXPORT, "session": {**EXPORT["session"], "id": sid}}  # type: ignore[attr-defined]
+    monkeypatch.setattr(main, "_control", lambda: fake)
+    cli_config.save(cli_config.CliConfig("u", "t", "s_1"))
+    result = runner.invoke(main.app, ["sessions", "export", "s_1", "-o", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    folder = tmp_path / "s_1"
+    lines = (folder / "trace.jsonl").read_text().splitlines()
+    assert [json.loads(line)["kind"] for line in lines] == ["session", "start", "turn", "tool_call"]
+    md = (folder / "transcript.md").read_text()
+    assert "> I should grep first" in md  # the driver's reasoning
+    assert "in 6,054 (6,000 cache read, 50 written) → out 90 tokens" in md
+    assert "L3.mlp.down[:, 7]" in md  # the tool's result
+    assert "SYSTEM" in md
+    assert json.loads((folder / "session.json").read_text())["usage"]["groups"][0]["n"] == 1
