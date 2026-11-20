@@ -92,6 +92,9 @@ def test_anthropic_thinking_signatures_round_trip() -> None:
     assert sent["betas"] == ["server-side-fallback-2026-07-01"]
     assert sent["fallbacks"] == "default"
     assert sent["thinking"] == {"type": "adaptive", "display": "summarized"}
+    # the system prompt keeps its own breakpoint; the conversation tail is cached automatically
+    assert sent["system"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert sent["cache_control"] == {"type": "ephemeral"}
     replayed = sent["messages"][1]["content"]
     assert replayed[0] == {
         "type": "thinking",

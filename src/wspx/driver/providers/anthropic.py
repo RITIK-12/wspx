@@ -95,6 +95,10 @@ class AnthropicProvider:
             "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
             "messages": self.messages(history),
             "tools": tools,
+            # Automatic caching moves a breakpoint to the end of the conversation each turn,
+            # so every turn reads the history back instead of paying for it again; the
+            # marker on the system prompt keeps tools and instructions cached regardless.
+            "cache_control": {"type": "ephemeral"},
         }
         if self.model.startswith(ADAPTIVE_PREFIXES):
             params["thinking"] = {"type": "adaptive", "display": "summarized"}
