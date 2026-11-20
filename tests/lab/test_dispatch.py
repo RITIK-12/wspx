@@ -65,3 +65,22 @@ def test_edit_ops_explain_their_arguments(lab) -> None:  # type: ignore[no-untyp
     assert "vcs merge" in merge_only.summary
     unknown = call(lab, "edit", {"op": "nudge", "args": {}})
     assert "orthogonalize" not in unknown.summary  # not offered where it cannot run
+
+
+def test_ls_filters_by_layers_alone(lab) -> None:  # type: ignore[no-untyped-def]
+    rows = call(lab, "ls", {"layers": "1"}).data["rows"]
+    assert rows
+    assert all(address.startswith("L1.") for address, *_ in rows)
+    downs = call(lab, "ls", {"scope": "L*.mlp.down", "layers": "0-1"}).data["rows"]
+    assert [address for address, *_ in downs] == ["L0.mlp.down", "L1.mlp.down"]
+
+
+def test_attribution_shows_the_requested_number_of_units(lab) -> None:  # type: ignore[no-untyped-def]
+    traced = call(
+        lab, "trace", {"prompt": [1, 2, 3, 4], "reference": [5, 6, 7, 8], "target": 9, "top": 3}
+    )
+    assert traced.ok, traced.summary
+    ranked = [
+        line for line in traced.summary.splitlines() if line.strip()[:2].rstrip(".").isdigit()
+    ]
+    assert len(ranked) == 3

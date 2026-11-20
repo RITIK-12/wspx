@@ -303,7 +303,7 @@ def forward_trace(
         )
         lines.append(f"L{i:<5d} {resid_norm[i]:<8.3g} {toks}")
     lines.append(
-        "output: "
+        "predicted next token at the last 3 positions (H = entropy): "
         + " ".join(
             f"{text.show(t)}(H={h:.2f})" for t, h in zip(out_ids[-3:], entropy[-3:], strict=True)
         )
@@ -458,7 +458,7 @@ def attribution_trace(
         a_f = acts.detach()[0, -1].float()
         a_r = ref.units[param][0, -1].float()
         score = (a_f - a_r) * grad[0, -1].float()
-        scored.extend(_unit_scores(role, score, top))
+        scored.extend(_unit_scores(role, score, max(top, 10)))  # rank over a wide pool
     scored.sort(key=lambda x: -abs(x[1]))
     lines = [f"attribution · objective log p({text.show(tid)}) at the last token · (Δa × ∂/∂a)"]
     lines.extend(f"  {i + 1:>2}. {a:<32s} {s:+.4f}" for i, (a, s) in enumerate(scored[:top]))

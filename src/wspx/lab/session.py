@@ -309,8 +309,9 @@ class Lab:
         layers: str | None = None,
         limit: int = 100,
     ) -> ToolResult:
-        if role is not None:
-            scope = f"L{layers or '*'}.{role}"
+        if role is not None or layers is not None:
+            head, _, rest = scope.partition(".") if scope.startswith("L") else ("L*", "", "*")
+            scope = f"L{layers or head[1:]}.{role or rest or '*'}"
         targets = self.resolve(scope)
         rows = []
         for t in targets:
@@ -502,7 +503,7 @@ class Lab:
                 prompt,
                 reference,
                 target=target,
-                top=max(top, 10),
+                top=top,
             )
         elif vs is not None:
             other = (
