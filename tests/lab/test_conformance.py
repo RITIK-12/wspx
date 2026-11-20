@@ -81,6 +81,14 @@ LLMS: dict[str, tuple[Callable[[], Any], list[str]]] = {
         ),
         ["L0.attn.post_norm", "L0.mlp.post_norm", "L1.attn.q_norm"],
     ),
+    "gemma4": (
+        lm(
+            lambda: T.Gemma4TextConfig(
+                **C, intermediate_size=96, num_key_value_heads=2, head_dim=16
+            )
+        ),
+        ["L0.attn.q", "L0.attn.o", "L0.attn.post_norm", "L1.mlp.gate", "L1.mlp.down"],
+    ),
     "mistral": (
         lm(lambda: T.MistralConfig(**C, intermediate_size=96, num_key_value_heads=2, head_dim=16)),
         ["L1.mlp.gate"],
