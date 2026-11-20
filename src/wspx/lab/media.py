@@ -93,7 +93,7 @@ class Media:
     def item(self, ref: str) -> Any:
         name, sep, index = str(ref).rpartition("/")
         if not sep or not name or not index.isdigit():
-            raise WspxError(f"item {ref!r}: use '<set>/<n>', e.g. 'ladder_dev/17'")
+            raise WspxError(f"item {ref!r}: use '<set>/<n>', e.g. 'questions/17'")
         rows = self.prompt_set(name)
         n = int(index)
         if n >= len(rows):

@@ -299,21 +299,21 @@ def test_suites_score_image_prompts_and_blind_suites_show_aggregates_only(
             yield api.expect.margin(
                 said == labels[i],
                 margin if labels[i] else -margin,
-                group="done" if labels[i] else "not done",
+                group="yes" if labels[i] else "no",
             )
 
-    suite = api.Suite("ladder_like", verify, blind=True, source="v1")
+    suite = api.Suite("grouped", verify, blind=True, source="v1")
     result = runner.run_suite(suite, model, "t")
     text = runner.summary(result, vs=result)
     assert "blind" in text
-    assert "by group: done" in text
+    assert "by group: yes" in text
     assert "balanced" in text
     assert "✗" not in text
     assert "item 0" not in text
     view = runner.driver_view(result)
     assert "checks" not in view
     assert "failures" not in view
-    assert set(view["groups"]) == {"done", "not done"}
+    assert set(view["groups"]) == {"yes", "no"}
     with pytest.raises(WspxError):
         runner.heldout_items(result, caller="driver")
     assert runner.heldout_items(result, caller="ui") == result.checks
@@ -321,13 +321,13 @@ def test_suites_score_image_prompts_and_blind_suites_show_aggregates_only(
 
 def test_prompt_lists_that_arrive_as_strings_are_understood(lab: Any) -> None:
     """Models sometimes JSON-encode an array into the string branch of the schema."""
-    texts = json.dumps(["The carrot rests on the plate.", "The apple is in the bowl."])
+    texts = json.dumps(["The lamp is on.", "The door is open."])
     items = json.dumps([{"item": "scenes/0"}, {"item": "scenes/1"}])
     for positive, negative in [
-        (texts, json.dumps(["The carrot is held.", "The apple is beside the bowl."])),
+        (texts, json.dumps(["The lamp is off.", "The door is shut."])),
         (items, json.dumps([{"item": "scenes/2"}, {"item": "scenes/3"}])),
         ([json.dumps({"item": "scenes/0"}), {"item": "scenes/1"}], [{"item": "scenes/2"}]),
-        ("The carrot rests on the plate.", "The carrot is held."),
+        ("The lamp is on.", "The lamp is off."),
         ("prompts/scenes.jsonl", [{"item": "scenes/2"}]),
     ]:
         out = call(lab, "contrast", {"positive": positive, "negative": negative, "name": "d"})
@@ -342,10 +342,10 @@ def test_prompt_lists_that_arrive_as_strings_are_understood(lab: Any) -> None:
 
 
 def test_a_stored_prompt_takes_a_reply(lab: Any) -> None:
-    started = {"item": "scenes/0", "reply": 'I see one.\n\n{"count": '}
+    started = {"item": "scenes/0", "reply": "Let me look.\n\nAnswer: "}
     plain = lab.text.batch([{"item": "scenes/0"}])
     replied = lab.text.batch([started])
     assert replied.ids.shape[1] > plain.ids.shape[1]
-    assert lab.text.decode(replied.ids[0].tolist()).endswith('{"count": ')
+    assert lab.text.decode(replied.ids[0].tolist()).endswith("Answer: ")
     out = call(lab, "trace", {"prompt": started})
     assert out.ok, out.summary

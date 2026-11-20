@@ -501,7 +501,7 @@ def test_custom_tools_pass(setup) -> None:  # type: ignore[no-untyped-def]
 
 def test_the_same_call_after_an_edit_is_not_a_repeat(setup) -> None:  # type: ignore[no-untyped-def]
     client, upstream, ledger = setup
-    test = ("test", {"suite": "ladder_dev", "vs": "base"})
+    test = ("test", {"suite": "dev", "vs": "base"})
     edit = ("edit", {"op": "scale", "args": {"targets": "L3.mlp.down", "factor": 0.9}})
 
     def turn(*calls: tuple[str, dict]) -> None:  # type: ignore[type-arg]
