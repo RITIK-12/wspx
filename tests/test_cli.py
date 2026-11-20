@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -155,4 +156,5 @@ def test_new_needs_a_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(main, "_control", FakeControl)
     result = runner.invoke(main.app, ["new", "task"])
     assert result.exit_code != 0
-    assert "--model" in result.output
+    # Typer colours its errors on CI (GITHUB_ACTIONS forces a terminal); compare the text.
+    assert "pass --model" in re.sub(r"\x1b\[[0-9;]*m", "", result.output)
