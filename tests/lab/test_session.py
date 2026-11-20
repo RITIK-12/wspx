@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import textwrap
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -281,3 +282,46 @@ def test_wspx_session_entry_point(tmp_path: Path) -> None:
         assert wspx.session() is lab
     finally:
         activate(previous)
+
+
+def test_grep_holds_one_tensor_at_a_time(lab: Lab, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Seen live: wide greps ran a 24 GB card out of memory holding every fp32 block."""
+    import weakref
+
+    from wspx.lab import grep as grep_mod
+
+    alive: list[weakref.ref[torch.Tensor]] = []
+    most = 0
+    units = grep_mod._units
+
+    def counted(*args: Any, **kw: Any) -> Any:
+        nonlocal most
+        for batch in units(*args, **kw):
+            alive.append(weakref.ref(batch.vectors))
+            most = max(most, sum(r() is not None for r in alive))
+            yield batch
+
+    monkeypatch.setattr(grep_mod, "_units", counted)
+    hits = lab.grep("colnorm > 1σ", scope="L*.mlp.down,L*.attn.o", top=3)
+    assert len(alive) >= 2 * 2 * lab.ir.num_blocks  # every tensor, once per pass
+    assert most <= 2  # the one being scored, and the last one until it is released
+    assert len(hits) == 3
+
+
+def test_contrast_keeps_its_direction_when_ranking_writers_fails(
+    lab: Lab, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    grep = Lab.grep
+
+    def failing(self: Lab, expression: str | None = None, **kw: Any) -> Any:
+        if expression and expression.startswith("abs(cos(dir:"):
+            raise RuntimeError("CUDA out of memory")
+        return grep(self, expression, **kw)
+
+    monkeypatch.setattr(Lab, "grep", failing)
+    d = lab.contrast(
+        [[1, i, 2, 10] for i in range(20, 24)], [[1, i, 2, 60] for i in range(20, 24)], name="kept"
+    )
+    assert "dir:kept" in d.summary
+    assert "not ranked (RuntimeError: CUDA out of memory)" in d.summary
+    assert "kept" in lab.directions

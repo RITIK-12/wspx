@@ -569,7 +569,16 @@ class Lab:
             call_id=self.context.get("call_id"),
         )
         self._save()
-        writers = self.grep(f"abs(cos(dir:{name}))", scope=_writer_scope(self.ir), top=5)
+        ranking = f"abs(cos(dir:{name}))"
+        try:
+            writers: GrepHits | str = self.grep(ranking, scope=_writer_scope(self.ir), top=5)
+        except (RuntimeError, GrepError) as exc:  # the direction is kept either way
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            writers = (
+                f"  not ranked ({type(exc).__name__}: {str(exc)[:160]}); "
+                f"rank them with grep '{ranking}' over a narrower scope"
+            )
         return DirectionRef(self, entry.display, d, writers)
 
     # ------------------------------------------------------------------ trace
@@ -1597,7 +1606,7 @@ class GrepHits:
 
 class DirectionRef:
     def __init__(
-        self, lab: Lab, handle: str, direction: analysis.Direction, writers: GrepHits
+        self, lab: Lab, handle: str, direction: analysis.Direction, writers: GrepHits | str
     ) -> None:
         self.lab = lab
         self.handle = handle
@@ -1613,7 +1622,8 @@ class DirectionRef:
         d = self.direction
         return (
             f"{self.handle} · ‖v‖ {float(d.vector.norm()):.3g} · separation {d.separation:.2f} "
-            f"({d.n_pos} vs {d.n_neg} prompts)\ntop writers:\n{self.writers.summary}"
+            f"({d.n_pos} vs {d.n_neg} prompts)"
+            f"\ntop writers:\n{self.writers if isinstance(self.writers, str) else self.writers.summary}"
         )
 
     def __str__(self) -> str:

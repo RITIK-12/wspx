@@ -697,22 +697,25 @@ def grep(
         names = set(re.findall(r"[a-z]+", expression))
         axis = "col" if "colnorm" in names else "row" if "rownorm" in names else None
     started = time.perf_counter()
-    batches: list[UnitBatch] = []
     skipped: list[str] = []
-    for target in targets:
-        try:
-            batches.extend(unit_batches(env.ir, env.params, [target], axis))
-        except GrepError:
-            if len(targets) == 1:
-                raise
-            skipped.append(target.address)  # a wide scope skips what has no units (3-D, 1-D)
-    if not batches:
-        raise GrepError("scope contains no weights")
+    lone = len(targets) == 1
 
-    # σ thresholds need the population of the left side across the whole scope.
+    def batches() -> Iterator[UnitBatch]:
+        """One tensor's units at a time, so only one fp32 copy is alive (24 GB cards held
+        every block of a wide scope at once and ran out of memory)."""
+        for target in targets:
+            try:
+                yield from unit_batches(env.ir, env.params, [target], axis)
+            except GrepError:
+                if lone:
+                    raise
+                if target.address not in skipped:  # a wide scope skips what has no units
+                    skipped.append(target.address)
+
+    # σ thresholds need the population of the left side across the whole scope: a first pass.
     thresholds: list[str] = []
     for node in _sigma_nodes(tree):
-        values = torch.cat([_flat(_Eval(env, b).eval(node.left), b) for b in batches])
+        values = torch.cat([_flat(_Eval(env, b).eval(node.left), b).cpu() for b in batches()])
         mu, sd = (
             float(values.mean()),
             float(values.std(correction=0)) if values.numel() > 1 else 0.0,
@@ -727,8 +730,9 @@ def grep(
 
     scores: list[Hit] = []
     hits: list[Hit] = []
-    used_axis = batches[0].axis
-    for batch in batches:
+    used_axis: str | None = None
+    for batch in batches():
+        used_axis = used_axis or batch.axis
         ev = _Eval(env, batch)
         score = _flat(ev.eval(key), batch)
         keep = (
@@ -738,6 +742,7 @@ def grep(
         )
         score_l = score.detach().cpu().tolist()
         keep_l = keep.detach().cpu().tolist()
+        del ev, score, keep
         for address, unit, s, k in zip(
             batch.addresses, batch.globals, score_l, keep_l, strict=True
         ):
@@ -751,6 +756,8 @@ def grep(
             scores.append(hit)
             if k:
                 hits.append(hit)
+    if used_axis is None:
+        raise GrepError("scope contains no weights")
     order = lambda h: (math.isnan(h.score), -h.score if not math.isnan(h.score) else 0.0)  # noqa: E731
     scores.sort(key=order)
     hits.sort(key=order)
