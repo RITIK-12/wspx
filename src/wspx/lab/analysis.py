@@ -436,7 +436,7 @@ def attribution_trace(
     ids_f, mask_f = text.batch([failing], device)
     ids_r, mask_r = text.batch([reference], device)
     with torch.no_grad(), probe.capture([], units=units) as ref:
-        forward(model, ir, ids_r, mask_r)
+        ref_logits = forward(model, ir, ids_r, mask_r)
     requires = {n: p.requires_grad for n, p in model.named_parameters()}
     for p in model.parameters():
         p.requires_grad_(False)
@@ -460,7 +460,13 @@ def attribution_trace(
         score = (a_f - a_r) * grad[0, -1].float()
         scored.extend(_unit_scores(role, score, max(top, 10)))  # rank over a wide pool
     scored.sort(key=lambda x: -abs(x[1]))
-    lines = [f"attribution · objective log p({text.show(tid)}) at the last token · (Δa × ∂/∂a)"]
+    logp_ref = float(torch.log_softmax(ref_logits[0, -1].float(), dim=-1)[tid])
+    lines = [
+        f"attribution · objective log p({text.show(tid)}) at the last token: "
+        f"{float(logp[tid].detach()):.3f} here, {logp_ref:.3f} on the reference",
+        "  score = (activation here − on the reference) × ∂ log p / ∂ activation: positive "
+        "units push the token up here, negative ones hold it down",
+    ]
     lines.extend(f"  {i + 1:>2}. {a:<32s} {s:+.4f}" for i, (a, s) in enumerate(scored[:top]))
     return Trace(
         "attribution",

@@ -358,7 +358,6 @@ class Lab:
             (
                 result.expression.split(" ")[0] if fires_on is None else "fires-on",
                 _scope_label(scope),
-                f"top{top}",
             ),
             name=name,
             description=(
@@ -766,7 +765,7 @@ class Lab:
                 reference = self._run(s, state)
             if s.heldout:
                 self.heldout_queries += 1
-            lines.append(runner.summary(current, vs=reference))
+            lines.append(runner.summary(current, vs=reference, vs_label=vs))
             data.append(runner.driver_view(current) if caller != "ui" else current.__dict__)
         self._save()
         return ToolResult("\n".join(lines), {"runs": data})

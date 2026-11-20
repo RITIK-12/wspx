@@ -88,6 +88,11 @@ class Report(BaseModel):
         n_err, n_warn = len(self.errors), len(self.warnings)
         verdict = "ok" if self.ok else "blocked"
         head = f"check {verdict}: {n_err} error(s), {n_warn} warning(s) [{', '.join(self.levels)}]"
+        stats = self.stats or {}
+        if "canary_kl" in stats:  # the smoke numbers, warning or not
+            head += f"\nsmoke: canary KL vs base {stats['canary_kl']:.3f}"
+            if "ppl_new" in stats:
+                head += f" · perplexity {stats['ppl_base']:.2f} → {stats['ppl_new']:.2f}"
         if not self.diagnostics:
             return head
         return head + "\n" + "\n".join(d.render() for d in self.diagnostics)

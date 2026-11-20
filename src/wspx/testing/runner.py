@@ -206,21 +206,39 @@ def paired(
 # --------------------------------------------------------------------------- reporting
 
 
+MEASURES = {
+    "kl": "KL vs base (lower is better)",
+    "logit_diff": "logit difference",
+    "judge": "judge score",
+}
+
+
 def summary(
-    result: RunResult, *, vs: RunResult | None = None, show_failures: int = PREVIEW_FAILURES
+    result: RunResult,
+    *,
+    vs: RunResult | None = None,
+    vs_label: str | None = None,
+    show_failures: int = PREVIEW_FAILURES,
 ) -> str:
     """What the driver sees: aggregate, paired delta and (dev only) a few failing examples."""
+    kinds = {c["kind"] for c in result.checks}
+    # a mean is only meaningful over items scored the same way (not perplexity with pass/fail)
+    measure = MEASURES.get(next(iter(kinds))) if len(kinds) == 1 else None
     head = (
         f"{result.suite} [{result.split}] {result.passed}/{result.n} passed "
-        f"({result.pass_rate:.1%}) · mean {result.mean_score:.3f}"
+        f"({result.pass_rate:.1%})"
+        + (f" · mean {measure} {result.mean_score:.3f}" if measure else "")
         + (" · cached" if result.cached else f" · {result.seconds:.1f}s")
     )
     lines = [head]
     if vs is not None:
         p = paired(result, vs)
+        label = vs_label or vs.tree[:9]
         lines.append(
-            f"  vs {vs.tree[:9]}: Δ {p.mean_delta:+.3f} [95% CI {p.ci_low:+.3f}, {p.ci_high:+.3f}] "
-            f"· {p.flips_up} fixed, {p.flips_down} broken (n={p.n})"
+            f"  vs {label}: Δ {p.mean_delta:+.3f} [95% CI {p.ci_low:+.3f}, {p.ci_high:+.3f}] "
+            f"(score here minus at {label}"
+            + (", where a higher KL is worse" if kinds == {"kl"} else "")
+            + f") · {p.flips_up} fixed, {p.flips_down} broken (n={p.n})"
         )
     if result.split == "heldout":
         lines.append("  (held-out: per-item results are visible in the UI only)")

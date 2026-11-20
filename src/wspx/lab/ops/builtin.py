@@ -347,15 +347,17 @@ def _restore_base(ctx: OpContext, targets: Any) -> list[TensorDelta]:
         if torch.equal(src, cur):
             continue
         out.append(
-            patch.dense(
-                target.param,
-                tuple(ctx.ir.params[target.param].shape),
-                ctx.base_hash(target.param),
-                src - cur,
-                index=index,
-                kind="set",
-                op="transplant",
-                source="base",
+            patch.compact(
+                patch.dense(
+                    target.param,
+                    tuple(ctx.ir.params[target.param].shape),
+                    ctx.base_hash(target.param),
+                    src - cur,
+                    index=index,
+                    kind="set",
+                    op="transplant",
+                    source="base",
+                )
             )
         )
     return out

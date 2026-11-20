@@ -230,7 +230,10 @@ class Repo:
         self._check_branch(name)
         oid = self.resolve(at) if at else None
         if self.store.refs.exists(HEADS + name):
-            raise VCSError(f"branch {name!r} already exists")
+            raise VCSError(
+                f"branch {name!r} already exists (branches are shared by every session on this "
+                "model); pick another name, or check it out"
+            )
         self.store.refs.update(HEADS + name, oid or "", expected=None)
         return oid or ""
 

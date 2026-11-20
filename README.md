@@ -44,6 +44,11 @@ wspx open                   # watch the session in the browser
 project has its own current session, which the commands below act on; pass
 `--session` to pick another.
 
+A session's trace records everything from its start: the driver's prompt, each
+turn's reasoning, text and token counts, and every tool call with its full
+result. `wspx sessions export` writes it as `trace.jsonl`, `transcript.md` and
+`session.json`; the UI's Traces tab shows the same record.
+
 ## Commands
 
 Every tool the agent has is also a command:
@@ -186,6 +191,9 @@ Any PyTorch model whose forward pass runs. Tested against Llama, Mistral,
 Qwen3, Qwen3-MoE, Qwen3.5, Gemma 3, Gemma 4, Phi-3/Phi-4, OLMo 2, GPT-2,
 Falcon, Mixtral, gpt-oss, DeepSeek-V3, Jamba, Bamba, Mamba, ViT and ResNet, and
 plain MLPs, CNNs, LSTMs and GRUs.
+
+Vision-language checkpoints (Qwen3-VL, GLM-4.1V, Qwen3.5, Gemma 3) load with
+their vision tower; the tools work on the language model with text prompts.
 
 ## Development
 
