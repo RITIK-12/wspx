@@ -65,5 +65,9 @@ class HeldOutAccess(WspxError):
     """A driver-facing path tried to read held-out items or outputs."""
 
 
+class LabCancelled(WspxError):
+    """A lab start was cancelled because the session's lab was stopped meanwhile."""
+
+
 class LabUnavailable(WspxError):
     """The operation needs a live lab and none is reachable."""

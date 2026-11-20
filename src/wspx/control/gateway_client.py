@@ -16,7 +16,7 @@ class GatewayAdmin:
         self.client = httpx.Client(
             base_url=url.rstrip("/"),
             headers={"authorization": f"Bearer {token}"},
-            timeout=30.0,
+            timeout=90.0,  # the gateway scales to zero; a cold start takes tens of seconds
             transport=transport,
         )
 
@@ -27,7 +27,13 @@ class GatewayAdmin:
             raise WspxError(f"gateway unreachable: {exc}") from exc
         if r.status_code >= 400:
             raise WspxError(f"gateway {path}: {r.text[:300]}")
-        return r.json()
+        try:
+            return r.json()
+        except ValueError:
+            raise WspxError(f"gateway {path}: not JSON: {r.text[:300]}") from None
+
+    def halted(self) -> bool:
+        return bool(self._req("GET", "/healthz")["halted"])
 
     def keys(self) -> dict[str, Any]:
         data: dict[str, Any] = self._req("GET", "/admin/keys")["keys"]

@@ -23,7 +23,7 @@ from wspx.auth import mint
 from wspx.control.backend import Backend, LabHandle, RunnerHandle, SessionRecord
 from wspx.control.gateway_client import GatewayAdmin
 from wspx.control.tracedb import TraceDB
-from wspx.errors import WspxError
+from wspx.errors import LabCancelled, WspxError
 from wspx.store import Store, short
 from wspx.store.overlay import apply_journal
 from wspx.tools import TOOLS
@@ -63,6 +63,8 @@ class SessionManager:
         self.workspace: dict[str, str] = {}
         self.halted = False
         self._lab_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
+        self._lab_gen: dict[str, int] = defaultdict(int)
+        """Bumped by every lab stop: a start begun under an older value is abandoned."""
         self._lock = threading.RLock()
         for data in trace.sessions():
             known = {f.name for f in fields(SessionRecord)}
@@ -130,15 +132,18 @@ class SessionManager:
         record = self.get(sid)
         try:
             self.lab(sid)
+        except LabCancelled:
+            return  # stopped while the lab started: nothing to report
         except Exception as exc:
             record.status, record.reason = "error", f"lab failed to start: {exc}"
             self._save(record)
             self.trace.event(sid, "error", {"error": record.reason})
             return
-        if record.driver:
+        if record.driver and record.status in ("idle", "running"):
             self.start_driver(sid)
 
     def start_driver(self, sid: str) -> None:
+        """Start the session's driver. A session never has two: starting a running one is a no-op."""
         record = self.get(sid)
         if not record.driver:
             raise WspxError(f"{sid} has no driver")
@@ -151,22 +156,39 @@ class SessionManager:
             "WSPX_RUNNER_TOKEN": mint(self.secret, sid, scope="runner"),
             "WSPX_LLM_TOKEN": mint(self.secret, sid, scope="llm"),
         }
-        record.status = "running"
-        self._save(record)
-        self.runners[sid] = self.backend.start_runner(record, env)
+        with self._lock:
+            runner = self.runners.get(sid)
+            if runner is not None and runner.alive():
+                if record.status == "running":
+                    return
+                runner.stop()  # a paused or stopped driver still winding down
+            record.status = "running"
+            self._save(record)
+            self.runners[sid] = self.backend.start_runner(record, env)
         self.trace.event(sid, "session", {"status": "running"})
 
     # ------------------------------------------------------------------ labs
 
     def lab(self, sid: str) -> LabHandle:
-        """The session's lab, started if cold (blocks until it is up)."""
+        """The session's lab, started if cold (blocks until it is up).
+
+        Stopping the lab abandons a start in progress, and fails the calls
+        that were waiting for it, instead of starting the lab again for them.
+        """
+        gen = self._lab_gen[sid]
         with self._lab_locks[sid]:
             if sid in self.labs:
                 return self.labs[sid]
+            if self._lab_gen[sid] != gen:
+                raise LabCancelled(f"{sid}'s lab was stopped")
             record = self.get(sid)
             self.trace.event(sid, "lab", {"tier": "starting"})
             started = time.time()
-            handle = self.backend.start_lab(record)
+            try:
+                handle = self.backend.start_lab(record, cancelled=lambda: self._lab_gen[sid] != gen)
+            except LabCancelled:
+                self.trace.event(sid, "lab", {"tier": "cold", "reason": "start cancelled"})
+                raise
             record.load_seconds = time.time() - started
             record.tier = "hot"
             self.labs[sid] = handle
@@ -176,6 +198,7 @@ class SessionManager:
             return handle
 
     def stop_lab(self, sid: str, reason: str) -> None:
+        self._lab_gen[sid] += 1  # before the lock: a start in progress holds it until it gives up
         with self._lab_locks[sid]:
             handle = self.labs.pop(sid, None)
             if handle is None:
@@ -223,6 +246,9 @@ class SessionManager:
                 "handles": [],
                 "data": {},
             }
+        if source == "driver" and record.status == "stopped":
+            # a driver call still in flight when the session was stopped must not wake the lab
+            return {"summary": f"{sid} was stopped", "ok": False, "handles": [], "data": {}}
         call_id = call_id or "c_" + secrets.token_hex(5)
         self.touch(sid)
         started = time.time()
@@ -354,6 +380,12 @@ class SessionManager:
             with contextlib.suppress(WspxError):
                 self.gateway.pause(sid, reason)
 
+    def sync_halt(self) -> None:
+        """Take the halt state from the gateway, which keeps it across control-plane restarts."""
+        if self.gateway is not None:
+            with contextlib.suppress(WspxError):
+                self.halted = self.gateway.halted()
+
     def resume(self, sid: str | None = None) -> None:
         targets = [sid] if sid else [s for s, r in self.records.items() if r.status == "paused"]
         if sid is None:
@@ -377,14 +409,15 @@ class SessionManager:
                 with contextlib.suppress(WspxError):
                     self.gateway.halt("kill --all")
         for s in targets:
-            self.command(s, "stop")
-            runner = self.runners.pop(s, None)
-            if runner is not None:
-                runner.stop()
-            self.stop_lab(s, "killed")
             record = self.get(s)
             record.status = "stopped"
             self._save(record)
+            self.command(s, "stop")
+            with self._lock:
+                runner = self.runners.pop(s, None)
+            if runner is not None:
+                runner.stop()
+            self.stop_lab(s, "killed")
         return len(targets)
 
     def runner_event(self, sid: str, event: dict[str, Any]) -> None:

@@ -26,6 +26,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 from starlette.types import Receive, Scope, Send
 
 from wspx import __version__
@@ -143,6 +144,10 @@ def create_app(
         except WspxError as exc:
             raise HTTPException(400, str(exc)) from None
 
+    async def offload(fn: Callable[..., Any]) -> Any:
+        """``guarded`` on a worker thread: for async endpoints whose work blocks (Modal, I/O)."""
+        return await run_in_threadpool(guarded, fn)
+
     # ------------------------------------------------------------------ MCP
 
     def mcp_call(session: str | None, name: str, args: dict[str, Any]) -> dict[str, Any]:
@@ -186,6 +191,7 @@ def create_app(
     stop = threading.Event()
 
     def ticker() -> None:
+        manager.sync_halt()  # here, not at import: a cold gateway must not delay startup
         while not stop.wait(settings.tick_seconds):
             try:
                 manager.tick()
@@ -229,8 +235,8 @@ def create_app(
         data = await request.body()
         if len(data) > project_snapshot.MAX_BYTES:
             raise HTTPException(413, "project snapshot too large")
-        infos = guarded(lambda: project_snapshot.members(data))
-        return {"snapshot": store.objects.put(data), "files": len(infos)}
+        infos = await offload(lambda: project_snapshot.members(data))
+        return {"snapshot": await offload(lambda: store.objects.put(data)), "files": len(infos)}
 
     @app.get("/api/sessions/{sid}", dependencies=[Depends(user)])
     def get_session(sid: str) -> dict[str, Any]:
@@ -263,7 +269,8 @@ def create_app(
     async def runner_event(
         sid: str, request: Request, _caller: str = Depends(session_caller)
     ) -> dict[str, Any]:
-        manager.runner_event(sid, await request.json())
+        event = await request.json()
+        await offload(lambda: manager.runner_event(sid, event))
         return {"ok": True}
 
     @app.get("/api/sessions/{sid}/commands")
@@ -278,18 +285,16 @@ def create_app(
     @app.post("/api/sessions/{sid}/{action}", dependencies=[Depends(user)])
     async def control(sid: str, action: str, request: Request) -> dict[str, Any]:
         body = await request.json() if await request.body() else {}
-        if action == "pause":
-            guarded(lambda: manager.pause(sid, body.get("reason", "paused by user")))
-        elif action == "resume":
-            guarded(lambda: manager.resume(sid))
-        elif action == "stop":
-            guarded(lambda: manager.kill(sid))
-        elif action == "inject":
-            guarded(lambda: manager.command(sid, "inject", body.get("text", "")))
-        elif action == "start":
-            guarded(lambda: manager.start_driver(sid))
-        else:
+        actions: dict[str, Callable[[], Any]] = {
+            "pause": lambda: manager.pause(sid, body.get("reason", "paused by user")),
+            "resume": lambda: manager.resume(sid),
+            "stop": lambda: manager.kill(sid),
+            "inject": lambda: manager.command(sid, "inject", body.get("text", "")),
+            "start": lambda: manager.start_driver(sid),
+        }
+        if action not in actions:
             raise HTTPException(404, f"unknown action {action}")
+        await offload(actions[action])
         return {"ok": True, "session": manager.get(sid).to_dict()}
 
     @app.get("/api/sessions/{sid}/timeline", dependencies=[Depends(user)])
@@ -374,7 +379,7 @@ def create_app(
     @app.post("/api/limits", dependencies=[Depends(user)])
     async def set_limit(request: Request) -> dict[str, Any]:
         body = await request.json()
-        return guarded(lambda: need_gateway().set_limit(body))  # type: ignore[no-any-return]
+        return await offload(lambda: need_gateway().set_limit(body))  # type: ignore[no-any-return]
 
     @app.delete("/api/limits/{limit_id}", dependencies=[Depends(user)])
     def remove_limit(limit_id: str) -> dict[str, Any]:
@@ -383,7 +388,7 @@ def create_app(
     @app.post("/api/prices", dependencies=[Depends(user)])
     async def set_price(request: Request) -> dict[str, Any]:
         body = await request.json()
-        guarded(
+        await offload(
             lambda: need_gateway().price(body["model"], float(body["input"]), float(body["output"]))
         )
         return {"ok": True}
@@ -395,12 +400,12 @@ def create_app(
     @app.post("/api/kill", dependencies=[Depends(user)])
     async def kill(request: Request) -> dict[str, Any]:
         body = await request.json() if await request.body() else {}
-        return {"stopped": guarded(lambda: manager.kill(body.get("session")))}
+        return {"stopped": await offload(lambda: manager.kill(body.get("session")))}
 
     @app.post("/api/resume", dependencies=[Depends(user)])
     async def resume(request: Request) -> dict[str, Any]:
         body = await request.json() if await request.body() else {}
-        guarded(lambda: manager.resume(body.get("session")))
+        await offload(lambda: manager.resume(body.get("session")))
         return {"ok": True}
 
     @app.get("/api/doctor", dependencies=[Depends(user)])

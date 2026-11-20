@@ -11,7 +11,7 @@ from typing import Any, Protocol
 
 import httpx
 
-from wspx.errors import LabUnavailable
+from wspx.errors import LabCancelled, LabUnavailable
 
 
 @dataclass
@@ -61,7 +61,9 @@ class RunnerHandle(Protocol):
 
 
 class Backend(Protocol):
-    def start_lab(self, record: SessionRecord) -> LabHandle: ...
+    def start_lab(self, record: SessionRecord, cancelled: Callable[[], bool]) -> LabHandle:
+        """Start a lab and wait until it serves; give up (LabCancelled) once ``cancelled()``."""
+        ...
 
     def start_runner(self, record: SessionRecord, env: dict[str, str]) -> RunnerHandle: ...
 
@@ -184,7 +186,9 @@ class LocalBackend:
         self.labs: list[InProcessLab] = []
         self.runners: list[ThreadRunner] = []
 
-    def start_lab(self, record: SessionRecord) -> LabHandle:
+    def start_lab(
+        self, record: SessionRecord, cancelled: Callable[[], bool] = lambda: False
+    ) -> LabHandle:
         from wspx.lab.server import LabServer
         from wspx.store.overlay import OverlayStore
 
@@ -195,6 +199,9 @@ class LocalBackend:
             else _load_lab(record, overlay)
         )
         handle = InProcessLab(LabServer(lab, exit_on_lapse=False))
+        if cancelled():
+            handle.stop()
+            raise LabCancelled(f"{record.id}'s lab was stopped while it started")
         self.labs.append(handle)
         return handle
 

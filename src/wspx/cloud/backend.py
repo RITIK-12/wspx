@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import secrets
 import time
+from collections.abc import Callable
 from typing import Any
 
 import httpx
 
 from wspx.cloud import APP_NAME, ENVIRONMENT, LAB_PORT
 from wspx.control.backend import HttpLab, SessionRecord
+from wspx.errors import LabCancelled
 from wspx.safety import LEASE_DICT, TAG_KEY, TAG_VALUE
 
-READY_TIMEOUT_S = 3600.0
+READY_TIMEOUT_S = 1800.0
 SANDBOX_MAX_S = 24 * 3600
 
 
@@ -67,10 +69,14 @@ class ModalBackend:
     def _fn(self, name: str) -> Any:
         return self.modal.Function.from_name(APP_NAME, name, environment_name=ENVIRONMENT)
 
-    def start_lab(self, record: SessionRecord) -> ModalLab:
+    def start_lab(
+        self, record: SessionRecord, cancelled: Callable[[], bool] = lambda: False
+    ) -> ModalLab:
         from wspx.cloud.app import app, lab_image, models_volume
 
         path = self._fn("download").remote(record.model, record.revision)
+        if cancelled():
+            raise LabCancelled(f"{record.id}'s lab was stopped while it started")
         self.store_volume.commit()  # the lab mounts the store read-only: give it the latest state
         lab_token = secrets.token_urlsafe(24)
         args = [
@@ -114,6 +120,9 @@ class ModalBackend:
         lab = ModalLab(sandbox, creds.url, creds.token, lab_token, self.leases)
         deadline = time.time() + READY_TIMEOUT_S
         while time.time() < deadline:
+            if cancelled():
+                lab.stop()
+                raise LabCancelled(f"{record.id}'s lab was stopped while it started")
             try:
                 if lab.client.get("/health", timeout=10).status_code == 200:
                     break
@@ -123,8 +132,8 @@ class ModalBackend:
                 raise RuntimeError(f"lab exited while loading: {sandbox.stderr.read()[-2000:]}")
             time.sleep(3)
         else:
-            sandbox.terminate()
-            raise RuntimeError("lab did not become ready in time")
+            lab.stop()
+            raise RuntimeError(f"lab did not become ready in {READY_TIMEOUT_S / 60:.0f} minutes")
         self.labs.append(lab)
         return lab
 
