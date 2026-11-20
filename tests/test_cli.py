@@ -158,3 +158,17 @@ def test_new_needs_a_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     assert result.exit_code != 0
     # Typer colours its errors on CI (GITHUB_ACTIONS forces a terminal); compare the text.
     assert "pass --model" in re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+
+
+def test_a_stopped_deployment_is_a_clear_error() -> None:
+    import httpx
+
+    from wspx.cli.client import Control
+    from wspx.errors import WspxError
+
+    def stopped(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="modal-http: app for invoked web endpoint is stopped")
+
+    control = Control("http://control", "t", transport=httpx.MockTransport(stopped))
+    with pytest.raises(WspxError, match="wspx deploy"):
+        control.sessions()

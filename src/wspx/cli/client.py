@@ -34,7 +34,13 @@ class Control:
             except ValueError:
                 detail = r.text
             raise WspxError(f"{method} {path}: {detail}")
-        return r.json()
+        try:
+            return r.json()
+        except ValueError:
+            raise WspxError(
+                f"{method} {path}: the control plane at {self.url} answered with something "
+                f"other than JSON (is the deployment stopped? run `wspx deploy`): {r.text[:200]}"
+            ) from None
 
     def sessions(self) -> list[dict[str, Any]]:
         data: list[dict[str, Any]] = self._req("GET", "/api/sessions")["sessions"]

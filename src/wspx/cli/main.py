@@ -184,12 +184,17 @@ def deploy(
         path = write_compose(Path.cwd())
         typer.echo(f"wrote {path}; start it with `docker compose up -d`")
         return
+    from modal.exception import Error as ModalError
+
     from wspx.cloud.deploy import deploy as do_deploy
 
     try:
         result = do_deploy()
     except subprocess.CalledProcessError as exc:
         _fail(WspxError(exc.stderr or str(exc)))
+        return
+    except ModalError as exc:  # an image build failure's log is printed above this
+        _fail(WspxError(f"deploy failed: {type(exc).__name__}: {exc}"))
         return
     cfg = cli_config.load()
     cfg.url = result.control_url
