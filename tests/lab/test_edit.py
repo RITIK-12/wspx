@@ -225,8 +225,11 @@ class TestOps:
 
     def test_bake_steer_without_bias_fails_helpfully(self) -> None:
         _, _, _, ctx = make()
-        with pytest.raises(PatchError, match="no writer bias"):
+        with pytest.raises(PatchError, match="no writer bias") as err:
             get("bake_steer")(ctx, torch.randn(32), scale=1.0, at=7)
+        assert "project_out" in str(err.value)
+        assert "strength below 0" in str(err.value)
+        assert "rank_one_write" in str(err.value)
 
     def test_transplant(self) -> None:
         model, ir, tree, ctx = make(seed=0)

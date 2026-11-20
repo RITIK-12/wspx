@@ -247,14 +247,22 @@ def bake_steer(ctx: OpContext, direction: Any, *, scale: float, at: int | str) -
         if with_bias
         else "this model has no writer biases"
     )
-    hint = ""
+    name = direction if isinstance(direction, str) else "the direction"
+    hint = (
+        ". Without a bias, no weight adds a constant vector at every token; these edits move "
+        f"the residual along {name} instead. Amplify it where it is already written: grep "
+        f"'cos({name}) > 0.1' in L{at}.mlp.down (or a range of blocks), then project_out "
+        f"{name} on those units with strength below 0 (-1 doubles their component). Or "
+        "rank_one_write one writer so that an input it sees writes more of it"
+    )
     if embed is not None:
         rows = ctx.weight(embed).float().norm(dim=-1).median()
-        hint = (
-            f". at=0 shifts every token embedding instead: that is before block 0, not after "
+        hint += (
+            f". at=0 shifts every token embedding: that is before block 0, not after "
             f"block {at}, so a direction found deeper in the model may mean something else "
             f"there, and scale is an absolute norm (embedding rows have median norm "
-            f"{float(rows):.3g})"
+            f"{float(rows):.3g}); on a vision-language model image tokens do not come from "
+            "the embedding, so they are not shifted"
         )
     raise PatchError(f"block {at} has no writer bias to carry a steering vector ({where}){hint}")
 
