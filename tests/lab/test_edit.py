@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import random
+from pathlib import Path
 
 import pytest
 import torch
@@ -332,3 +333,25 @@ class TestChecks:
             SmokeMetrics(kl=0.5, ppl_base=10, ppl_new=20, degenerate=["empty output"]), self.cfg
         )
         assert {d.code for d in report.diagnostics} == {"W301", "W302", "W303"}
+
+
+def test_transplant_from_base_restores_exactly(tmp_path: Path) -> None:
+    from tests.lab.test_session import tiny_llama
+    from wspx.lab.sdk import open_lab
+    from wspx.lab.tensors import tensor_hash
+
+    lab = open_lab(tiny_llama(), store=tmp_path / "s", workdir=tmp_path)
+    base = tensor_hash(lab.model.get_parameter("model.layers.1.mlp.down_proj.weight"))
+    lab.edit.scale("L1.mlp.down", factor=0.5)
+    lab.commit("halve L1 down")
+    lab.edit.transplant("L1.mlp.down")  # source defaults to the base model
+    assert tensor_hash(lab.model.get_parameter("model.layers.1.mlp.down_proj.weight")) == base
+
+
+def test_bake_steer_takes_a_block_name(tmp_path: Path) -> None:
+    from tests.lab.test_session import tiny_llama
+    from wspx.lab.sdk import open_lab
+
+    lab = open_lab(tiny_llama(), store=tmp_path / "s", workdir=tmp_path)
+    d = lab.contrast([[1, 2, 3]], [[4, 5, 6]], name="d")
+    assert lab.edit.bake_steer(d, scale=0.5, at="L0").record.deltas

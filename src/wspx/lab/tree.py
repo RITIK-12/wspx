@@ -277,7 +277,11 @@ class WorkingTree:
                 raise PatchError(f"{name}: adapter mode needs a 2-D projection weight")
             for d in deltas:
                 if d.kind != "lowrank" or d.index is not None:
-                    raise PatchError(f"{name}: adapter mode needs whole-matrix low-rank deltas")
+                    raise PatchError(
+                        f"{name}: adapter precision keeps edits as low-rank deltas over whole "
+                        "matrices, and this edit is not one (a slice, or full rank); "
+                        'use precision="merged" (the default) or "promote"'
+                    )
             module = self.model.get_submodule(info.module)
             in_dim = role.in_dim
 

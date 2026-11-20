@@ -67,10 +67,10 @@ wspx vcs commit -m "Project out the loop direction in L15/L19 down_proj"
 | `contrast` | A direction from two prompt sets, and its top writers |
 | `generate` | Samples from the current weights |
 | `trace` | Logit lens and top writers; diff (`--vs`) and attribution traces |
-| `edit` | Stages `ablate`, `set`, `scale`, `project_out`, `bake_steer`, `rank_one_write`, `transplant` or `orthogonalize` |
+| `edit` | Stages `ablate`, `set`, `scale`, `project_out`, `bake_steer`, `rank_one_write` or `transplant` (`source="base"` restores weights) |
 | `check` | Static, numeric and smoke diagnostics, each with suggested fixes |
 | `test` | Test suites, paired against another revision |
-| `vcs` | `status`, `diff`, `commit`, `log`, `checkout`, `branch`, `revert`, `bisect`, `blame`, `merge` |
+| `vcs` | `status`, `diff`, `commit`, `log`, `checkout`, `branch`, `revert`, `bisect`, `blame`, `merge` (strategies include `orthogonalize`) |
 | `export` | Merged safetensors, PEFT adapter, GGUF or a portable bundle |
 | `run` | A Python script in the lab, with the SDK loaded |
 | `jobs` | Status and results of long-running jobs |

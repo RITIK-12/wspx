@@ -10,11 +10,12 @@ signature ``op(ctx: OpContext, **args) -> list[TensorDelta]``.
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from functools import cache
 from importlib.metadata import entry_points
-from typing import Any
+from typing import Any, TypeVar
 
 import torch
 
@@ -24,6 +25,13 @@ from wspx.lab.patch import TensorDelta
 from wspx.lab.tree import WorkingTree
 
 Op = Callable[..., list[TensorDelta]]
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+def merge_only(fn: F) -> F:
+    """Mark an op that rewrites existing deltas: merges use it, ``edit`` cannot stage it."""
+    fn.__wspx_merge_only__ = True  # type: ignore[attr-defined]
+    return fn
 
 
 @dataclass
@@ -72,5 +80,39 @@ def registry() -> dict[str, Op]:
 def get(name: str) -> Op:
     ops = registry()
     if name not in ops:
-        raise PatchError(f"unknown op {name!r}; available: {', '.join(sorted(ops))}")
+        raise PatchError(f"unknown op {name!r}; available: {', '.join(edit_ops())}")
     return ops[name]
+
+
+def edit_ops() -> list[str]:
+    """Ops that ``edit`` can stage (merge-only ops excluded)."""
+    return sorted(
+        n for n, fn in registry().items() if not getattr(fn, "__wspx_merge_only__", False)
+    )
+
+
+def signature(name: str) -> str:
+    """``project_out(direction, targets, *, cols=None, strength=1.0)``: the op without its context."""
+    params = list(inspect.signature(get(name)).parameters.values())[1:]
+    return f"{name}({', '.join(_param_text(p, params) for p in params)})"
+
+
+def _param_text(p: inspect.Parameter, params: list[inspect.Parameter]) -> str:
+    first_kw = next((q for q in params if q.kind is inspect.Parameter.KEYWORD_ONLY), None)
+    text = p.name if p.default is inspect.Parameter.empty else f"{p.name}={p.default!r}"
+    return f"*, {text}" if p is first_kw else text
+
+
+def call(name: str, ctx: OpContext, args: dict[str, Any]) -> list[TensorDelta]:
+    """Run an op for ``edit``: refuse merge-only ops and name the signature on bad arguments."""
+    fn = get(name)
+    if getattr(fn, "__wspx_merge_only__", False):
+        raise PatchError(
+            f"{name} rewrites existing patches, so it runs during a merge: "
+            f'vcs merge with strategies={{"<address>": "{name}"}}'
+        )
+    try:
+        inspect.signature(fn).bind(ctx, **args)
+    except TypeError as exc:
+        raise PatchError(f"{signature(name)}: {exc}") from None
+    return fn(ctx, **args)

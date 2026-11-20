@@ -45,3 +45,23 @@ def test_errors_come_back_as_results(lab) -> None:  # type: ignore[no-untyped-de
     assert "E105" in blocked.summary
     assert "fix 1" in blocked.summary
     assert not call(lab, "nope").ok
+
+
+def test_edit_tool_documents_every_builtin_op_exactly() -> None:
+    """The schema is torch-free, so it states the signatures; they must match the ops."""
+    from wspx.lab import ops
+    from wspx.tools.schemas import EDIT_OPS
+
+    assert {name: ops.signature(name) for name in ops.edit_ops()} == EDIT_OPS
+
+
+def test_edit_ops_explain_their_arguments(lab) -> None:  # type: ignore[no-untyped-def]
+    """Guessed arguments get the op's signature back, not a crash (seen with a live driver)."""
+    wrong = call(lab, "edit", {"op": "rank_one_write", "args": {"targets": "L1.mlp.down"}})
+    assert not wrong.ok
+    assert "rank_one_write(target, *, key, value, cov=None)" in wrong.summary
+    merge_only = call(lab, "edit", {"op": "orthogonalize", "args": {}})
+    assert not merge_only.ok
+    assert "vcs merge" in merge_only.summary
+    unknown = call(lab, "edit", {"op": "nudge", "args": {}})
+    assert "orthogonalize" not in unknown.summary  # not offered where it cannot run

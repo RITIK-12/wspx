@@ -552,9 +552,8 @@ class Lab:
     ) -> PatchRef:
         if precision not in ("merged", "adapter", "promote"):
             raise PatchError(f"precision must be merged, adapter or promote, not {precision!r}")
-        fn = op_registry.get(op)
         args = self._expand_unit_handles(args)
-        deltas = fn(self._ctx(), **args)
+        deltas = op_registry.call(op, self._ctx(), args)
         if not deltas:
             raise PatchError(f"{op} produced no change")
         plan = EditPlan(

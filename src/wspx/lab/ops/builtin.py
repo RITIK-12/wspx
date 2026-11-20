@@ -10,7 +10,7 @@ import torch
 from wspx.errors import PatchError
 from wspx.lab import patch
 from wspx.lab.ir.model_ir import Target
-from wspx.lab.ops import OpContext
+from wspx.lab.ops import OpContext, merge_only
 from wspx.lab.patch import TensorDelta
 from wspx.lab.tensors import Index, normalize_index, select
 
@@ -195,12 +195,13 @@ def project_out(
     return out
 
 
-def bake_steer(ctx: OpContext, direction: Any, *, scale: float, at: int) -> list[TensorDelta]:
-    """Add ``scale · d`` to the residual stream after block ``at``, permanently.
+def bake_steer(ctx: OpContext, direction: Any, *, scale: float, at: int | str) -> list[TensorDelta]:
+    """Add ``scale · d`` to the residual stream after block ``at`` (``14`` or ``"L14"``), permanently.
 
     Uses a writer bias in that block when one exists; at block 0 the token
     embedding works too (every row shifts by the same vector).
     """
+    at = _block(at)
     d = ctx.direction(direction)
     d = d / d.norm()
     biases = [
@@ -262,10 +263,16 @@ def rank_one_write(
     return [_lowrank_on(ctx, t, index, along, op="rank_one_write")]
 
 
-def transplant(ctx: OpContext, targets: Any, *, source: str) -> list[TensorDelta]:
-    """Copy the selected weights from another loaded model with matching IR roles."""
+def transplant(ctx: OpContext, targets: Any, *, source: str = "base") -> list[TensorDelta]:
+    """Copy the selected weights from ``source``: ``"base"`` (the unedited model) or a loaded model.
+
+    From ``"base"`` this restores a region exactly, whatever edits are applied.
+    """
+    if source == "base":
+        return _restore_base(ctx, targets)
     if source not in ctx.sources:
-        raise PatchError(f"no source model {source!r} is loaded")
+        loaded = ", ".join(sorted(ctx.sources)) or "none"
+        raise PatchError(f"no source model {source!r} is loaded (base, or loaded: {loaded})")
     src_ir, src_model = ctx.sources[source]
     src_params = dict(src_model.named_parameters())
     out = []
@@ -300,6 +307,42 @@ def transplant(ctx: OpContext, targets: Any, *, source: str) -> list[TensorDelta
     return out
 
 
+def _restore_base(ctx: OpContext, targets: Any) -> list[TensorDelta]:
+    out = []
+    for target in ctx.targets(targets):
+        index = _index(ctx, target)
+        cur = select(ctx.weight(target.param), index)
+        src = select(ctx.tree.base(target.param).detach().float(), index).to(cur.device)
+        if torch.equal(src, cur):
+            continue
+        out.append(
+            patch.dense(
+                target.param,
+                tuple(ctx.ir.params[target.param].shape),
+                ctx.base_hash(target.param),
+                src - cur,
+                index=index,
+                kind="set",
+                op="transplant",
+                source="base",
+            )
+        )
+    return out
+
+
+def _block(at: int | str) -> int:
+    """A block index from ``14``, ``"14"`` or ``"L14"`` (``-1``: before block 0, the embedding)."""
+    if isinstance(at, int):
+        return at
+    text = at.strip()
+    number = text[1:] if text[:1] in ("L", "l") else text
+    try:
+        return int(number)
+    except ValueError:
+        raise PatchError(f"at={at!r}: expected a block number such as 14 or 'L14'") from None
+
+
+@merge_only
 def orthogonalize(
     ctx: OpContext, deltas: list[TensorDelta], *, against: list[TensorDelta], side: str = "out"
 ) -> list[TensorDelta]:

@@ -90,15 +90,32 @@ class TraceArgs(_Args):
     top: int = Field(5, ge=1, le=50)
 
 
+EDIT_OPS = {
+    "ablate": "ablate(targets, *, units=None)",
+    "set": "set(targets, *, value=0.0, units=None)",
+    "scale": "scale(targets, *, factor, units=None)",
+    "project_out": "project_out(direction, targets, *, cols=None, strength=1.0)",
+    "bake_steer": "bake_steer(direction, *, scale, at)",
+    "rank_one_write": "rank_one_write(target, *, key, value, cov=None)",
+    "transplant": "transplant(targets, *, source='base')",
+}
+"""The built-in ops ``edit`` stages, by signature (tests keep this in step with the ops)."""
+
+
 class EditArgs(_Args):
     op: str = Field(
-        description="ablate, set, scale, project_out, bake_steer, rank_one_write, transplant, "
-        "orthogonalize, or a plugin op."
+        description="One of: "
+        + "; ".join(EDIT_OPS.values())
+        + "; or a plugin op. targets: an address or list of addresses (target: exactly one). "
+        "direction: dir:name. cols: a grep result (@rN) narrowing targets to its units. "
+        "units: unit indices. at: a block (14 or 'L14'). key, value: dir: handles or vectors, "
+        "key in the target's input space and value in its output space. "
+        "source: 'base' restores the unedited weights. Merging uses orthogonalize "
+        "(vcs merge strategies).",
     )
     args: dict[str, Any] = Field(
         default_factory=dict,
-        description="The op's arguments: targets (addresses), "
-        "direction (dir:name), cols (@rN), factor, strength, scale, at, key, value …",
+        description="The op's arguments by name, as in its signature above.",
     )
     precision: Literal["merged", "adapter", "promote"] = "merged"
     scope: str | None = Field(None, description="Declared scope: the edit is refused outside it.")
