@@ -41,6 +41,9 @@ class RefStore:
             raise StoreError(f"invalid ref name {name!r}")
         return self.root / name
 
+    def exists(self, name: str) -> bool:
+        return self._path(name).is_file()
+
     def read_raw(self, name: str) -> str | None:
         try:
             return self._path(name).read_text(encoding="utf-8").strip() or None
