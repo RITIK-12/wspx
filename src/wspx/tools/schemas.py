@@ -87,7 +87,9 @@ class TraceArgs(_Args):
     target: str | int | None = Field(
         None, description="Attribution objective: this token's log-probability."
     )
-    top: int = Field(5, ge=1, le=50)
+    top: int = Field(
+        5, ge=1, le=50, description="Tokens per block in the logit lens, and units listed."
+    )
 
 
 EDIT_OPS = {
@@ -107,7 +109,8 @@ class EditArgs(_Args):
         description="One of: "
         + "; ".join(EDIT_OPS.values())
         + "; or a plugin op. targets: an address or list of addresses (target: exactly one). "
-        "direction: dir:name. cols: a grep result (@rN) narrowing targets to its units. "
+        "direction: dir:name. cols: a grep result (@rN); the hits it showed (its top) narrow "
+        "targets to those units. "
         "units: unit indices. at: a block (14 or 'L14'). key, value: dir: handles or vectors, "
         "key in the target's input space and value in its output space. "
         "source: 'base' restores the unedited weights. Merging uses orthogonalize "

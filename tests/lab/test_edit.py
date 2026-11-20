@@ -287,6 +287,13 @@ class TestChecks:
         _, ir, _, ctx = make()
         tied = static_check(ir, EditPlan(get("scale")(ctx, "embed", factor=1.1), op="scale"))
         assert "W101" in {d.code for d in tied.diagnostics}
+        steer = get("bake_steer")(ctx, torch.randn(32), scale=0.1, at=-1)  # via the embedding
+        (w101,) = [
+            d
+            for d in static_check(ir, EditPlan(steer, op="bake_steer")).diagnostics
+            if d.code == "W101"
+        ]
+        assert any("softmax ignores" in line for line in w101.detail)
         norm = [patch.dense("blocks.0.ln1.weight", (32,), "x", torch.ones(32))]
         bad = static_check(ir, EditPlan(norm, op="project_out"))
         assert {"E103", "E106"} <= {d.code for d in bad.diagnostics}

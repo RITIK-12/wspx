@@ -48,6 +48,17 @@ class TensorStats:
     spectrum: list[float] = field(default_factory=list)
 
 
+def _histogram(values: torch.Tensor, lo: float, hi: float, bins: int) -> torch.Tensor:
+    """Exact integer counts. ``torch.histc`` counts in the input's float dtype, which loses
+    counts once a bin passes 2^24 (an embedding matrix has hundreds of millions of values)."""
+    counts = torch.zeros(bins, dtype=torch.int64, device=values.device)
+    width = (hi - lo) / bins
+    for chunk in torch.split(values, 1 << 24):
+        index = ((chunk - lo) / width).floor_().long().clamp_(0, bins - 1)
+        counts += torch.bincount(index, minlength=bins)
+    return counts
+
+
 def tensor_stats(t: torch.Tensor, *, spectrum: bool = True) -> TensorStats:
     x = t.detach().float()
     flat = x.reshape(-1)
@@ -62,7 +73,7 @@ def tensor_stats(t: torch.Tensor, *, spectrum: bool = True) -> TensorStats:
     lo, hi = (float(finite.min()), float(finite.max())) if finite.numel() else (0.0, 0.0)
     if hi == lo:
         hi = lo + 1e-12
-    counts = torch.histc(finite, bins=10, min=lo, max=hi) if finite.numel() else torch.zeros(10)
+    counts = _histogram(finite, lo, hi, 10)
     edges = [lo + (hi - lo) * i / 10 for i in range(11)]
     spec: list[float] = []
     if spectrum and x.dim() >= 2:

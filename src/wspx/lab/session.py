@@ -57,7 +57,7 @@ from wspx.lab.grep import Environment, GrepResult, Hit, grep
 from wspx.lab.index import ModelIndex, build_index
 from wspx.lab.ir.model_ir import ModelIR, Target
 from wspx.lab.ops import OpContext
-from wspx.lab.patch import TensorDelta
+from wspx.lab.patch import TensorDelta, materialize
 from wspx.lab.probe import Probe
 from wspx.lab.tensors import normalize_index, select, tensor_hash
 from wspx.lab.text import Prompt, Text
@@ -353,11 +353,16 @@ class Lab:
         entry = self.handles.register_result(
             (
                 result.expression.split(" ")[0] if fires_on is None else "fires-on",
-                result.scope.split(",")[0],
+                _scope_label(scope),
                 f"top{top}",
             ),
             name=name,
-            description=f"{len(result.hits)} of {result.candidates} {result.axis}s matching {result.expression}",
+            description=(
+                f"{result.candidates} {result.axis}s ranked by {result.expression}"
+                if fires_on is not None
+                else f"{len(result.hits)} of {result.candidates} {result.axis}s matching "
+                f"{result.expression}"
+            ),
             size=f"{min(len(result.hits), top)} hits",
             call_id=self.context.get("call_id"),
         )
@@ -378,6 +383,7 @@ class Lab:
         units = [p for p in params if p in writer_units(self.ir)]
         if not units:
             raise GrepError("--fires-on ranks writer units; the scope has none")
+        started = time.perf_counter()
         ids, mask = self.text.batch(prompts, self.device)
         with torch.no_grad(), self.probe.capture([], units=units) as cap:
             analysis.forward(self.model, self.ir, ids, mask)
@@ -391,7 +397,13 @@ class Lab:
             scores.extend(Hit(f"{addr}[:, {j}]", param, None, j, s) for j, s in enumerate(mean))
         scores.sort(key=lambda h: -h.score)
         return GrepResult(
-            f"fires-on n={len(prompts)}", scope or "writers", "col", len(scores), scores, scores
+            f"mean |activation| on {len(prompts)} prompt(s)",
+            scope or "writers",
+            "col",
+            len(scores),
+            scores,
+            scores,
+            seconds=time.perf_counter() - started,
         )
 
     def _prompts(self, value: Sequence[Prompt] | str) -> list[Prompt]:
@@ -874,7 +886,7 @@ class Lab:
         ms = (time.perf_counter() - started) * 1000
         where = branch or (short(oid) if oid else "base")
         return ToolResult(
-            f"checked out {where} · {len(tree.tensors())} tensor(s) edited vs base · "
+            f"checked out {where} · {len(tree.tensors())} patched tensor(s) · "
             f"hashes verified · {ms:.0f} ms",
             {"head": oid},
         )
@@ -935,46 +947,64 @@ class Lab:
         names = sorted(
             t
             for t in sa.tensors() | sb.tensors()
-            if sa.merged.get(t) != sb.merged.get(t) or (t in sa.promote) != (t in sb.promote)
+            if sa.merged.get(t) != sb.merged.get(t)
+            or sa.adapter.get(t) != sb.adapter.get(t)
+            or (t in sa.promote) != (t in sb.promote)
         )
-        rows = []
+        rows: list[dict[str, Any]] = []
+        cancelled: list[str] = []
         for name in names:
-            wa = self.tree.materialize_state(name, sa, dtype=torch.float32)
-            wb = self.tree.materialize_state(name, sb, dtype=torch.float32)
+            wa, wb = self._effective(name, sa), self._effective(name, sb)
             delta = wb - wa
             nz = delta != 0
-            rel = float(delta.norm() / wa.norm().clamp_min(1e-30))
-            rank = (
-                int(torch.linalg.matrix_rank(delta))
-                if delta.dim() == 2 and delta.numel() <= 1 << 24
-                else None
-            )
+            if not bool(nz.any()):
+                cancelled.append(name)
+                continue
+            rank, rank_text = _delta_rank(delta)
             rows.append(
                 {
                     "tensor": name,
                     "address": _display(self.ir, name),
+                    "precision": "adapter"
+                    if sa.adapter.get(name) != sb.adapter.get(name)
+                    and sa.merged.get(name) == sb.merged.get(name)
+                    else "merged",
                     "norm": float(delta.norm()),
-                    "rel": rel,
+                    "rel": float(delta.norm() / wa.norm().clamp_min(1e-30)),
                     "rank": rank,
+                    "rank_text": rank_text,
                     "touched": int(nz.sum()),
                     "slices": _bbox(nz),
                 }
             )
-        roles = sorted(
-            {(r.block, r.branch) for n in names for r in self.ir.roles_of(n) if r.block is not None}
-        )
+        blocks = {
+            r.block for row in rows for r in self.ir.roles_of(row["tensor"]) if r.block is not None
+        }
         lines = [
-            f"weight diff {a}..{b or 'working tree'}: {len(rows)} tensor(s)"
-            + (f" across {len({blk for blk, _ in roles})} block(s)" if roles else "")
+            f"weight diff {a}..{b or 'working tree'}: {len(rows)} tensor(s) differ"
+            + (f" across {len(blocks)} block(s)" if blocks else "")
         ]
         lines.extend(
-            f"  {r['address']:<24} ‖Δ‖ {r['norm']:.3g} ({r['rel']:.2%}) rank {r['rank']} · "
+            f"  {r['address']:<24} ‖Δ‖ {r['norm']:.3g} ({r['rel']:.2%}) rank {r['rank_text']} · "
             f"{r['touched']} elements in {r['slices']}"
+            + (" [adapter]" if r["precision"] == "adapter" else "")
             for r in rows
         )
+        if cancelled:
+            lines.append(
+                f"  patched but no net change: {', '.join(_display(self.ir, n) for n in cancelled)}"
+            )
         behaviour = self._behaviour_diff(sa, sb)
         lines.extend(behaviour)
-        return ToolResult("\n".join(lines), {"tensors": rows, "behaviour": behaviour})
+        return ToolResult(
+            "\n".join(lines), {"tensors": rows, "cancelled": cancelled, "behaviour": behaviour}
+        )
+
+    def _effective(self, name: str, state: TreeState) -> torch.Tensor:
+        """What ``name`` computes with under ``state``, in float32, adapter patches included."""
+        weight = self.tree.materialize_state(name, state, dtype=torch.float32)
+        side = [self.tree.delta(o) for o in state.adapter.get(name, ())]
+        return materialize(weight, side, dtype=torch.float32) if side else weight
 
     def _state_of(self, rev: str) -> TreeState:
         if rev == "base":
@@ -1399,12 +1429,16 @@ class GrepHits:
                 if tops:
                     tokens = "  writes: " + ", ".join(self.lab.text.show(t) for t, _ in tops)
             lines.append(f"{h.address:<32} {h.score:+.4f}{tokens}")
-        more = len(self.result.hits) - len(self.hits)
-        tail = (
-            f"{len(self.hits)} of {self.result.candidates:,} {self.result.axis}s"
-            + (f" ({more} more matched; raise --top or narrow)" if more > 0 else "")
-            + f" · {self.result.seconds * 1000:.0f} ms · saved as {self.handle}"
-        )
+        r = self.result
+        if r.expression.startswith("mean |activation|"):  # a ranking: every unit "matches"
+            head = f"top {len(self.hits)} of {r.candidates:,} {r.axis}s by {r.expression}"
+        else:
+            head = f"{len(r.hits):,} of {r.candidates:,} {r.axis}s matched" + (
+                f", showing the top {len(self.hits)} (raise --top or narrow)"
+                if len(r.hits) > len(self.hits)
+                else ""
+            )
+        tail = f"{head} · {r.seconds * 1000:.0f} ms · saved as {self.handle}"
         return "\n".join([*lines, tail])
 
     def __str__(self) -> str:
@@ -1494,6 +1528,35 @@ def _bind_positional(op: str, positional: tuple[Any, ...], args: dict[str, Any])
 def _display(ir: ModelIR, name: str) -> str:
     role = ir.primary_role(name)
     return role.address if role else name
+
+
+_RANK_SKETCH = 128
+
+
+def _delta_rank(delta: torch.Tensor) -> tuple[int | None, str]:
+    """A change's rank. Big matrices are sketched: exact (almost surely) below the sketch size."""
+    if delta.dim() != 2:
+        return None, "n/a"
+    if delta.numel() <= 1 << 24:
+        rank = int(torch.linalg.matrix_rank(delta))
+        return rank, str(rank)
+    gen = torch.Generator(device=delta.device).manual_seed(0)
+    sketch = torch.randn(
+        delta.shape[1], _RANK_SKETCH, device=delta.device, dtype=delta.dtype, generator=gen
+    )
+    rank = int(torch.linalg.matrix_rank(delta @ sketch))
+    return (rank, str(rank)) if rank < _RANK_SKETCH else (None, f"≥{_RANK_SKETCH}")
+
+
+def _scope_label(scope: str | None) -> str:
+    """A short name for a scope pattern: ``L*.mlp.down`` → ``mlp.down``, ``L8-12.*`` → ``L8-12``."""
+    if not scope:
+        return "all"
+    parts = []
+    for raw in scope.split(","):
+        part = raw.strip().removeprefix("L*.").removesuffix(".*")
+        parts.append(part.replace("*.", "").replace("*", "all") or "all")
+    return "+".join(dict.fromkeys(parts))
 
 
 def _default_scope(expression: str) -> str:

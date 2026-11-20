@@ -234,10 +234,28 @@ def bake_steer(ctx: OpContext, direction: Any, *, scale: float, at: int | str) -
                 embed, tuple(shape), ctx.base_hash(embed), ones, scale * d, op="bake_steer", at=at
             )
         ]
-    raise PatchError(
-        f"block {at} has no writer bias to carry a steering vector; use at=0 (via the embedding) "
-        "or a block whose attention/MLP output has a bias"
+    with_bias = sorted(
+        {
+            r.block
+            for r in ctx.ir.roles
+            if r.kind == "bias" and r.block is not None and r.split is None
+            if r.address.endswith((".o.bias", ".down.bias", ".out.bias"))
+        }
     )
+    where = (
+        f"blocks with one: {', '.join(f'L{b}' for b in with_bias)}"
+        if with_bias
+        else "this model has no writer biases"
+    )
+    hint = ""
+    if embed is not None:
+        rows = ctx.weight(embed).float().norm(dim=-1).median()
+        hint = (
+            f". at=0 shifts every token embedding instead: that is before block 0, not after "
+            f"block {at}, so a direction measured at L{at} may mean something else there, and "
+            f"scale is an absolute norm (embedding rows have median norm {float(rows):.3g})"
+        )
+    raise PatchError(f"block {at} has no writer bias to carry a steering vector ({where}){hint}")
 
 
 def rank_one_write(
@@ -257,6 +275,19 @@ def rank_one_write(
     mat = block if free.index(out_dim) == 0 else block.T  # (out, in)
     k = ctx.direction(key).to(mat.device)
     v_star = ctx.direction(value).to(mat.device)
+    n_out, n_in = mat.shape
+    residual_side = "output" if _residual_side(ctx, t) == "out" else "input"
+    for what, vec, size, space in (("key", k, n_in, "input"), ("value", v_star, n_out, "output")):
+        if vec.shape != (size,):
+            raise PatchError(
+                f"{t.address}: {what} has {vec.numel()} dims, but it must be a vector in the "
+                f"weight's {space} space ({size}); key goes in the input space ({n_in}), value "
+                f"in the output space ({n_out}). The residual stream is this weight's "
+                f"{residual_side}, so a residual direction such as dir:name fits "
+                f"{'value' if residual_side == 'output' else 'key'}."
+            )
+    if cov is not None and tuple(cov.shape) != (n_in, n_in):
+        raise PatchError(f"{t.address}: cov must be ({n_in}, {n_in}), got {tuple(cov.shape)}")
     ck = torch.linalg.solve(cov.to(mat.device).float(), k) if cov is not None else k
     residual = v_star - mat @ k
     along = {out_dim: residual / float(k @ ck), in_dim: ck}

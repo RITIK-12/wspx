@@ -43,7 +43,7 @@ def show(
     stats = tensor_stats(view)
     out: dict[str, Any] = {"address": target.address, "param": target.param, "stats": stats}
     role = target.role or ir.primary_role(target.param)
-    if view.dim() == 1 and text is not None and role is not None:
+    if view.dim() == 1 and text is not None and role is not None and "norm" not in role.kind:
         tokens = _vocab_of_vector(ir, params, view.float(), role.kind, final_scale)
         if tokens:
             out["vocab"] = [(text.show(t), s) for t, s in tokens]
@@ -287,7 +287,7 @@ def forward_trace(
         final = torch.softmax(logits[0].float(), dim=-1)
         entropy = (-(final * final.clamp_min(1e-30).log()).sum(-1)).tolist()
         out_ids = final.argmax(-1).tolist()
-    writers = _top_writers(model, ir, cap.units, top=3)
+    writers = _top_writers(model, ir, cap.units, top=top)
     routes = {
         p: [t[1][0, -1].tolist() if len(t) > 1 else t[0][0, -1].tolist()]
         for p, t in cap.points.items()
@@ -299,7 +299,7 @@ def forward_trace(
     ]
     for i in range(len(resid_points)):
         toks = ", ".join(
-            f"{text.show(t)} {p:.2f}" for t, p in zip(lens_ids[i][:3], lens_p[i][:3], strict=True)
+            f"{text.show(t)} {p:.2f}" for t, p in zip(lens_ids[i], lens_p[i], strict=True)
         )
         lines.append(f"L{i:<5d} {resid_norm[i]:<8.3g} {toks}")
     lines.append(
@@ -310,7 +310,7 @@ def forward_trace(
     )
     if writers:
         lines.append(
-            "top writer units @ last token: " + ", ".join(f"{a} {s:.2f}" for a, s in writers[:6])
+            "top writer units @ last token: " + ", ".join(f"{a} {s:.2f}" for a, s in writers[:top])
         )
     if routes:
         lines.append(
@@ -410,7 +410,7 @@ def diff_trace(
         )
     )
     if moved:
-        lines.append("most-moved units: " + ", ".join(f"{a} {s:+.2f}" for a, s in moved[:6]))
+        lines.append("most-moved units: " + ", ".join(f"{a} {s:+.2f}" for a, s in moved[:top]))
     return Trace(
         "diff",
         "\n".join(lines),

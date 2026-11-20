@@ -94,3 +94,110 @@ def test_attribution_shows_the_requested_number_of_units(lab) -> None:  # type: 
         line for line in traced.summary.splitlines() if line.strip()[:2].rstrip(".").isdigit()
     ]
     assert len(ranked) == 3
+
+
+# What the tools report, from findings of a live driver run against Qwen3-0.6B.
+
+
+def test_rank_one_write_names_the_space_each_vector_belongs_to(lab) -> None:  # type: ignore[no-untyped-def]
+    lab.contrast([[1, 2, 3]], [[4, 5, 6]], name="d")  # a residual direction (48)
+    args = {"target": "L1.mlp.down", "key": "dir:d", "value": "dir:d"}
+    wrong = call(lab, "edit", {"op": "rank_one_write", "args": args})
+    assert not wrong.ok
+    assert "input space (64)" in wrong.summary
+    assert "fits value" in wrong.summary
+    assert "RuntimeError" not in wrong.summary
+    args = {"target": "L1.mlp.up", "key": "dir:d", "value": torch.randn(64).tolist()}
+    right = call(lab, "edit", {"op": "rank_one_write", "args": args})
+    assert right.ok, right.summary
+
+
+def test_bake_steer_says_where_a_steer_can_go(lab) -> None:  # type: ignore[no-untyped-def]
+    lab.contrast([[1, 2, 3]], [[4, 5, 6]], name="d")
+    out = call(
+        lab, "edit", {"op": "bake_steer", "args": {"direction": "dir:d", "scale": 1, "at": 2}}
+    )
+    assert not out.ok
+    assert "this model has no writer biases" in out.summary
+    assert "before block 0, not after block 2" in out.summary
+    assert "median norm" in out.summary
+
+
+def test_show_counts_every_value_and_skips_tokens_for_norms(lab) -> None:  # type: ignore[no-untyped-def]
+    shown = call(lab, "show", {"address": "embed"})
+    counts = [int(line.rsplit(" ", 1)[1]) for line in shown.summary.splitlines() if "[" in line]
+    assert sum(counts) == 96 * 48
+    assert "tokens:" not in call(lab, "show", {"address": "final_norm"}).summary
+
+
+def test_histograms_stay_exact_past_float32_integers() -> None:
+    from wspx.lab.index import tensor_stats
+
+    values = torch.zeros(20_000_000)  # one bin passes 2^24, where float32 counting stalls
+    values[0] = 1.0
+    stats = tensor_stats(values, spectrum=False)
+    assert sum(stats.hist_counts) == 20_000_000
+    assert stats.hist_counts[0] == 19_999_999
+
+
+def test_grep_results_are_named_after_their_scope(lab) -> None:  # type: ignore[no-untyped-def]
+    from wspx.lab.session import _scope_label
+
+    assert _scope_label("L*.mlp.down") == "mlp.down"
+    assert _scope_label("L8-12.*") == "L8-12"
+    assert _scope_label("L*.*.down,L*.*.o,L*.*.out") == "down+o+out"
+    assert _scope_label(None) == "all"
+    hits = call(lab, "grep", {"expression": "colnorm > 0σ", "in": "L*.mlp.down", "top": 2})
+    assert "mlp-down" in hits.handles[0]
+    assert "showing the top 2" in hits.summary
+    ranked = call(lab, "grep", {"fires_on": [[1, 2, 3]], "in": "L*.mlp.down", "top": 2})
+    assert "top 2 of 192 cols by mean |activation|" in ranked.summary
+    assert " 0 ms" not in ranked.summary
+
+
+def test_trace_top_sets_the_lens_width(lab) -> None:  # type: ignore[no-untyped-def]
+    trace = call(lab, "trace", {"prompt": [1, 2, 3, 4], "top": 2})
+    lens = [line for line in trace.summary.splitlines() if line.startswith("L0 ")]
+    assert lens[0].count(",") == 1  # two tokens
+
+
+def test_diff_counts_adapters_and_names_patches_that_cancel(lab) -> None:  # type: ignore[no-untyped-def]
+    lab.contrast([[1, 2, 3]], [[4, 5, 6]], name="d")
+    up = {"target": "L1.mlp.up", "key": "dir:d", "value": torch.randn(64).tolist()}
+    steps = [
+        {"op": "rank_one_write", "args": up, "precision": "adapter"},
+        {"op": "set", "args": {"targets": "L0.mlp.down", "units": [3]}},
+        {"op": "transplant", "args": {"targets": "L0.mlp.down"}},
+        {"op": "scale", "args": {"targets": "L2.mlp.down", "factor": 0.5}},
+    ]
+    for step in steps:
+        assert call(lab, "edit", step).ok
+    diff = call(lab, "vcs", {"action": "diff", "a": "base"})
+    assert "2 tensor(s) differ" in diff.summary
+    assert "[adapter]" in diff.summary
+    assert "no net change: L0.mlp.down" in diff.summary
+    assert "rank None" not in diff.summary
+    commit = call(lab, "vcs", {"action": "commit", "message": "four edits"})
+    assert commit.ok, commit.summary
+    checkout = call(lab, "vcs", {"action": "checkout", "rev": "HEAD"})
+    assert "3 patched tensor(s)" in checkout.summary  # 2 that differ + 1 that cancels
+
+
+def test_large_delta_ranks_are_sketched() -> None:
+    from wspx.lab.session import _delta_rank
+
+    low = torch.randn(5000, 3) @ torch.randn(3, 4000)  # 2e7 elements: past the exact limit
+    assert _delta_rank(low) == (3, "3")
+    assert _delta_rank(torch.randn(5000, 4000))[1] == "≥128"
+
+
+def test_an_adapter_edit_then_a_merged_one_keeps_the_base(lab) -> None:  # type: ignore[no-untyped-def]
+    from wspx.lab.tensors import tensor_hash
+
+    name = "model.layers.1.mlp.up_proj.weight"
+    base = tensor_hash(lab.model.get_parameter(name))
+    lab.contrast([[1, 2, 3]], [[4, 5, 6]], name="d")
+    up = {"target": "L1.mlp.up", "key": "dir:d", "value": torch.randn(64).tolist()}
+    assert call(lab, "edit", {"op": "rank_one_write", "args": up, "precision": "adapter"}).ok
+    assert call(lab, "edit", {"op": "scale", "args": {"targets": "L1.mlp.up", "factor": 0.5}}).ok
+    assert tensor_hash(lab.tree.base(name)) == base

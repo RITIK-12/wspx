@@ -121,12 +121,19 @@ def static_check(ir: ModelIR, plan: EditPlan) -> Report:
             )
         if info.aliases or {"embed", "unembed"} <= kinds:
             names = ", ".join([name, *info.aliases])
+            detail = [f"shared storage: {names}"]
+            if plan.op == "bake_steer":
+                detail.append(
+                    "a shift shared by every row adds the same amount to every logit at a "
+                    "position, which softmax ignores: next-token probabilities change only "
+                    "through the embedding side"
+                )
             add(
                 diag(
                     Code.TIED_WEIGHT,
                     "tensor is tied: the edit changes both embedding and unembedding",
                     target=target,
-                    detail=[f"shared storage: {names}"],
+                    detail=detail,
                     fixes=[
                         Fix(title="accept: both roles change together"),
                         Fix(
@@ -322,9 +329,10 @@ def numeric_check(ir: ModelIR, tree: WorkingTree, plan: EditPlan, cfg: CheckSect
         add(
             diag(
                 Code.DENSE_EDIT,
-                f"edit changes {frac:.1%} of all parameters (store size)",
+                f"edit changes {frac:.1%} of all parameter values",
+                detail=["broad edits are more likely to have side effects than narrow ones"],
                 severity=Severity.WARNING,
-                fixes=[Fix(title="prefer low-rank or sparse edits")],
+                fixes=[Fix(title="narrow it: fewer tensors, rows or columns")],
             )
         )
     return report

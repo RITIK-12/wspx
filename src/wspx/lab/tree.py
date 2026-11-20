@@ -121,7 +121,7 @@ class WorkingTree:
         if name in self._cache:
             self._cache.move_to_end(name)
             return self._cache[name].to(device)
-        if name not in self.state.tensors():
+        if self._live_is_base(name):
             return self.params[name].detach()
         if self.base_reader is None:  # pragma: no cover - snapshots are pinned
             raise PatchError(f"base of {name} was not kept and there is no reader")
@@ -129,9 +129,13 @@ class WorkingTree:
         self._remember_base(name, tensor, pinned=False)
         return tensor.to(device)
 
+    def _live_is_base(self, name: str) -> bool:
+        """Adapter patches never touch the live weight; only merged and promoted ones do."""
+        return not self.state.merged.get(name) and name not in self.state.promote
+
     def _snapshot(self, name: str) -> None:
         """Keep a copy of the base before its first edit."""
-        if name in self._cache or name in self.state.tensors():
+        if name in self._cache or not self._live_is_base(name):
             return
         copy = self.params[name].detach().to("cpu", copy=True)
         self._remember_base(name, copy, pinned=self.base_reader is None)
