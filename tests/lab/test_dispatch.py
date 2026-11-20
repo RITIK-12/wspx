@@ -151,7 +151,7 @@ def test_grep_results_are_named_after_their_scope(lab) -> None:  # type: ignore[
     assert "mlp-down" in hits.handles[0]
     assert "showing the top 2" in hits.summary
     ranked = call(lab, "grep", {"fires_on": [[1, 2, 3]], "in": "L*.mlp.down", "top": 2})
-    assert "top 2 of 192 cols by mean |activation|" in ranked.summary
+    assert "top 2 of 192 cols ranked by mean |activation|" in ranked.summary
     assert " 0 ms" not in ranked.summary
 
 
@@ -256,3 +256,42 @@ def test_a_merge_that_needs_review_says_why(lab) -> None:  # type: ignore[no-unt
     assert f"merge into protected {main} needs review: it differs from {main} by KL" in (
         refused.summary
     )
+
+
+def test_ls_leads_with_the_count(lab) -> None:  # type: ignore[no-untyped-def]
+    listed = call(lab, "ls", {"limit": 3})
+    first = listed.summary.splitlines()[0]
+    assert first.startswith(f"{len(listed.data['rows'])} address(es) match")
+    assert "the first 3 are listed" in first
+
+
+def test_merging_a_branch_ahead_of_this_one_fast_forwards(lab) -> None:  # type: ignore[no-untyped-def]
+    main = lab.repo.current_branch(lab.session)
+    call(lab, "edit", {"op": "scale", "args": {"targets": "L0.mlp.down", "factor": 0.9}})
+    _vcs(lab, "commit", message="on main")
+    _vcs(lab, "branch", name="work")
+    _vcs(lab, "branch", name="ahead")
+    call(lab, "edit", {"op": "scale", "args": {"targets": "L1.mlp.down", "factor": 0.9}})
+    ahead = _vcs(lab, "commit", message="ahead by one")
+    _vcs(lab, "checkout", rev="work")
+    summary = _vcs(lab, "merge", name="ahead")
+    assert summary.startswith("fast-forwarded work to ahead")
+    assert lab.repo.head(lab.session) == lab.repo.resolve("ahead")
+    assert lab.repo.get_commit(lab.repo.head(lab.session)).message == "ahead by one"
+    assert ahead
+    _vcs(lab, "checkout", rev=main)  # protected: a real merge commit, checked for interference
+    assert "fast-forward" not in _vcs(lab, "merge", name="ahead")
+
+
+def test_peft_export_skips_cancelled_patches_and_names_what_it_cannot_take(lab) -> None:  # type: ignore[no-untyped-def]
+    lab.contrast([[1, 2, 3]], [[4, 5, 6]], name="d")
+    steer = {"direction": "dir:d", "scale": 0.01, "at": 0}  # via the embedding
+    assert call(lab, "edit", {"op": "bake_steer", "args": steer}).ok
+    call(lab, "edit", {"op": "scale", "args": {"targets": "L1.mlp.down", "factor": 0.9}})
+    refused = call(lab, "export", {"kind": "peft", "path": "out/peft"})
+    assert not refused.ok
+    assert "this is a Embedding embed" in refused.summary
+    assert "export merged" in refused.summary
+    assert call(lab, "edit", {"op": "transplant", "args": {"targets": "embed"}}).ok  # undo it
+    exported = call(lab, "export", {"kind": "peft", "path": "out/peft"})
+    assert exported.ok, exported.summary

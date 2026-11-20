@@ -149,6 +149,11 @@ def export_peft(
     for name in names:
         role = ir.primary_role(name)
         info = ir.params[name]
+        deltas = [
+            tree.delta(o) for o in (*state.merged.get(name, ()), *state.adapter.get(name, ()))
+        ]
+        if _restored(tree, name):
+            continue  # patches that cancel out (say, a transplant back to base) change nothing
         module = model.get_submodule(info.module)
         if (
             len(info.shape) != 2
@@ -157,12 +162,11 @@ def export_peft(
             or not hasattr(module, "weight")
             or name.rpartition(".")[2] != "weight"
         ):
+            kind = f"{type(module).__name__} {role.kind}" if role else type(module).__name__
             raise WspxError(
-                f"{name}: PEFT LoRA covers 2-D linear weights only; export --merged instead"
+                f"{name}: PEFT LoRA export covers linear-layer weights, and this is a {kind}; "
+                "export merged (the full weights) or bundle instead"
             )
-        deltas = [
-            tree.delta(o) for o in (*state.merged.get(name, ()), *state.adapter.get(name, ()))
-        ]
         b, a, err = _lora_factors(deltas, info.shape, role.in_dim, max_rank)
         flip = role.in_dim == 0
         fan_in_fan_out.add(flip)
@@ -172,6 +176,8 @@ def export_peft(
         ranks[info.module] = a.shape[0]
         if err > 0:
             errors[name] = err
+    if not tensors:
+        raise WspxError("nothing to export: the working tree's patches cancel out")
     if len(fan_in_fan_out) > 1:
         raise WspxError(
             "edits mix nn.Linear and Conv1D layouts; PEFT needs one fan_in_fan_out setting"
@@ -196,6 +202,21 @@ def export_peft(
     }
     (out / "adapter_config.json").write_text(json.dumps(config, indent=2))
     return {"path": str(out), "modules": sorted(ranks), "ranks": ranks, "svd_error": errors}
+
+
+def _restored(tree: WorkingTree, name: str) -> bool:
+    """Whether ``name``'s patches cancel out (and add no adapter).
+
+    Cancelled patches can leave float32 rounding residue (a transplant back to base is
+    computed against the rounded weight), so "cancel" means below float32 resolution.
+    """
+    state = tree.state
+    if state.adapter.get(name):
+        return False
+    weight = tree.materialize_state(name, state, dtype=torch.float32)
+    base = tree.base(name).float()
+    eps = torch.finfo(torch.float32).eps
+    return float((weight - base).abs().max()) <= 4 * eps * float(base.abs().max())
 
 
 def _lora_factors(

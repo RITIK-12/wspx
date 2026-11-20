@@ -243,6 +243,10 @@ class Repo:
         self.store.refs.set_symbolic(self.head_ref(session), HEADS + branch)
         return self.head(session)
 
+    def fast_forward(self, session: str, oid: str) -> None:
+        """Move the session's branch (or detached HEAD) on to ``oid``, a descendant of HEAD."""
+        self.store.refs.update(self.head_ref(session), oid, expected=self.head(session))
+
     def detach(self, session: str, oid: str) -> None:
         self.store.refs.delete(self.head_ref(session))
         self.store.refs.update(self.head_ref(session), oid)

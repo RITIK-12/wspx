@@ -319,12 +319,16 @@ class Lab:
             shape = tuple(select(torch.empty(info.shape, device="meta"), t.index).shape)
             kind = t.role.kind if t.role else "param"
             rows.append((t.address, kind, t.param, shape, info.dtype))
-        lines = [f"{a:<28} {k:<9} {tuple(s)!s:<16} {d:<9} {p}" for a, k, p, s, d in rows[:limit]]
-        if len(rows) > limit:
-            lines.append(f"… {len(rows) - limit} more; narrow the scope")
-        return ToolResult(
-            "\n".join(lines) or "(nothing matches)", {"rows": [list(r[:3]) for r in rows]}
+        if not rows:
+            return ToolResult("(nothing matches)", {"rows": []})
+        # the count leads, so output budgets that trim the end never hide it
+        head = f"{len(rows)} address(es) match {scope}" + (
+            f"; the first {limit} are listed (narrow the scope or raise limit)"
+            if len(rows) > limit
+            else ""
         )
+        lines = [f"{a:<28} {k:<9} {tuple(s)!s:<16} {d:<9} {p}" for a, k, p, s, d in rows[:limit]]
+        return ToolResult("\n".join([head, *lines]), {"rows": [list(r[:3]) for r in rows]})
 
     # ------------------------------------------------------------------ grep
 
@@ -1098,6 +1102,22 @@ class Lab:
             raise VCSError(f"{branch} has no commits")
         if self.repo.is_ancestor(theirs, ours):
             return ToolResult(f"already up to date with {branch}")
+        here = self.repo.current_branch(self.session)
+        if (
+            self.repo.is_ancestor(ours, theirs)
+            and here not in self.config.policy.protected_branches
+        ):
+            # nothing changed on this side: take their commit as it is, like git's fast-forward
+            # (a protected branch still gets a merge commit, which runs the interference check)
+            self.tree.checkout(TreeState.from_dict(self.repo.tree_of_oid(theirs)))
+            self._verify(self.repo.get_commit(theirs))
+            self.repo.fast_forward(self.session, theirs)
+            self._save()
+            return ToolResult(
+                f"fast-forwarded {here or 'HEAD'} to {branch} ({short(theirs)}): nothing "
+                "changed on this side, so no merge commit is needed",
+                {"commit": theirs, "fast_forward": True},
+            )
         base = self.repo.merge_base(ours, theirs)
         mine = self.repo.introduced(base, ours, sections=("merged",))
         other = self.repo.introduced(base, theirs, sections=("merged",))
@@ -1457,8 +1477,8 @@ class GrepHits:
                     tokens = "  writes: " + ", ".join(self.lab.text.show(t) for t, _ in tops)
             lines.append(f"{h.address:<32} {h.score:+.4f}{tokens}")
         r = self.result
-        if r.expression.startswith("mean |activation|"):  # a ranking: every unit "matches"
-            head = f"top {len(self.hits)} of {r.candidates:,} {r.axis}s by {r.expression}"
+        if len(r.hits) == r.candidates:  # no threshold (a ranking): every unit "matches"
+            head = f"top {len(self.hits)} of {r.candidates:,} {r.axis}s ranked by {r.expression}"
         else:
             head = f"{len(r.hits):,} of {r.candidates:,} {r.axis}s matched" + (
                 f", showing the top {len(self.hits)} (raise --top or narrow)"
