@@ -76,8 +76,8 @@ class GrepArgs(_Args):
     )
     fires_on: list[Prompt] | str | None = Field(
         None,
-        description="Activation grep: rank writer units by activation on these prompts (text, "
-        "image or video prompts) or a .jsonl path.",
+        description="Activation grep: rank writer units by activation on an array of prompts "
+        "(text, token ids or image prompts), or on a .jsonl prompt file.",
     )
 
 
@@ -92,9 +92,12 @@ class ShowArgs(_Args):
 
 class ContrastArgs(_Args):
     positive: list[Prompt] | str = Field(
-        description="Prompts showing the behaviour, or a .jsonl path."
+        description="An array of prompts showing the behaviour (text, token ids or image "
+        "prompts), or the path of a .jsonl prompt file."
     )
-    negative: list[Prompt] | str = Field(description="Prompts without it, or a .jsonl path.")
+    negative: list[Prompt] | str = Field(
+        description="An array of prompts without it, or the path of a .jsonl prompt file."
+    )
     name: str = Field(description="Direction name; it is saved as dir:<name>.")
     layer: int | None = Field(
         None, ge=0, description="Residual stream after this block (default: middle)."

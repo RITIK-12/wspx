@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import traceback
 from typing import TYPE_CHECKING, Any
 
@@ -56,7 +57,12 @@ def _run(lab: Lab, name: str, a: Any) -> ToolResult:
         return lab.ls(a.scope, role=a.role, layers=a.layers, limit=a.limit)
     if name == "grep":
         hits = lab.grep(
-            a.expression, scope=a.scope, axis=a.axis, top=a.top, name=a.name, fires_on=a.fires_on
+            a.expression,
+            scope=a.scope,
+            axis=a.axis,
+            top=a.top,
+            name=a.name,
+            fires_on=prompt_arg(a.fires_on),
         )
         return ToolResult(
             hits.summary, {"handle": hits.handle, "hits": [h.__dict__ for h in hits]}, [hits.handle]
@@ -64,16 +70,28 @@ def _run(lab: Lab, name: str, a: Any) -> ToolResult:
     if name == "show":
         return lab.show(a.address, values=a.values)
     if name == "contrast":
-        d = lab.contrast(a.positive, a.negative, name=a.name, layer=a.layer, position=a.position)
+        d = lab.contrast(
+            prompt_arg(a.positive),
+            prompt_arg(a.negative),
+            name=a.name,
+            layer=a.layer,
+            position=a.position,
+        )
         return ToolResult(
             d.summary, {"handle": d.handle, "separation": d.direction.separation}, [d.handle]
         )
     if name == "generate":
         return lab.generate(
-            a.prompt, max_tokens=a.max_tokens, temperature=a.temperature, seed=a.seed
+            prompt_arg(a.prompt), max_tokens=a.max_tokens, temperature=a.temperature, seed=a.seed
         )
     if name == "trace":
-        return lab.trace(a.prompt, vs=a.vs, reference=a.reference, target=a.target, top=a.top)
+        return lab.trace(
+            prompt_arg(a.prompt),
+            vs=a.vs,
+            reference=prompt_arg(a.reference),
+            target=a.target,
+            top=a.top,
+        )
     if name == "edit":
         p = lab.edit_op(a.op, precision=a.precision, scope=a.scope, **a.args)
         return ToolResult(p.summary, {"handle": p.handle, "record": p.record.oid}, [p.handle])
@@ -121,4 +139,31 @@ def _vcs(lab: Lab, a: Any) -> ToolResult:
 def _need(value: str | None, what: str) -> str:
     if not value:
         raise WspxError(f"this action needs {what}")
+    return value
+
+
+_MEDIA_KEYS = {"messages", "reply", "item"}
+
+
+def prompt_arg(value: Any) -> Any:
+    """Prompts as the caller meant them.
+
+    Models sometimes send an array or object of prompts JSON-encoded inside a string (the
+    schema allows a string, for a .jsonl path). Such a string is parsed; so is a list element
+    that holds a JSON-encoded image prompt. Plain text stays text.
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        if text[:1] in ("[", "{"):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                return value
+            if isinstance(parsed, list) or (
+                isinstance(parsed, dict) and parsed and set(parsed) <= _MEDIA_KEYS
+            ):
+                return prompt_arg(parsed) if isinstance(parsed, list) else parsed
+        return value
+    if isinstance(value, list):
+        return [prompt_arg(v) if isinstance(v, str) and v.strip()[:1] == "{" else v for v in value]
     return value

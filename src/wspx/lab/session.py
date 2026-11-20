@@ -445,9 +445,14 @@ class Lab:
             seconds=time.perf_counter() - started,
         )
 
-    def _prompts(self, value: Sequence[Prompt] | str) -> list[Prompt]:
+    def _prompts(self, value: Sequence[Prompt] | Prompt) -> list[Prompt]:
+        """A list of prompts, a single prompt, or the path of a .jsonl prompt file."""
+        if is_media(value):
+            return [value]  # type: ignore[list-item]
+        if isinstance(value, str) and not value.strip().endswith(".jsonl"):
+            return [value]
         if isinstance(value, str):
-            path = self._readable(value)
+            path = self._readable(value.strip())
             rows: list[Any] = [
                 json.loads(line) for line in path.read_text().splitlines() if line.strip()
             ]
@@ -462,12 +467,18 @@ class Lab:
             if any(p is None for p in prompts):
                 raise WspxError(f"{value}: each line needs 'messages', 'prompt' or 'text'")
             return prompts
-        return list(value)
+        items: list[Any] = list(value)
+        if items and all(isinstance(t, int) for t in items):
+            return [items]  # one prompt of token ids
+        return items
 
     def _readable(self, rel: str) -> Path:
         """A project file tools may read: inside the project and outside the test folders."""
         root = self.workdir.resolve()
-        path = (root / rel).resolve()
+        try:
+            path = (root / rel).resolve()
+        except OSError as exc:
+            raise WspxError(f"{rel[:80]}: not a usable prompt file path ({exc.strerror})") from None
         if not path.is_relative_to(root):
             raise WspxError(f"{rel}: prompt files must be inside the project")
         for folder in self.config.tests.paths:
@@ -476,7 +487,11 @@ class Lab:
                     f"{rel}: {folder.rstrip('/')}/ holds test data, which tools cannot read; "
                     f"keep prompts in {self.config.tests.prompts}"
                 )
-        if not path.is_file():
+        try:
+            found = path.is_file()
+        except OSError as exc:
+            raise WspxError(f"{rel[:80]}: not a usable prompt file path ({exc.strerror})") from None
+        if not found:
             raise WspxError(f"{rel}: no such prompt file")
         return path
 

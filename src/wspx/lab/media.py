@@ -130,13 +130,21 @@ class Media:
         return out
 
     def resolve(self, prompt: Any) -> Any:
-        """A prompt with any ``item`` reference replaced by the stored prompt."""
+        """A prompt with any ``item`` reference replaced by the stored prompt.
+
+        ``{"item": ..., "reply": "..."}`` is the stored prompt with the answer started.
+        """
         seen = 0
         while is_media(prompt) and "item" in prompt:
-            extra = set(prompt) - {"item"}
+            extra = set(prompt) - {"item", "reply"}
             if extra:
-                raise WspxError(f"an item prompt takes only 'item' (got {sorted(extra)})")
+                raise WspxError(f"an item prompt takes 'item' and 'reply' (got {sorted(extra)})")
+            reply = prompt.get("reply")
             prompt = self.item(prompt["item"])
+            if reply:
+                if not is_media(prompt):
+                    prompt = {"messages": [{"role": "user", "content": str(prompt)}]}
+                prompt = {**prompt, "reply": str(prompt.get("reply") or "") + str(reply)}
             seen += 1
             if seen > 4:
                 raise WspxError("item prompts nest too deeply")

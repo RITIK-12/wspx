@@ -251,7 +251,7 @@ def test_tools_cannot_read_test_data_or_leave_the_project(lab: Any, tmp_path: Pa
     )
     assert not out.ok
     assert "test data" in out.summary
-    out = call(lab, "contrast", {"positive": "/etc/hosts", "negative": "/etc/hosts", "name": "x"})
+    out = call(lab, "contrast", {"positive": "/etc/x.jsonl", "negative": "../y.jsonl", "name": "x"})
     assert not out.ok
     assert "inside the project" in out.summary
 
@@ -317,3 +317,35 @@ def test_suites_score_image_prompts_and_blind_suites_show_aggregates_only(
     with pytest.raises(WspxError):
         runner.heldout_items(result, caller="driver")
     assert runner.heldout_items(result, caller="ui") == result.checks
+
+
+def test_prompt_lists_that_arrive_as_strings_are_understood(lab: Any) -> None:
+    """Models sometimes JSON-encode an array into the string branch of the schema."""
+    texts = json.dumps(["The carrot rests on the plate.", "The apple is in the bowl."])
+    items = json.dumps([{"item": "scenes/0"}, {"item": "scenes/1"}])
+    for positive, negative in [
+        (texts, json.dumps(["The carrot is held.", "The apple is beside the bowl."])),
+        (items, json.dumps([{"item": "scenes/2"}, {"item": "scenes/3"}])),
+        ([json.dumps({"item": "scenes/0"}), {"item": "scenes/1"}], [{"item": "scenes/2"}]),
+        ("The carrot rests on the plate.", "The carrot is held."),
+        ("prompts/scenes.jsonl", [{"item": "scenes/2"}]),
+    ]:
+        out = call(lab, "contrast", {"positive": positive, "negative": negative, "name": "d"})
+        assert out.ok, out.summary
+    fires = call(lab, "grep", {"fires_on": items, "top": 2})
+    assert fires.ok, fires.summary
+    gen = call(lab, "generate", {"prompt": json.dumps({"item": "scenes/0"}), "max_tokens": 2})
+    assert gen.ok, gen.summary
+    long = call(lab, "contrast", {"positive": "x" * 5000 + ".jsonl", "negative": "y", "name": "d"})
+    assert not long.ok
+    assert "failed" not in long.summary  # a clean error, not a crash
+
+
+def test_a_stored_prompt_takes_a_reply(lab: Any) -> None:
+    started = {"item": "scenes/0", "reply": 'I see one.\n\n{"count": '}
+    plain = lab.text.batch([{"item": "scenes/0"}])
+    replied = lab.text.batch([started])
+    assert replied.ids.shape[1] > plain.ids.shape[1]
+    assert lab.text.decode(replied.ids[0].tolist()).endswith('{"count": ')
+    out = call(lab, "trace", {"prompt": started})
+    assert out.ok, out.summary
