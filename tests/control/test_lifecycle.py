@@ -46,6 +46,7 @@ class SlowBackend:
     """Labs start only once ``ready`` is set, like a sandbox pulling its image."""
 
     def __init__(self) -> None:
+        self.fail: Exception | None = None
         self.ready = threading.Event()
         self.starting = threading.Event()
         self.labs_started = 0
@@ -57,6 +58,8 @@ class SlowBackend:
         while not self.ready.wait(0.01):
             if cancelled():
                 raise LabCancelled(f"{record.id}'s lab was stopped while it started")
+        if self.fail is not None:
+            raise self.fail
         return FakeLab()
 
     def start_runner(self, record: SessionRecord, env: dict[str, str]) -> FakeRunner:
@@ -197,3 +200,27 @@ def test_gateway_admin_reads_the_halt_state() -> None:
     admin = GatewayAdmin("http://gw", "t", transport=httpx.MockTransport(broken))
     with pytest.raises(WspxError, match="not JSON"):
         admin.halted()
+
+
+def test_a_failed_start_fails_the_calls_queued_behind_it(tmp_path: Path) -> None:
+    """Seen live: three calls queued on a lab that never got a GPU started three sandboxes."""
+    m, backend = manager(tmp_path)
+    backend.fail = RuntimeError("no GPU available")
+    sid = m.create(model="m").id
+    assert backend.starting.wait(5)
+    results: list[Any] = []
+    queued = [
+        threading.Thread(target=lambda: results.append(m.tool(sid, "info", {}))) for _ in range(2)
+    ]
+    for t in queued:
+        t.start()
+    time.sleep(0.05)
+    backend.ready.set()  # the start now fails
+    for t in queued:
+        t.join(timeout=5)
+    assert backend.labs_started == 1
+    assert [r["ok"] for r in results] == [False, False]
+    assert all("failed to start: no GPU available" in r["summary"] for r in results)
+    wait(lambda: m.get(sid).status == "error")
+    assert m.tool(sid, "info", {}, source="human")["ok"] is False  # a new call tries again
+    assert backend.labs_started == 2

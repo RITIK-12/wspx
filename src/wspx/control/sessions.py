@@ -23,7 +23,7 @@ from wspx.auth import mint
 from wspx.control.backend import Backend, LabHandle, RunnerHandle, SessionRecord
 from wspx.control.gateway_client import GatewayAdmin
 from wspx.control.tracedb import TraceDB
-from wspx.errors import LabCancelled, WspxError
+from wspx.errors import LabCancelled, LabUnavailable, WspxError
 from wspx.store import Store, short
 from wspx.store.overlay import apply_journal
 from wspx.tools import TOOLS
@@ -66,6 +66,8 @@ class SessionManager:
         """Bumped by every kill --all and resume, so a stale halt read cannot undo them."""
         self._lab_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
         self._lab_gen: dict[str, int] = defaultdict(int)
+        self._lab_why: dict[str, str] = {}
+        """Why the last generation ended: calls that waited on it fail with this."""
         """Bumped by every lab stop: a start begun under an older value is abandoned."""
         self._lock = threading.RLock()
         for data in trace.sessions():
@@ -182,7 +184,7 @@ class SessionManager:
             if sid in self.labs:
                 return self.labs[sid]
             if self._lab_gen[sid] != gen:
-                raise LabCancelled(f"{sid}'s lab was stopped")
+                raise LabCancelled(self._lab_why.get(sid, f"{sid}'s lab was stopped"))
             record = self.get(sid)
             self.trace.event(sid, "lab", {"tier": "starting"})
             started = time.time()
@@ -191,6 +193,12 @@ class SessionManager:
             except LabCancelled:
                 self.trace.event(sid, "lab", {"tier": "cold", "reason": "start cancelled"})
                 raise
+            except Exception as exc:
+                # fail the calls queued behind this start too, rather than each starting a lab
+                self._lab_why[sid] = f"the lab failed to start: {exc}"
+                self._lab_gen[sid] += 1
+                self.trace.event(sid, "lab", {"tier": "cold", "reason": self._lab_why[sid]})
+                raise LabUnavailable(self._lab_why[sid]) from exc
             record.load_seconds = time.time() - started
             record.tier = "hot"
             self.labs[sid] = handle
@@ -200,6 +208,7 @@ class SessionManager:
             return handle
 
     def stop_lab(self, sid: str, reason: str) -> None:
+        self._lab_why[sid] = f"{sid}'s lab was stopped"
         self._lab_gen[sid] += 1  # before the lock: a start in progress holds it until it gives up
         with self._lab_locks[sid]:
             handle = self.labs.pop(sid, None)
