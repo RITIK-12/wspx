@@ -13,7 +13,9 @@ labs               GPU sandboxes created by the control plane at runtime
 from __future__ import annotations
 
 import importlib.metadata
+import json
 import os
+import re
 from pathlib import Path
 
 import modal
@@ -47,30 +49,64 @@ key_secrets = [
 hf_secret = modal.Secret.from_name(KEY_SECRETS["hf"][0], environment_name=ENVIRONMENT)
 
 
-def _image(extra: str, *, gpu: bool = False) -> modal.Image:
-    """The same wspx version as the CLI, with the extras that role runs.
+_DEV_REQUIRES = "WSPX_DEV_REQUIRES"
+_SOURCE_IGNORE = ["**/__pycache__/**", "**/*.pyc"]
+_EXTRA_MARKER = re.compile(r"""\bextra\s*==\s*["']([^"']+)["']""")
 
-    A wspx installed from a source checkout (development) is copied in instead
-    of fetched from PyPI.
+
+def _source_requires() -> list[str] | None:
+    """wspx's requirements when it runs from a source checkout; None for a PyPI install.
+
+    Locally this reads the installed distribution. Inside a container the
+    source-built images carry the list in their environment, because copied
+    source has no distribution metadata; the control plane needs it to rebuild
+    the lab image definition (which Modal then finds in its image cache).
     """
-    base = modal.Image.debian_slim(python_version="3.12")
+    if not modal.is_local():
+        raw = os.environ.get(_DEV_REQUIRES)
+        return json.loads(raw) if raw else None
     dist = importlib.metadata.distribution("wspx")
     direct = dist.read_text("direct_url.json") or ""
     if os.environ.get("WSPX_DEV_SOURCE") or '"editable": true' in direct or "file://" in direct:
-        requires = [
-            r for r in (dist.requires or []) if "extra ==" not in r or f'extra == "{extra}"' in r
-        ]
-        deps = [r.split(";")[0].strip() for r in requires]
-        image = base.uv_pip_install(*deps) if deps else base
-        return image.add_local_python_source("wspx")
-    del gpu
-    return base.uv_pip_install(f"wspx[{extra}]=={__version__}")
+        return list(dist.requires or [])
+    return None
+
+
+def _deps_for(requires: list[str], extra: str) -> list[str]:
+    """The base requirements plus one extra's, markers stripped (images are all Linux).
+
+    Metadata writers quote the marker either way (``extra == 'lab'`` from
+    hatchling), so the extra is parsed rather than string-matched.
+    """
+    deps = []
+    for req in requires:
+        spec, _, marker = req.partition(";")
+        match = _EXTRA_MARKER.search(marker)
+        if match is None or match.group(1) == extra:
+            deps.append(spec.strip())
+    return deps
+
+
+def _image(extra: str) -> modal.Image:
+    """The same wspx version as the CLI, with the extras that role runs.
+
+    A wspx installed from a source checkout (development) is copied in,
+    with its data files (the UI bundle, the skill), instead of fetched from PyPI.
+    """
+    base = modal.Image.debian_slim(python_version="3.12")
+    requires = _source_requires()
+    if requires is None:
+        return base.uv_pip_install(f"wspx[{extra}]=={__version__}")
+    deps = _deps_for(requires, extra)
+    image = base.env({_DEV_REQUIRES: json.dumps(requires)})
+    image = image.uv_pip_install(*deps) if deps else image
+    return image.add_local_python_source("wspx", copy=True, ignore=_SOURCE_IGNORE)
 
 
 control_image = _image("control")
 gateway_image = _image("gateway")
 driver_image = _image("driver")
-lab_image = _image("lab", gpu=True)
+lab_image = _image("lab")
 
 
 @app.function(
