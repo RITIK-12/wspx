@@ -64,3 +64,36 @@ def test_container_rebuilds_images_without_metadata(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.delenv(cloud._DEV_REQUIRES)
     assert cloud._source_requires() is None  # a PyPI install: images pin wspx by version
+
+
+def test_set_key_uses_the_api_not_argv(monkeypatch: pytest.MonkeyPatch) -> None:
+    from wspx.cloud import deploy
+
+    argv: list[tuple[str, ...]] = []
+    created: list[tuple[str, dict[str, str], str | None, bool]] = []
+
+    def fake_modal(*args: str, check: bool = True) -> object:
+        argv.append(args)
+        return type("Proc", (), {"stdout": "[]"})()
+
+    def fake_create(
+        name: str,
+        env: dict[str, str],
+        *,
+        environment_name: str | None = None,
+        overwrite: bool = False,
+    ) -> str:
+        created.append((name, env, environment_name, overwrite))
+        return "st-1"
+
+    monkeypatch.setattr(deploy, "_modal", fake_modal)
+    monkeypatch.setattr(modal.Secret, "_create_deployed", fake_create, raising=False)
+    deploy.set_key("anthropic", "  sk-test-value\n")
+
+    assert ("environment", "create", "wspx") in argv  # works before the first deploy
+    assert not any("sk-test-value" in " ".join(a) for a in argv)
+    assert created == [("wspx-key-anthropic", {"ANTHROPIC_API_KEY": "sk-test-value"}, "wspx", True)]
+    with pytest.raises(ValueError, match="empty"):
+        deploy.set_key("anthropic", "   ")
+    with pytest.raises(ValueError, match="unknown provider"):
+        deploy.set_key("acme", "x")

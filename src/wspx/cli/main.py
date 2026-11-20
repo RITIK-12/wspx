@@ -96,6 +96,8 @@ def keys_set(
     provider: Annotated[str, typer.Argument(help="anthropic, openai, google or hf")],
 ) -> None:
     """Store a provider key as a Modal secret."""
+    from modal.exception import Error as ModalError
+
     from wspx.cloud.deploy import set_key
 
     links = {
@@ -106,7 +108,7 @@ def keys_set(
     value = typer.prompt(f"{provider} key", hide_input=True)
     try:
         set_key(provider, value)
-    except (ValueError, subprocess.CalledProcessError) as exc:
+    except (ValueError, subprocess.CalledProcessError, ModalError) as exc:
         _fail(exc)
     typer.echo(
         f"stored the {provider} key in your Modal account; it takes effect when the gateway restarts "

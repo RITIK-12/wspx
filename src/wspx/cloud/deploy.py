@@ -55,11 +55,27 @@ def ensure_secrets(api_token: str | None = None) -> str:
 
 
 def set_key(provider: str, value: str) -> None:
-    """Store a provider key in the keys secret (never on local disk)."""
+    """Store a provider key as that provider's secret, overwriting it in place.
+
+    The value goes to Modal over its API, so it never lands on local disk or in
+    a process list (``modal secret create KEY=value`` would put it in argv).
+    Works before the first deploy: the environment is created if needed.
+    """
     if provider not in KEY_SECRETS:
         raise ValueError(f"unknown provider {provider!r}; use one of {', '.join(KEY_SECRETS)}")
+    value = value.strip()
+    if not value:
+        raise ValueError("the key is empty")
+    ensure_environment()
     name, var = KEY_SECRETS[provider]
-    _modal("secret", "create", name, f"{var}={value}", "--env", ENVIRONMENT, "--force")
+    import modal
+
+    # The overwrite path `modal secret create --force` uses; fall back to the CLI if it moves.
+    create_deployed = getattr(modal.Secret, "_create_deployed", None)
+    if create_deployed is None:
+        _modal("secret", "create", name, f"{var}={value}", "--env", ENVIRONMENT, "--force")
+        return
+    create_deployed(name, {var: value}, environment_name=ENVIRONMENT, overwrite=True)
 
 
 def deploy() -> Deployment:  # pragma: no cover - needs a Modal account
