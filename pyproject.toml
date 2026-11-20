@@ -121,6 +121,7 @@ ignore = [
     "PLR0911", # too many returns: dispatchers read better flat
     "PLR0912", # too many branches
     "PLR0913", # too many arguments: tool signatures mirror their schemas
+    "PLR0917", # too many positional arguments: same, for internal helpers
     "PLR0915", # too many statements
     "PLR2004", # magic values: thresholds are documented where used
     "PLC0415", # imports inside functions keep heavy deps (torch) off the client path
@@ -128,6 +129,10 @@ ignore = [
     "RUF002",
     "RUF003",
 ]
+
+[tool.ruff.lint.pycodestyle]
+# The formatter aims for 100 columns; allow headroom for lines it cannot split.
+max-line-length = 120
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["PLR2004", "S101"]
