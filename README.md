@@ -169,6 +169,7 @@ for review.
 ```python
 from wspx.testing import suite, expect, load_jsonl
 
+
 @suite(split="dev", seed=0)
 def math_finishes(model):
     for item in load_jsonl("data/math_dev.jsonl"):
