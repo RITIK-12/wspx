@@ -62,6 +62,8 @@ class SessionManager:
         self.idle_since: dict[str, float] = {}
         self.workspace: dict[str, str] = {}
         self.halted = False
+        self._halt_epoch = 0
+        """Bumped by every kill --all and resume, so a stale halt read cannot undo them."""
         self._lab_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
         self._lab_gen: dict[str, int] = defaultdict(int)
         """Bumped by every lab stop: a start begun under an older value is abandoned."""
@@ -381,15 +383,28 @@ class SessionManager:
                 self.gateway.pause(sid, reason)
 
     def sync_halt(self) -> None:
-        """Take the halt state from the gateway, which keeps it across control-plane restarts."""
-        if self.gateway is not None:
-            with contextlib.suppress(WspxError):
-                self.halted = self.gateway.halted()
+        """Take the halt state from the gateway, which keeps it across control-plane restarts.
+
+        A kill or resume that lands while the gateway answers (both often wake it
+        together) is newer than the answer, and wins.
+        """
+        if self.gateway is None:
+            return
+        epoch = self._halt_epoch
+        try:
+            halted = self.gateway.halted()
+        except WspxError:
+            return
+        with self._lock:
+            if self._halt_epoch == epoch:
+                self.halted = halted
 
     def resume(self, sid: str | None = None) -> None:
         targets = [sid] if sid else [s for s, r in self.records.items() if r.status == "paused"]
         if sid is None:
-            self.halted = False
+            with self._lock:
+                self.halted = False
+                self._halt_epoch += 1
         if self.gateway is not None:
             self.gateway.resume(sid)
         for s in targets:
@@ -404,7 +419,9 @@ class SessionManager:
         """Stop drivers, revoke leases and terminate labs. ``None`` kills everything and halts."""
         targets = [sid] if sid else list(self.records)
         if sid is None:
-            self.halted = True
+            with self._lock:
+                self.halted = True
+                self._halt_epoch += 1
             if self.gateway is not None:
                 with contextlib.suppress(WspxError):
                     self.gateway.halt("kill --all")

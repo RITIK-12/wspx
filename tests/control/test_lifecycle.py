@@ -146,13 +146,19 @@ def test_calls_queued_behind_a_cancelled_start_do_not_restart_the_lab(tmp_path: 
 
 
 class FakeGateway:
-    def __init__(self, halted: bool | Exception) -> None:
+    def __init__(self, halted: bool | Exception, during: Any = None) -> None:
         self._halted = halted
+        self.during = during
 
     def halted(self) -> bool:
+        if self.during is not None:
+            self.during()
         if isinstance(self._halted, Exception):
             raise self._halted
         return self._halted
+
+    def resume(self, session: str | None = None) -> None:
+        pass
 
 
 def test_halt_survives_a_control_plane_restart(tmp_path: Path) -> None:
@@ -165,6 +171,15 @@ def test_halt_survives_a_control_plane_restart(tmp_path: Path) -> None:
 
     m, _ = manager(tmp_path, gateway=FakeGateway(WspxError("gateway unreachable")))
     m.sync_halt()  # an unreachable gateway leaves the state as it was
+    assert not m.halted
+
+
+def test_a_resume_during_the_halt_read_wins(tmp_path: Path) -> None:
+    """A resume that wakes both services: the gateway answers the read first, but resume is newer."""
+    gateway = FakeGateway(True)
+    m, _ = manager(tmp_path, gateway=gateway)
+    gateway.during = m.resume
+    m.sync_halt()
     assert not m.halted
 
 
