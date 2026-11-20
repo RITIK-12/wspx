@@ -131,12 +131,15 @@ class AnthropicStream:
 def openai_json(body: dict[str, Any]) -> tuple[Usage, Observed]:
     u = body.get("usage") or {}
     obs = Observed(stop_reason=body.get("status") or None)
-    if "input_tokens" in u:  # Responses API
+    if "input_tokens" in u:  # Responses API: input_tokens includes cached and cache-written tokens
+        details = u.get("input_tokens_details") or {}
+        cached = int(details.get("cached_tokens") or 0)
+        written = int(details.get("cache_write_tokens") or 0)
         usage = Usage(
-            input=int(u.get("input_tokens") or 0)
-            - int((u.get("input_tokens_details") or {}).get("cached_tokens") or 0),
+            input=int(u.get("input_tokens") or 0) - cached - written,
             output=int(u.get("output_tokens") or 0),
-            cache_read=int((u.get("input_tokens_details") or {}).get("cached_tokens") or 0),
+            cache_read=cached,
+            cache_write=written,
             reasoning=int((u.get("output_tokens_details") or {}).get("reasoning_tokens") or 0),
             complete=True,
         )
