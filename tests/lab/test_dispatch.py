@@ -201,3 +201,58 @@ def test_an_adapter_edit_then_a_merged_one_keeps_the_base(lab) -> None:  # type:
     assert call(lab, "edit", {"op": "rank_one_write", "args": up, "precision": "adapter"}).ok
     assert call(lab, "edit", {"op": "scale", "args": {"targets": "L1.mlp.up", "factor": 0.5}}).ok
     assert tensor_hash(lab.tree.base(name)) == base
+
+
+def _vcs(lab, action: str, **args: object) -> str:  # type: ignore[no-untyped-def]
+    result = call(lab, "vcs", {"action": action, **args})
+    assert result.ok, result.summary
+    return result.summary
+
+
+def test_merge_keeps_their_reverts_and_adapters(lab) -> None:  # type: ignore[no-untyped-def]
+    from wspx.lab.tensors import tensor_hash
+
+    down0 = "model.layers.0.mlp.down_proj.weight"
+    base = tensor_hash(lab.model.get_parameter(down0))
+    ours = lab.repo.current_branch(lab.session)
+    call(lab, "edit", {"op": "scale", "args": {"targets": "L0.mlp.down", "factor": 0.9}})
+    _vcs(lab, "commit", message="scale L0")
+    _vcs(lab, "branch", name="theirs")
+    _vcs(lab, "revert", rev="HEAD")
+    lab.contrast([[1, 2, 3]], [[4, 5, 6]], name="d")
+    up = {"target": "L1.mlp.up", "key": "dir:d", "value": (0.01 * torch.randn(64)).tolist()}
+    call(lab, "edit", {"op": "rank_one_write", "args": up, "precision": "adapter"})
+    _vcs(lab, "commit", message="adapter on L1 up")
+    _vcs(lab, "checkout", rev=ours)
+    call(lab, "edit", {"op": "scale", "args": {"targets": "L2.mlp.down", "factor": 0.9}})
+    _vcs(lab, "commit", message="scale L2")
+
+    _vcs(lab, "merge", name="theirs")
+    tree = lab.repo.tree_of_oid(lab.repo.head(lab.session))
+    assert "model.layers.0.mlp.down_proj.weight" not in tree["merged"]  # their revert holds
+    assert tensor_hash(lab.model.get_parameter(down0)) == base
+    assert "model.layers.1.mlp.up_proj.weight" in tree["adapter"]  # still an adapter
+    assert "model.layers.1.mlp.up_proj.weight" not in tree["merged"]
+
+
+def test_a_merge_that_needs_review_says_why(lab) -> None:  # type: ignore[no-untyped-def]
+    main = lab.repo.current_branch(lab.session)
+    call(lab, "edit", {"op": "scale", "args": {"targets": "L0.mlp.down", "factor": 0.99}})
+    _vcs(lab, "commit", message="small")
+    _vcs(lab, "branch", name="big")
+    call(lab, "edit", {"op": "scale", "args": {"targets": "unembed", "factor": 200.0}})
+    _vcs(lab, "commit", message="sharpen every output", force=True)
+    _vcs(lab, "checkout", rev=main)
+    _vcs(lab, "branch", name="work")
+    call(lab, "edit", {"op": "scale", "args": {"targets": "L2.attn.o", "factor": 0.99}})
+    _vcs(lab, "commit", message="small too")
+    summary = _vcs(lab, "merge", name="big")
+    assert "[needs-review]" in summary
+    assert "needs review: it differs from work by KL" in summary
+
+    _vcs(lab, "checkout", rev=main)  # protected: the merge is refused, with the same reason
+    refused = call(lab, "vcs", {"action": "merge", "name": "big"})
+    assert not refused.ok
+    assert f"merge into protected {main} needs review: it differs from {main} by KL" in (
+        refused.summary
+    )

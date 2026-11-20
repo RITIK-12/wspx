@@ -379,12 +379,17 @@ class Repo:
             return True
         return b is not None and any(c.oid == a for c in self.walk(b))
 
-    def introduced(self, since: str | None, until: str | None) -> dict[str, list[str]]:
+    def introduced(
+        self,
+        since: str | None,
+        until: str | None,
+        sections: tuple[str, ...] = ("merged", "adapter"),
+    ) -> dict[str, list[str]]:
         """Delta blobs per tensor in ``until``'s tree that are not in ``since``'s tree."""
         before = self.get_tree(self.get_commit(since).tree) if since else EMPTY_TREE
         after = self.get_tree(self.get_commit(until).tree) if until else EMPTY_TREE
         out: dict[str, list[str]] = {}
-        for section in ("merged", "adapter"):
+        for section in sections:
             for tensor, blobs in after.get(section, {}).items():
                 old = set(before.get(section, {}).get(tensor, []))
                 new = [b for b in blobs if b not in old]

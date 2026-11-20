@@ -1099,10 +1099,16 @@ class Lab:
         if self.repo.is_ancestor(theirs, ours):
             return ToolResult(f"already up to date with {branch}")
         base = self.repo.merge_base(ours, theirs)
-        mine = self.repo.introduced(base, ours)
-        other = self.repo.introduced(base, theirs)
+        mine = self.repo.introduced(base, ours, sections=("merged",))
+        other = self.repo.introduced(base, theirs, sections=("merged",))
         tree = self.repo.tree_of_oid(ours)
+        base_tree, their_tree = self.repo.tree_of_oid(base), self.repo.tree_of_oid(theirs)
         merged = {k: list(v) for k, v in tree.get("merged", {}).items()}
+        for tensor, blobs in base_tree.get("merged", {}).items():  # what theirs reverted stays out
+            gone = set(blobs) - set(their_tree.get("merged", {}).get(tensor, []))
+            if gone and tensor in merged:
+                merged[tensor] = [b for b in merged[tensor] if b not in gone]
+        both = _changed(base_tree, tree) & _changed(base_tree, their_tree)
         requested = self._strategy_map(strategies or {})
         report: list[dict[str, Any]] = []
         unresolved = []
@@ -1145,10 +1151,17 @@ class Lab:
                 {"conflicts": report},
                 ok=False,
             )
+        promote = _merge_sets(
+            {"": base_tree.get("promote", [])},
+            {"": tree.get("promote", [])},
+            {"": their_tree.get("promote", [])},
+        )
         new_tree = {
             "merged": {k: v for k, v in merged.items() if v},
-            "adapter": tree.get("adapter", {}),
-            "promote": tree.get("promote", []),
+            "adapter": _merge_sets(
+                base_tree.get("adapter", {}), tree.get("adapter", {}), their_tree.get("adapter", {})
+            ),
+            "promote": promote.get("", []),
         }
         state = TreeState.from_dict(new_tree)
         kl_ours = kl_theirs = None
@@ -1170,6 +1183,13 @@ class Lab:
         hashes = {n: self.tree.hash(n) for n in sorted(state.tensors())}
         branch_now = self.repo.current_branch(self.session)
         status = "needs-review" if failed else "ok"
+        review = [
+            f"it differs from {who} by KL {kl:.3f} (limit {limit})"
+            for who, kl in ((branch_now or "ours", kl_ours), (branch, kl_theirs))
+            if kl is not None and kl > limit
+        ]
+        if suites_failed:
+            review.append(f"suites scored below both sides: {', '.join(suites_failed)}")
         info = {
             "from": theirs,
             "base": base,
@@ -1177,12 +1197,13 @@ class Lab:
             "kl_vs_ours": kl_ours,
             "kl_vs_theirs": kl_theirs,
             "suites_failed": suites_failed,
+            "review": review,
         }
         if failed and branch_now in self.config.policy.protected_branches:
             self.tree.checkout(self._state_of(ours) if ours else TreeState())
             return ToolResult(
-                f"merge into protected {branch_now} needs review: interference check failed "
-                f"(KL {kl_ours}, {kl_theirs}; suites {suites_failed}); nothing changed",
+                f"merge into protected {branch_now} needs review: {'; '.join(review)}; "
+                "nothing changed",
                 {"merge": info},
                 ok=False,
             )
@@ -1203,9 +1224,15 @@ class Lab:
             if kl_ours is not None
             else "no canary"
         )
+        strategies_used = ", ".join(
+            f"{_display(self.ir, r['tensor'])}: {r['strategy']}" for r in report
+        )
         return ToolResult(
-            f"merged {branch} as {commit.short} [{status}] · {len(report)} overlapping tensor(s) · "
-            f"{kl_text}",
+            f"merged {branch} as {commit.short} [{status}] · {len(both)} tensor(s) changed on "
+            f"both sides"
+            + (f" ({strategies_used})" if strategies_used else "")
+            + f" · {kl_text}"
+            + (f"\nneeds review: {'; '.join(review)}" if review else ""),
             {"commit": commit.oid, "merge": info},
         )
 
@@ -1528,6 +1555,28 @@ def _bind_positional(op: str, positional: tuple[Any, ...], args: dict[str, Any])
 def _display(ir: ModelIR, name: str) -> str:
     role = ir.primary_role(name)
     return role.address if role else name
+
+
+def _changed(base: dict[str, Any], tree: dict[str, Any]) -> set[str]:
+    """Tensors whose patches differ between two trees, in either section."""
+    out = set()
+    for section in ("merged", "adapter"):
+        a, b = base.get(section, {}), tree.get(section, {})
+        out |= {t for t in set(a) | set(b) if set(a.get(t, [])) != set(b.get(t, []))}
+    return out
+
+
+def _merge_sets(
+    base: dict[str, list[str]], ours: dict[str, list[str]], theirs: dict[str, list[str]]
+) -> dict[str, list[str]]:
+    """Three-way merge of tensor → patch lists: ours, plus what theirs added, minus what it removed."""
+    out = {}
+    for t in set(base) | set(ours) | set(theirs):
+        b, o, th = set(base.get(t, [])), set(ours.get(t, [])), set(theirs.get(t, []))
+        keep = (o | (th - b)) - (b - th)
+        if keep:
+            out[t] = sorted(keep)
+    return out
 
 
 _RANK_SKETCH = 128
