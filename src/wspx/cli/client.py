@@ -21,6 +21,10 @@ class Control:
             headers={"authorization": f"Bearer {token}"},
             timeout=httpx.Timeout(3600.0, connect=15.0),
             transport=transport,
+            # Modal answers a request still running after 150 s with a 303 to poll for the
+            # result; a tool call that wakes a cold lab takes that long.
+            follow_redirects=True,
+            max_redirects=40,
         )
 
     def _req(self, method: str, path: str, **kw: Any) -> Any:

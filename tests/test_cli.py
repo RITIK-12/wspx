@@ -202,3 +202,32 @@ def test_every_tool_is_a_command_with_every_argument() -> None:
         params = set(inspect.signature(commands[name]).parameters)
         missing = fields - params - mapped.get(name, set())
         assert name == "vcs" or not missing, f"wspx {name} cannot pass {sorted(missing)}"
+
+
+def test_slow_answers_are_followed_through_modals_redirect() -> None:
+    """Past 150 s Modal answers 303 with a URL that returns the result when it is ready."""
+    import httpx
+
+    from wspx.cli.client import Control
+
+    def modal(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(303, headers={"location": "/api/sessions/s_1/tools/info?t=x"})
+        return httpx.Response(200, json={"summary": "ok", "ok": True})
+
+    control = Control("http://control", "t", transport=httpx.MockTransport(modal))
+    assert control.tool("s_1", "info", {})["summary"] == "ok"
+
+
+def test_the_runner_follows_modals_redirect_too() -> None:
+    import httpx
+
+    from wspx.driver.run import ControlHooks
+
+    def modal(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(303, headers={"location": "/api/sessions/s_1/tools/ls?t=x"})
+        return httpx.Response(200, json={"summary": "listed", "ok": True, "handles": []})
+
+    hooks = ControlHooks("http://c", "", "s_1", "rt", "lt", transport=httpx.MockTransport(modal))
+    assert hooks.tool("ls", {}, "call_1").text == "listed"

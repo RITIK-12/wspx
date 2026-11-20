@@ -39,6 +39,8 @@ class ControlHooks:
             timeout=3600.0,
             transport=transport,
             headers={"authorization": f"Bearer {runner_token}"},
+            follow_redirects=True,  # Modal's 303 for requests past 150 s (a cold lab)
+            max_redirects=40,
         )
         self.gateway = (
             httpx.Client(
