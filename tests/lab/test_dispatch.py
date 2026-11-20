@@ -1,0 +1,47 @@
+from pathlib import Path
+
+import pytest
+import torch
+
+from tests.lab.test_session import tiny_llama
+from wspx.lab.sdk import open_lab
+from wspx.tools.dispatch import call
+
+
+@pytest.fixture
+def lab(tmp_path: Path):  # type: ignore[no-untyped-def]
+    return open_lab(tiny_llama(), store=tmp_path / "s", workdir=tmp_path)
+
+
+def test_end_to_end_through_the_tool_surface(lab) -> None:  # type: ignore[no-untyped-def]
+    assert call(lab, "info").ok
+    grep = call(lab, "grep", {"expression": "colnorm > 1σ", "in": "L*.mlp.down", "top": 3})
+    assert grep.ok
+    assert grep.handles[0].startswith("@r1")
+    edit = call(
+        lab,
+        "edit",
+        {
+            "op": "project_out",
+            "args": {"direction": torch.ones(48).tolist(), "targets": "L1.mlp.down", "cols": "@r1"},
+        },
+    )
+    assert edit.ok, edit.summary
+    assert call(lab, "check", {"level": "numeric"}).ok
+    commit = call(lab, "vcs", {"action": "commit", "message": "project out ones from hit columns"})
+    assert commit.ok, commit.summary
+    assert "project out" in call(lab, "vcs", {"action": "log"}).summary
+
+
+def test_errors_come_back_as_results(lab) -> None:  # type: ignore[no-untyped-def]
+    bad_args = call(lab, "grep", {"top": 1000})
+    assert not bad_args.ok
+    assert "invalid arguments" in bad_args.summary
+    unknown = call(lab, "show", {"address": "L0.mlp.dwn"})
+    assert not unknown.ok
+    assert "E101" in unknown.summary
+    blocked = call(lab, "edit", {"op": "scale", "args": {"targets": "L0.mlp.down", "factor": 1.0}})
+    assert not blocked.ok
+    assert "E105" in blocked.summary
+    assert "fix 1" in blocked.summary
+    assert not call(lab, "nope").ok
