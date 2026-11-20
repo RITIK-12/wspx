@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from tests.lab.test_session import tiny_llama
+from wspx.errors import VCSError
 from wspx.lab.sdk import open_lab
 from wspx.tools.dispatch import call
 
@@ -295,3 +296,38 @@ def test_peft_export_skips_cancelled_patches_and_names_what_it_cannot_take(lab) 
     assert call(lab, "edit", {"op": "transplant", "args": {"targets": "embed"}}).ok  # undo it
     exported = call(lab, "export", {"kind": "peft", "path": "out/peft"})
     assert exported.ok, exported.summary
+
+
+def test_embedding_rows_list_their_nearest_embeddings(lab) -> None:  # type: ignore[no-untyped-def]
+    shown = call(lab, "show", {"address": "embed[5]"}).summary
+    line = next(line for line in shown.splitlines() if "nearest embeddings" in line)
+    assert line.split(": ", 1)[1].split(",")[0].endswith("1.00")  # itself, first
+
+
+def test_check_judges_each_patch_at_its_own_precision(lab) -> None:  # type: ignore[no-untyped-def]
+    """An adapter patch is never rounded into the weights, so it cannot lose sub-ULP mass."""
+    lab.contrast([[1, 2, 3]], [[4, 5, 6]], name="d")
+    tiny = (1e-6 * torch.randn(64)).tolist()
+    up = {"target": "L1.mlp.up", "key": "dir:d", "value": tiny}
+    assert call(lab, "edit", {"op": "rank_one_write", "args": up, "precision": "adapter"}).ok
+    call(lab, "edit", {"op": "scale", "args": {"targets": "L2.mlp.down", "factor": 0.9}})
+    report = call(lab, "check", {"level": "numeric"}).summary
+    assert "W203 L1.mlp.up" not in report
+
+
+def test_branches_of_other_models_are_not_this_models(tmp_path: Path) -> None:  # type: ignore[no-untyped-def]
+    from wspx.control import views
+
+    first = open_lab(tiny_llama(0), store=tmp_path / "s", workdir=tmp_path)
+    call(first, "edit", {"op": "scale", "args": {"targets": "L0.mlp.down", "factor": 0.9}})
+    _vcs(first, "commit", message="on the first model")
+    _vcs(first, "branch", name="first-side")
+    with pytest.raises(VCSError, match="another model's commits"):  # "main" is the first's
+        open_lab(tiny_llama(1), store=tmp_path / "s", workdir=tmp_path, session="s_other")
+    other = open_lab(
+        tiny_llama(1), store=tmp_path / "s", workdir=tmp_path, session="s_other2", branch="b2"
+    )
+    assert first.ir.fingerprint != other.ir.fingerprint
+    assert "first-side" not in other.repo.branches()
+    listed = views.commits(other.store, other.ir.fingerprint, "s_other2")["commits"]
+    assert listed == []

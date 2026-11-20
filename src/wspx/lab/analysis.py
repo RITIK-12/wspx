@@ -47,6 +47,13 @@ def show(
         tokens = _vocab_of_vector(ir, params, view.float(), role.kind, final_scale)
         if tokens:
             out["vocab"] = [(text.show(t), s) for t, s in tokens]
+            out["vocab_label"] = (
+                "nearest embeddings (cos)"
+                if role.kind in ("embed", "pos_embed")
+                else "writes (cos with the unembedding, through the final norm)"
+                if role.kind in ("writer", "stem", "expert")
+                else "reads (cos with the embeddings)"
+            )
     if values is not None:
         n = max(0, min(values or DEFAULT_VALUES, MAX_VALUES))
         flat = view.reshape(-1).float()
@@ -71,7 +78,8 @@ def render_show(info: dict[str, Any]) -> str:
     if s.spectrum:
         lines.append("  σ: " + " ".join(f"{v:.3g}" for v in s.spectrum[:8]))
     if info.get("vocab"):
-        lines.append("  tokens: " + ", ".join(f"{t} {v:.2f}" for t, v in info["vocab"][:8]))
+        label = info.get("vocab_label", "tokens")
+        lines.append(f"  {label}: " + ", ".join(f"{t} {v:.2f}" for t, v in info["vocab"][:8]))
     if "values" in info:
         lines.append(
             f"  values ({len(info['values'])} of {info['values_total']}): {info['values']}"
@@ -87,7 +95,7 @@ def _vocab_of_vector(
     final_scale: torch.Tensor | None,
     k: int = 8,
 ) -> list[tuple[int, float]]:
-    writes = kind in ("writer", "embed", "pos_embed", "stem", "expert")
+    writes = kind in ("writer", "stem", "expert")  # embeddings: compared with the embedding table
     name = ir.semantics.unembed if writes else ir.semantics.embed
     if name is None:
         return []

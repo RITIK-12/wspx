@@ -157,8 +157,8 @@ class VcsArgs(_Args):
     b: str | None = None
     name: str | None = Field(
         None,
-        description="branch: the new branch, created at HEAD and checked out (branches are "
-        "shared by every session on this model); merge: the branch to merge.",
+        description="branch: the new branch, created at HEAD and checked out (branch names are "
+        "shared by every session in the deployment); merge: the branch to merge.",
     )
     address: str | None = Field(None, description="For blame.")
     suite: str | None = Field(None, description="For bisect.")

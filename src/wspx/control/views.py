@@ -90,6 +90,8 @@ def commits(
         for commit in repo.walk(start):
             if commit.oid in seen or len(seen) >= limit:
                 continue
+            if fingerprint and commit.base != fingerprint:
+                break  # another model's history: refs are shared across the store
             patches = []
             for pid in commit.patches:
                 try:

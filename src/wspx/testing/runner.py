@@ -185,11 +185,15 @@ def paired(
     pairs = [(c, ref[c["item"]]) for c in current.checks if c["item"] in ref]
     if not pairs:
         raise WspxError("no common items to pair; are these the same suite and seed?")
-    deltas = [
-        float(a["score"]) - float(b["score"])
-        for a, b in pairs
-        if not (math.isnan(a["score"]) or math.isnan(b["score"]))
-    ]
+    if len({c["kind"] for c in current.checks}) > 1:
+        # items scored different ways (a perplexity next to pass/fail) only compare as passes
+        deltas = [float(a["passed"]) - float(b["passed"]) for a, b in pairs]
+    else:
+        deltas = [
+            float(a["score"]) - float(b["score"])
+            for a, b in pairs
+            if not (math.isnan(a["score"]) or math.isnan(b["score"]))
+        ]
     up = sum(1 for a, b in pairs if a["passed"] and not b["passed"])
     down = sum(1 for a, b in pairs if b["passed"] and not a["passed"])
     if not deltas:
@@ -234,9 +238,10 @@ def summary(
     if vs is not None:
         p = paired(result, vs)
         label = vs_label or vs.tree[:9]
+        what = "pass rate" if len(kinds) > 1 else "score"
         lines.append(
             f"  vs {label}: Δ {p.mean_delta:+.3f} [95% CI {p.ci_low:+.3f}, {p.ci_high:+.3f}] "
-            f"(score here minus at {label}"
+            f"({what} here minus at {label}"
             + (", where a higher KL is worse" if kinds == {"kl"} else "")
             + f") · {p.flips_up} fixed, {p.flips_down} broken (n={p.n})"
         )

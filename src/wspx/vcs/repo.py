@@ -224,15 +224,27 @@ class Repo:
         return value or None
 
     def branches(self) -> dict[str, str]:
-        return {k.removeprefix(HEADS): v for k, v in self.store.refs.list(HEADS).items() if v}
+        """Branches on this model. Refs are shared by every model in the store, so others' are
+        left out (a commit records the model it was made on)."""
+        out = {}
+        for ref, oid in self.store.refs.list(HEADS).items():
+            if not oid:
+                continue
+            try:
+                if self.base and self.get_commit(oid).base != self.base:
+                    continue
+            except StoreError:
+                continue
+            out[ref.removeprefix(HEADS)] = oid
+        return out
 
     def create_branch(self, name: str, at: str | None) -> str:
         self._check_branch(name)
         oid = self.resolve(at) if at else None
         if self.store.refs.exists(HEADS + name):
             raise VCSError(
-                f"branch {name!r} already exists (branches are shared by every session on this "
-                "model); pick another name, or check it out"
+                f"branch {name!r} already exists (branch names are shared by every session in "
+                "this deployment, whatever the model); pick another name"
             )
         self.store.refs.update(HEADS + name, oid or "", expected=None)
         return oid or ""

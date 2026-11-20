@@ -162,6 +162,12 @@ class Lab:
             self.staged = [self.repo.get_patch(p) for p in state.get("staged", [])]
             self.heldout_queries = int(state.get("heldout_queries", 0))
         head = self.repo.head(self.session)
+        if head and self.repo.get_commit(head).base != self.repo.base:
+            branch_name = self.repo.current_branch(self.session) or head[:12]
+            raise VCSError(
+                f"{branch_name} holds another model's commits (branch names are shared by every "
+                "model in this store); open this session on another branch"
+            )
         tree = TreeState.from_dict(self.repo.tree_of_oid(head))
         for record in self.staged:
             deltas = [self._load_delta(d["blob"]) for d in record.deltas]
@@ -362,7 +368,7 @@ class Lab:
             name=name,
             description=(
                 f"{result.candidates} {result.axis}s ranked by {result.expression}"
-                if fires_on is not None
+                if len(result.hits) == result.candidates
                 else f"{len(result.hits)} of {result.candidates} {result.axis}s matching "
                 f"{result.expression}"
             ),
@@ -687,8 +693,13 @@ class Lab:
             reference = reference.with_deltas(
                 [self._load_delta(d["blob"]) for d in r.deltas], r.precision
             )
-        with self.at_state(reference):
-            report.extend(numeric_check(self.ir, self.tree, plan, self.config.check))
+        groups: dict[str, list[TensorDelta]] = {}
+        for r in records:
+            groups.setdefault(r.precision, []).extend(self._load_delta(d["blob"]) for d in r.deltas)
+        with self.at_state(reference):  # each precision on its own terms (adapters never round)
+            for precision, group in groups.items():
+                part = EditPlan(group, op=plan.op, precision=precision, scope=plan.scope)
+                report.extend(numeric_check(self.ir, self.tree, part, self.config.check))
         if level == "smoke" and self.ir.is_lm:
             report.extend(smoke_report(self._smoke(), self.config.check))
         return report
@@ -723,10 +734,20 @@ class Lab:
         kl = token_kl(self._base_canary["logits"].to(logits.device), logits, mask)
         reasons: list[str] = []
         if self.text.tokenizer is not None:
-            outs = analysis.generate(self.model, self.text, CANARY_PROMPTS[:4], max_tokens=16)
-            for out in outs:
+            prompts, eos = CANARY_PROMPTS[:4], self.text.eos_id
+            if "degenerate" not in self._base_canary:
+                # a reasoning model can end a bare prompt at once: that is the base, not a fault
+                with torch.no_grad(), self.at_base():
+                    base = analysis.generate(self.model, self.text, prompts, max_tokens=16)
+                self._base_canary["degenerate"] = [
+                    set(degenerate_reasons(o, eos=eos)) for o in base
+                ]
+            outs = analysis.generate(self.model, self.text, prompts, max_tokens=16)
+            for out, before in zip(outs, self._base_canary["degenerate"], strict=True):
                 reasons.extend(
-                    r for r in degenerate_reasons(out, eos=self.text.eos_id) if r not in reasons
+                    r
+                    for r in degenerate_reasons(out, eos=eos)
+                    if r not in before and r not in reasons
                 )
         return SmokeMetrics(kl, self._base_canary["ppl"], perplexity(logits, ids, mask), reasons)
 
