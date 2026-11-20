@@ -61,7 +61,8 @@ def build_ir(
 
     with torch.no_grad():
         if is_lm:
-            vocab = int(getattr(model, "config").vocab_size)  # noqa: B009
+            vocab = _vocab_size(model)
+            assert vocab is not None
             ids = torch.randint(0, vocab, (BATCH, PREFILL_TOKENS), generator=gen).to(device)
             mask = torch.ones(BATCH, PREFILL_TOKENS, dtype=torch.long, device=device)
             mask[1, :LEFT_PAD] = 0
@@ -156,7 +157,7 @@ def build_ir(
         coverage=coverage,
         modules={path: type(m).__name__ for path, m in model.named_modules()},
         is_lm=is_lm,
-        vocab_size=int(config.vocab_size) if is_lm and config is not None else None,
+        vocab_size=_vocab_size(model) if is_lm else None,
         labels=labels,
         capture={"method": "tape", "passes": passes, "batch": BATCH, "tokens": PREFILL_TOKENS},
     )
@@ -255,8 +256,18 @@ def _is_causal_lm(model: torch.nn.Module) -> bool:
         isinstance(model, GenerationMixin)
         and config is not None
         and not getattr(config, "is_encoder_decoder", False)
-        and getattr(config, "vocab_size", None) is not None
+        and _vocab_size(model) is not None
     )
+
+
+def _vocab_size(model: torch.nn.Module) -> int | None:
+    """The vocabulary size; multimodal configs keep it in their text config."""
+    config = getattr(model, "config", None)
+    if config is None:
+        return None
+    text = config.get_text_config() if hasattr(config, "get_text_config") else config
+    size = getattr(text, "vocab_size", None) or getattr(config, "vocab_size", None)
+    return int(size) if size else None
 
 
 def _default_inputs(model: torch.nn.Module, gen: torch.Generator, device: torch.device) -> Any:

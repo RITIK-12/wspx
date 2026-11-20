@@ -87,19 +87,15 @@ def load_hf(
     device: str | None = None,
     local_only: bool = False,
 ) -> Loaded:
-    """Load a causal LM (or any AutoModel) and fingerprint it."""
-    from transformers import AutoConfig, AutoModel, AutoModelForCausalLM, AutoTokenizer
+    """Load a causal LM, a vision-language model or any AutoModel, and fingerprint it."""
+    from transformers import AutoConfig, AutoTokenizer
 
     path = resolve_source(source, revision=revision, local_only=local_only)
     config = AutoConfig.from_pretrained(str(path), trust_remote_code=trust_remote_code)
     torch_dtype = DTYPES.get(dtype, "auto")
-    is_lm = bool(getattr(config, "architectures", None)) and any(
-        a.endswith(("ForCausalLM", "LMHeadModel", "ForConditionalGeneration"))
-        for a in config.architectures or []
-    )
-    auto = AutoModelForCausalLM if is_lm else AutoModel
+    auto = _auto_class(config)
     with torch.device("meta"):
-        skeleton = auto.from_config(config, trust_remote_code=trust_remote_code)  # type: ignore[no-untyped-call]
+        skeleton = auto.from_config(config, trust_remote_code=trust_remote_code)
     expected = {n for n, _ in skeleton.named_parameters()}
     try:
         loaded: Any = auto.from_pretrained(
@@ -127,6 +123,31 @@ def load_hf(
         tokenizer = None
     readable = _verbatim_tensors(path, model)
     return Loaded(model, tokenizer, fingerprint(path, source, revision), source, path, readable)
+
+
+def _auto_class(config: Any) -> Any:
+    """The Auto class that matches the checkpoint's own architecture, weights and all.
+
+    Vision-language checkpoints (Qwen3-VL, GLM-4.1V, Qwen3.5, Gemma 3) load as
+    image-text-to-text models: a text-only class would reject their vision weights,
+    and several have no causal-LM class at all.
+    """
+    from transformers import AutoModel, AutoModelForCausalLM, AutoModelForImageTextToText
+    from transformers.models.auto.modeling_auto import (
+        MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES,
+    )
+
+    archs = list(getattr(config, "architectures", None) or [])
+    kind = getattr(config, "model_type", "")
+    remote = set(getattr(config, "auto_map", None) or {})
+    if any(a.endswith("ForConditionalGeneration") for a in archs) and (
+        kind in MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES
+        or "AutoModelForImageTextToText" in remote
+    ):
+        return AutoModelForImageTextToText
+    if any(a.endswith(("ForCausalLM", "LMHeadModel", "ForConditionalGeneration")) for a in archs):
+        return AutoModelForCausalLM
+    return AutoModel
 
 
 def load_module(spec: str, weights: str | None = None, **kwargs: Any) -> Loaded:

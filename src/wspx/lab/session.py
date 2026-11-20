@@ -1486,6 +1486,12 @@ class GrepHits:
                 else ""
             )
         tail = f"{head} · {r.seconds * 1000:.0f} ms · saved as {self.handle}"
+        if r.skipped:
+            tail += (
+                f"\nskipped {len(r.skipped)} tensor(s) with no {r.axis} units: "
+                + ", ".join(r.skipped[:4])
+                + (" …" if len(r.skipped) > 4 else "")
+            )
         return "\n".join([*lines, tail])
 
     def __str__(self) -> str:

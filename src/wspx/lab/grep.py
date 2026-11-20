@@ -674,6 +674,8 @@ class GrepResult:
     scores: list[Hit]
     """Every candidate unit with its ranking score, best first."""
     seconds: float = 0.0
+    skipped: list[str] = field(default_factory=list)
+    """Tensors in the scope that could not be split into units (convolutions, vectors)."""
 
 
 def grep(
@@ -689,8 +691,19 @@ def grep(
     tree = parse(expression)
     key = ranking_key(tree)
     boolean = _is_boolean(tree)
+    if axis is None:  # colnorm and rownorm name their axis; readers default to rows otherwise
+        names = set(re.findall(r"[a-z]+", expression))
+        axis = "col" if "colnorm" in names else "row" if "rownorm" in names else None
     started = time.perf_counter()
-    batches = list(unit_batches(env.ir, env.params, targets, axis))
+    batches: list[UnitBatch] = []
+    skipped: list[str] = []
+    for target in targets:
+        try:
+            batches.extend(unit_batches(env.ir, env.params, [target], axis))
+        except GrepError:
+            if len(targets) == 1:
+                raise
+            skipped.append(target.address)  # a wide scope skips what has no units (3-D, 1-D)
     if not batches:
         raise GrepError("scope contains no weights")
 
@@ -742,6 +755,7 @@ def grep(
         hits,
         scores,
         time.perf_counter() - started,
+        skipped,
     )
 
 
