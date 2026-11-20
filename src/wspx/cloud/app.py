@@ -12,6 +12,7 @@ labs               GPU sandboxes created by the control plane at runtime
 
 from __future__ import annotations
 
+import base64
 import importlib.metadata
 import json
 import os
@@ -54,6 +55,12 @@ _SOURCE_IGNORE = ["**/__pycache__/**", "**/*.pyc"]
 _EXTRA_MARKER = re.compile(r"""\bextra\s*==\s*["']([^"']+)["']""")
 
 
+def _pack_requires(requires: list[str]) -> str:
+    """Requirements as an image environment value: base64, because Dockerfile ``ENV``
+    parsing breaks on the quotes inside markers like ``extra == 'lab'``."""
+    return base64.b64encode(json.dumps(requires).encode()).decode()
+
+
 def _source_requires() -> list[str] | None:
     """wspx's requirements when it runs from a source checkout; None for a PyPI install.
 
@@ -64,7 +71,7 @@ def _source_requires() -> list[str] | None:
     """
     if not modal.is_local():
         raw = os.environ.get(_DEV_REQUIRES)
-        return json.loads(raw) if raw else None
+        return json.loads(base64.b64decode(raw)) if raw else None
     dist = importlib.metadata.distribution("wspx")
     direct = dist.read_text("direct_url.json") or ""
     if os.environ.get("WSPX_DEV_SOURCE") or '"editable": true' in direct or "file://" in direct:
@@ -103,7 +110,7 @@ def _image(extra: str) -> modal.Image:
     image = image.uv_pip_install(*deps) if deps else image
     if source is None:
         return image.uv_pip_install(f"wspx=={__version__}", extra_options="--no-deps")
-    image = image.env({_DEV_REQUIRES: json.dumps(source)})
+    image = image.env({_DEV_REQUIRES: _pack_requires(source)})
     return image.add_local_python_source("wspx", copy=True, ignore=_SOURCE_IGNORE)
 
 

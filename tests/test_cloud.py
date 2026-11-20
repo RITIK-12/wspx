@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json
+import re
 from pathlib import Path
 
 import modal
@@ -58,7 +58,9 @@ def test_container_rebuilds_images_without_metadata(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(modal, "is_local", lambda: False)
     monkeypatch.setattr(cloud.importlib.metadata, "distribution", no_metadata)
-    monkeypatch.setenv(cloud._DEV_REQUIRES, json.dumps(requires))
+    packed = cloud._pack_requires(requires)
+    assert re.fullmatch(r"[A-Za-z0-9+/=]+", packed)  # nothing for Dockerfile ENV to misparse
+    monkeypatch.setenv(cloud._DEV_REQUIRES, packed)
     assert cloud._source_requires() == requires
     cloud._image("lab")
 
