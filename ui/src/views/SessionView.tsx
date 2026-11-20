@@ -79,8 +79,6 @@ function Event({ event }: { event: TimelineEvent }) {
             <summary>reasoning</summary>
             <pre className="reasoning">{p.reasoning}</pre>
           </details>
-        ) : p.reasoning_available === false ? (
-          <div className="muted small">reasoning not returned by this provider</div>
         ) : null}
         {p.text && <div className="text">{p.text}</div>}
         {(p.tool_calls ?? []).map((c: any) => (

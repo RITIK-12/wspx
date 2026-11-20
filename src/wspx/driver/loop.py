@@ -135,6 +135,13 @@ class Runner:
                 self.hooks.event(
                     {"type": "error", "turn": self.turns, "error": f"{type(exc).__name__}: {exc}"}
                 )
+                if "wspx_limit" in str(exc):
+                    refusal = _limit_message(str(exc))
+                    return self._end(
+                        "paused",
+                        f"a limit you set was reached ({refusal}); raise it with "
+                        "`wspx limits set`, then `wspx resume`",
+                    )
                 return self._end("error", f"{type(exc).__name__}: {exc}")
             self.turns += 1
             self.history.append(
@@ -272,3 +279,9 @@ class Runner:
             {"type": "end", "status": status, "reason": reason, "turns": self.turns, "text": text}
         )
         return RunResult(status, self.turns, reason, text, self.history)
+
+
+def _limit_message(text: str) -> str:
+    """The gateway's own words from a limit refusal (``'message': '...'``), else the text."""
+    match = re.search(r"'message': '([^']*)'", text) or re.search(r'"message": "([^"]*)"', text)
+    return match.group(1) if match else text[:300]

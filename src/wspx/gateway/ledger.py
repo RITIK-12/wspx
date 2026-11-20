@@ -169,7 +169,20 @@ class Ledger:
         ]
 
     def set_limit(self, limit: Limit) -> Limit:
+        """Add a limit, replacing any on the same thing (scope, metric, session, provider, window)."""
         with self.tx() as db:
+            db.execute(
+                "DELETE FROM limits WHERE scope = ? AND metric = ? AND session IS ? "
+                "AND provider IS ? AND window_s IS ? AND id != ?",
+                (
+                    limit.scope,
+                    limit.metric,
+                    limit.session,
+                    limit.provider,
+                    limit.window_s,
+                    limit.id,
+                ),
+            )
             db.execute(
                 "INSERT OR REPLACE INTO limits VALUES (?,?,?,?,?,?,?,?)",
                 (

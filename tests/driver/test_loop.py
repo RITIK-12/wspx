@@ -191,3 +191,22 @@ def test_end_to_end_with_a_real_lab(tmp_path: Path) -> None:
     assert result.status == "done"
     assert any("Apply one of the listed fixes" in n for n in provider.requests[4][-1].notes)
     assert "Scale unit 0" in lab.log().summary
+
+
+def test_a_limit_pauses_the_session_rather_than_failing_it() -> None:
+    """Seen live: a day's spend cap ended an 8B run as an error; it is resumable."""
+
+    class Capped(Scripted):
+        def step(self, *args: Any, **kw: Any) -> Turn:
+            raise RuntimeError(
+                "Error code: 429 - {'type': 'error', 'error': {'type': 'wspx_limit', "
+                "'message': 'dollars ≤ 5 per day: $3.2086 spent or held'}}"
+            )
+
+    h = hooks()
+    result = Runner(Capped([]), h, RunnerConfig("sys", "task")).run()
+    assert result.status == "paused"
+    assert "dollars ≤ 5 per day: $3.2086 spent or held" in result.reason
+    assert "wspx resume" in result.reason
+    start = h.events[0]  # type: ignore[attr-defined]
+    assert (start["type"], start["message"]) == ("start", "task")  # the trace starts at the start

@@ -445,3 +445,15 @@ def test_keys_are_checked_without_being_revealed(setup) -> None:  # type: ignore
 
     # outside Modal there is no container to recycle; the gateway says so
     assert admin(client, "POST", "recycle").json()["recycled"] is False
+
+
+def test_setting_a_limit_replaces_the_one_on_the_same_thing(tmp_path: Path) -> None:
+    """`wspx limits set day dollars 10` after 5 used to leave both, so 5 still applied."""
+    ledger = Ledger(tmp_path / "l.db")
+    ledger.set_limit(Limit(scope="day", metric="dollars", value=5.0))
+    ledger.set_limit(Limit(scope="session", metric="calls", value=400))
+    ledger.set_limit(Limit(scope="day", metric="dollars", value=10.0))
+    assert sorted((lim.scope, lim.metric, lim.value) for lim in ledger.limits()) == [
+        ("day", "dollars", 10.0),
+        ("session", "calls", 400.0),
+    ]
