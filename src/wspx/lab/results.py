@@ -7,6 +7,7 @@ as a few KB of JSON. Parquet never goes to the browser.
 
 from __future__ import annotations
 
+import io
 import math
 from collections import defaultdict
 from pathlib import Path
@@ -30,8 +31,8 @@ SCHEMA = pa.schema(
 )
 
 
-def save(result: GrepResult, path: Path, *, top: int | None = None) -> None:
-    """Write every scored unit; ``hit`` marks the matches that were returned (top-k)."""
+def to_bytes(result: GrepResult, *, top: int | None = None) -> bytes:
+    """Every scored unit as Parquet; ``hit`` marks the matches that were returned (top-k)."""
     returned = {
         (h.param, h.expert, h.unit)
         for h in result.hits[: top if top is not None else len(result.hits)]
@@ -49,12 +50,19 @@ def save(result: GrepResult, path: Path, *, top: int | None = None) -> None:
         },
         schema=SCHEMA,
     )
+    buf = io.BytesIO()
+    pq.write_table(table, buf, compression="zstd")
+    return buf.getvalue()
+
+
+def save(result: GrepResult, path: Path, *, top: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(table, path, compression="zstd")
+    path.write_bytes(to_bytes(result, top=top))
 
 
-def load_hits(path: Path, *, only_hits: bool = True) -> list[Hit]:
-    table = pq.read_table(path).to_pylist()
+def load_hits(source: Path | bytes, *, only_hits: bool = True) -> list[Hit]:
+    data = source if isinstance(source, bytes) else source.read_bytes()
+    table = pq.read_table(io.BytesIO(data)).to_pylist()
     return [
         Hit(
             r["address"],

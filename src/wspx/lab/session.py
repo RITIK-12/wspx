@@ -147,16 +147,18 @@ class Lab:
         return f"sessions/{self.session}/state.json"
 
     def _resume(self, branch: str | None) -> None:
-        path = self.store.path(self._state_path())
+        raw = self.store.read_file(self._state_path())
         if not self.store.refs.exists(self.repo.head_ref(self.session)):
             self.repo.init_session(self.session, branch or "main")
-        if path.exists():
-            state = json.loads(path.read_text())
+        if raw is not None:
+            state = json.loads(raw)
             self.handles = HandleTable.load(state.get("handles", []))
             for name, oid in state.get("directions", {}).items():
                 self.directions[name] = st_load(self.store.objects.get(oid))["v"]
             for key, rel in state.get("results", {}).items():
-                self.results[key] = results.load_hits(self.store.path(rel))
+                data = self.store.read_file(rel)
+                if data is not None:
+                    self.results[key] = results.load_hits(data)
             self.staged = [self.repo.get_patch(p) for p in state.get("staged", [])]
             self.heldout_queries = int(state.get("heldout_queries", 0))
         head = self.repo.head(self.session)
@@ -182,9 +184,7 @@ class Lab:
             "staged": [p.oid for p in self.staged],
             "heldout_queries": self.heldout_queries,
         }
-        path = self.store.path(self._state_path())
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(canonical_json(state))
+        self.store.write_file(self._state_path(), canonical_json(state))
 
     def _load_delta(self, oid: str) -> TensorDelta:
         return TensorDelta.from_bytes(self.store.objects.get(oid))
@@ -362,7 +362,7 @@ class Lab:
             call_id=self.context.get("call_id"),
         )
         rel = f"results/{self.session}/{entry.key[1:]}.parquet"
-        results.save(result, self.store.path(rel), top=top)
+        self.store.write_file(rel, results.to_bytes(result, top=top))
         self.results[entry.key] = result.hits[:top]
         self._save()
         return GrepHits(self, entry.display, result, top)
@@ -758,17 +758,17 @@ class Lab:
 
     def _run(self, suite: Suite, state: TreeState) -> runner.RunResult:
         key = self.tree_key(state)
-        path = self.store.path("runs", key, suite.name, f"{suite.hash}-{suite.seed}.json")
-        if path.exists():
-            cached = runner.RunResult.from_json(path.read_bytes())
+        rel = f"runs/{key}/{suite.name}/{suite.hash}-{suite.seed}.json"
+        raw = self.store.read_file(rel)
+        if raw is not None:
+            cached = runner.RunResult.from_json(raw)
             if self._data_unchanged(cached):
                 cached.cached = True
                 return cached
         with self.at_state(state):
             model = SuiteModel(self.model, self.ir, self.text, self.at_base)
             result = runner.run_suite(suite, model, key)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(result.to_json())
+        self.store.write_file(rel, result.to_json())
         return result
 
     def _data_unchanged(self, run: runner.RunResult) -> bool:
@@ -813,8 +813,8 @@ class Lab:
         state = self.tree.state
         hashes = {name: self.tree.hash(name) for name in sorted(state.tensors())}
         evals = [
-            f"run:{p.parent.name}@{self.tree_key()}"
-            for p in self.store.path("runs", self.tree_key()).glob("*/*")
+            f"run:{rel.split('/')[-2]}@{self.tree_key()}"
+            for rel in self.store.glob(f"runs/{self.tree_key()}", "*/*.json")
         ]
         author = {
             "session": self.session,
@@ -985,13 +985,12 @@ class Lab:
     def _behaviour_diff(self, sa: TreeState, sb: TreeState) -> list[str]:
         ka, kb = self.tree_key(sa), self.tree_key(sb)
         out = []
-        for run_b in self.store.path("runs", kb).glob("*/*.json"):
-            run_a = self.store.path("runs", ka, run_b.parent.name, run_b.name)
-            if run_a.exists():
-                ra, rb = (
-                    runner.RunResult.from_json(run_a.read_bytes()),
-                    runner.RunResult.from_json(run_b.read_bytes()),
-                )
+        for rel_b in self.store.glob(f"runs/{kb}", "*/*.json"):
+            suite_file = rel_b.split("/", 2)[2]
+            raw_a = self.store.read_file(f"runs/{ka}/{suite_file}")
+            raw_b = self.store.read_file(rel_b)
+            if raw_a is not None and raw_b is not None:
+                ra, rb = runner.RunResult.from_json(raw_a), runner.RunResult.from_json(raw_b)
                 p = runner.paired(rb, ra)
                 out.append(
                     f"  behaviour {rb.suite}: {ra.pass_rate:.1%} → {rb.pass_rate:.1%} "

@@ -99,20 +99,22 @@ def open_lab(
     )
 
 
+def _ir_path(fingerprint: str) -> str:
+    return f"models/{fingerprint.replace(':', '_')}/ir.json"
+
+
 def _cached_ir(store: Store, fingerprint: str | None) -> ModelIR | None:
     if fingerprint is None:
         return None
-    path = store.model_dir(fingerprint) / "ir.json"
-    if not path.exists():
+    raw = store.read_file(_ir_path(fingerprint))
+    if raw is None:
         return None
     import json
 
-    return ModelIR.from_dict(json.loads(path.read_text()))
+    return ModelIR.from_dict(json.loads(raw))
 
 
 def _save_ir(store: Store, ir: ModelIR) -> None:
     import json
 
-    directory = store.model_dir(ir.fingerprint)
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "ir.json").write_text(json.dumps(ir.to_dict()))
+    store.write_file(_ir_path(ir.fingerprint), json.dumps(ir.to_dict()).encode())
