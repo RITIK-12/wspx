@@ -417,9 +417,10 @@ def ls(
     session: Session = None,
     role: Annotated[str | None, typer.Option("--role")] = None,
     layers: Annotated[str | None, typer.Option("--layers")] = None,
+    limit: Annotated[int, typer.Option("--limit")] = 100,
 ) -> None:
     """List addresses matching a scope."""
-    _tool(session, "ls", {"scope": scope, "role": role, "layers": layers})
+    _tool(session, "ls", {"scope": scope, "role": role, "layers": layers, "limit": limit})
 
 
 @app.command()
@@ -464,12 +465,21 @@ def contrast(
     name: Annotated[str, typer.Option("--name")],
     session: Session = None,
     layer: Annotated[int | None, typer.Option("--layer")] = None,
+    position: Annotated[
+        str, typer.Option("--position", help="last token, or the mean over tokens")
+    ] = "last",
 ) -> None:
     """Build a direction from two prompt sets."""
     _tool(
         session,
         "contrast",
-        {"positive": positive, "negative": negative, "name": name, "layer": layer},
+        {
+            "positive": positive,
+            "negative": negative,
+            "name": name,
+            "layer": layer,
+            "position": position,
+        },
     )
 
 
@@ -479,12 +489,13 @@ def generate(
     session: Session = None,
     max_tokens: Annotated[int, typer.Option("--max-tokens")] = 64,
     temperature: Annotated[float, typer.Option("--temperature")] = 0.0,
+    seed: Annotated[int, typer.Option("--seed")] = 0,
 ) -> None:
     """Sample from the current working tree."""
     _tool(
         session,
         "generate",
-        {"prompt": prompt, "max_tokens": max_tokens, "temperature": temperature},
+        {"prompt": prompt, "max_tokens": max_tokens, "temperature": temperature, "seed": seed},
     )
 
 
@@ -495,9 +506,16 @@ def trace(
     vs: Annotated[str | None, typer.Option("--vs")] = None,
     reference: Annotated[str | None, typer.Option("--reference")] = None,
     target: Annotated[str | None, typer.Option("--target")] = None,
+    top: Annotated[
+        int, typer.Option("--top", help="Tokens per block in the logit lens, and units listed.")
+    ] = 5,
 ) -> None:
     """Forward, diff (--vs) or attribution (--reference) trace."""
-    _tool(session, "trace", {"prompt": prompt, "vs": vs, "reference": reference, "target": target})
+    _tool(
+        session,
+        "trace",
+        {"prompt": prompt, "vs": vs, "reference": reference, "target": target, "top": top},
+    )
 
 
 @app.command()
@@ -602,9 +620,17 @@ def export(
     kind: Annotated[str, typer.Argument(help="merged, peft, gguf or bundle")],
     path: Annotated[str, typer.Argument()],
     session: Session = None,
+    base_model: Annotated[
+        str | None, typer.Option("--base-model", help="peft: the base model id to record.")
+    ] = None,
+    max_rank: Annotated[int, typer.Option("--max-rank", help="peft: the highest LoRA rank.")] = 64,
 ) -> None:
     """Export the working tree."""
-    _tool(session, "export", {"kind": kind, "path": path})
+    _tool(
+        session,
+        "export",
+        {"kind": kind, "path": path, "base_model": base_model, "max_rank": max_rank},
+    )
 
 
 @app.command()

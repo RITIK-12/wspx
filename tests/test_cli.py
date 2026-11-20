@@ -188,8 +188,17 @@ def test_a_stopped_deployment_is_a_clear_error() -> None:
         control.sessions()
 
 
-def test_every_tool_is_a_command() -> None:
+def test_every_tool_is_a_command_with_every_argument() -> None:
+    import inspect
+
     from wspx.tools import TOOLS
 
-    commands = {c.name or c.callback.__name__ for c in main.app.registered_commands}  # type: ignore[union-attr]
-    assert set(TOOLS) <= commands
+    commands = {c.name or c.callback.__name__: c.callback for c in main.app.registered_commands}  # type: ignore[union-attr]
+    assert set(TOOLS) <= set(commands)
+    # vcs maps its arguments onto positionals and options per action; grep spells `in` --in
+    mapped = {"vcs": set(), "grep": {"in"}}
+    for name, spec in TOOLS.items():
+        fields = {f.alias or k for k, f in spec.args.model_fields.items()}
+        params = set(inspect.signature(commands[name]).parameters)
+        missing = fields - params - mapped.get(name, set())
+        assert name == "vcs" or not missing, f"wspx {name} cannot pass {sorted(missing)}"
