@@ -90,16 +90,20 @@ def _deps_for(requires: list[str], extra: str) -> list[str]:
 def _image(extra: str) -> modal.Image:
     """The same wspx version as the CLI, with the extras that role runs.
 
-    A wspx installed from a source checkout (development) is copied in,
-    with its data files (the UI bundle, the skill), instead of fetched from PyPI.
+    Dependencies get a layer of their own, below wspx itself, so a new wspx
+    release reuses the cached dependency layer (torch alone is gigabytes)
+    unless its requirements changed. A wspx installed from a source checkout
+    (development) is copied in, with its data files (the UI bundle, the
+    skill), instead of fetched from PyPI.
     """
-    base = modal.Image.debian_slim(python_version="3.12")
-    requires = _source_requires()
-    if requires is None:
-        return base.uv_pip_install(f"wspx[{extra}]=={__version__}")
+    source = _source_requires()
+    requires = source if source is not None else importlib.metadata.requires("wspx") or []
     deps = _deps_for(requires, extra)
-    image = base.env({_DEV_REQUIRES: json.dumps(requires)})
+    image = modal.Image.debian_slim(python_version="3.12")
     image = image.uv_pip_install(*deps) if deps else image
+    if source is None:
+        return image.uv_pip_install(f"wspx=={__version__}", extra_options="--no-deps")
+    image = image.env({_DEV_REQUIRES: json.dumps(source)})
     return image.add_local_python_source("wspx", copy=True, ignore=_SOURCE_IGNORE)
 
 

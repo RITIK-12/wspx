@@ -66,6 +66,41 @@ def test_container_rebuilds_images_without_metadata(monkeypatch: pytest.MonkeyPa
     assert cloud._source_requires() is None  # a PyPI install: images pin wspx by version
 
 
+class _Recorder:
+    """Stands in for modal.Image and records the layers built on it."""
+
+    def __init__(self, layers: tuple[tuple[object, ...], ...] = ()) -> None:
+        self.layers = layers
+
+    def uv_pip_install(self, *packages: str, extra_options: str = "") -> _Recorder:
+        return _Recorder((*self.layers, ("pip", packages, extra_options)))
+
+    def env(self, values: dict[str, str]) -> _Recorder:
+        return _Recorder((*self.layers, ("env", tuple(values))))
+
+    def add_local_python_source(self, *modules: str, **_kw: object) -> _Recorder:
+        return _Recorder((*self.layers, ("source", modules)))
+
+
+def test_release_images_keep_dependencies_in_their_own_layer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A new wspx release reuses the cached dependency layer: only wspx itself is reinstalled."""
+    requires = ["httpx>=0.28", "torch>=2.15; extra == 'lab'", "fastapi>=0.165; extra == 'control'"]
+    monkeypatch.setattr(cloud, "_source_requires", lambda: None)
+    monkeypatch.setattr(cloud.importlib.metadata, "requires", lambda _name: requires)
+    monkeypatch.setattr(cloud.modal.Image, "debian_slim", lambda **_kw: _Recorder())
+
+    monkeypatch.setattr(cloud, "__version__", "1.0.0")
+    first = cloud._image("lab").layers  # type: ignore[attr-defined]
+    monkeypatch.setattr(cloud, "__version__", "1.0.1")
+    second = cloud._image("lab").layers  # type: ignore[attr-defined]
+
+    assert first[0] == second[0] == ("pip", ("httpx>=0.28", "torch>=2.15"), "")
+    assert second[1] == ("pip", ("wspx==1.0.1",), "--no-deps")
+    assert len(second) == 2
+
+
 def test_set_key_uses_the_api_not_argv(monkeypatch: pytest.MonkeyPatch) -> None:
     from wspx.cloud import deploy
 
