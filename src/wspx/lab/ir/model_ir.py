@@ -90,7 +90,8 @@ class Target:
 
 
 TokenLookup = Callable[[str], int]
-HandleLookup = Callable[[Handle], list[int]]
+HandleLookup = Callable[[Handle, str], list[int]]
+"""(handle, parameter) → unit indices along the tensor dim being narrowed."""
 
 
 class ModelIR:
@@ -312,7 +313,7 @@ class ModelIR:
             dim = free[positional]
             positional += 1
             index[dim] = self._narrow_item(
-                index[dim], item, info.shape[dim], addr, token_id, handle_indices
+                index[dim], item, info.shape[dim], addr, token_id, handle_indices, target.param
             )
         return Target(target.param, tuple(index), str(addr), target.role)
 
@@ -324,6 +325,7 @@ class ModelIR:
         addr: Address,
         token_id: TokenLookup | None,
         handle_indices: HandleLookup | None,
+        param: str = "",
     ) -> Selector:
         if isinstance(item, Token):
             if token_id is None:
@@ -334,14 +336,13 @@ class ModelIR:
         if isinstance(item, HandleRef):
             if handle_indices is None:
                 raise AddressError(f"{addr}: handle selectors need a session")
-            picks = handle_indices(item.handle)
-            base = list(range(size)) if isinstance(current, slice) else _as_list(current, size)
-            try:
-                return [base[i] for i in picks]
-            except IndexError:
+            allowed = set(_as_list(current, size))
+            picks = [i for i in handle_indices(item.handle, param) if i in allowed]
+            if not picks:
                 raise AddressError(
-                    f"{addr}: {item.handle} has indices outside 0-{len(base) - 1}"
-                ) from None
+                    f"{addr}: {item.handle} has no units in this selection of {param}"
+                )
+            return picks
         assert isinstance(item, Index | Range)
         return _narrow(current, item, size, addr)
 
