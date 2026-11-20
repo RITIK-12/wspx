@@ -349,3 +349,38 @@ def test_a_stored_prompt_takes_a_reply(lab: Any) -> None:
     assert lab.text.decode(replied.ids[0].tolist()).endswith("Answer: ")
     out = call(lab, "trace", {"prompt": started})
     assert out.ok, out.summary
+
+
+def test_info_counts_the_vision_tower_on_image_prompts(lab: Any) -> None:
+    """Seen live: info told the driver the whole vision tower was unexercised, with no role."""
+    assert not lab.ir.unexercised
+    vision = lab.ir.vision_only
+    assert vision
+    assert all(name.startswith("model.visual.") for name in vision)
+    info = call(lab, "info", {}).summary
+    assert "UNEXERCISED" not in info
+    assert "phases prefill, decode, vision" in info
+    assert f"vision tower: {len(vision)} tensors under model.visual.*" in info
+    assert "model.visual" not in info.split("vision tower:")[0]  # not listed as roleless
+    hits = call(
+        lab, "grep", {"expression": "rownorm", "in": "model.visual.blocks.*.mlp.linear_fc2.weight"}
+    )
+    assert hits.ok, hits.summary
+
+
+def test_an_ir_from_an_older_capture_is_rebuilt(tmp_path: Path) -> None:
+    import json
+
+    from wspx.lab.ir.model_ir import IR_VERSION
+    from wspx.lab.sdk import _cached_ir, _ir_path
+    from wspx.store import Store
+
+    model, processor = tiny_vlm()
+    lab = open_lab(model, store=tmp_path / "s", workdir=tmp_path, processor=processor)
+    store = Store(tmp_path / "s")
+    fp = lab.ir.fingerprint
+    assert _cached_ir(store, fp) is not None
+    old = json.loads(store.read_file(_ir_path(fp)) or b"{}")
+    assert old["version"] == IR_VERSION
+    store.write_file(_ir_path(fp), json.dumps({**old, "version": 1}).encode())
+    assert _cached_ir(store, fp) is None

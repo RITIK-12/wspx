@@ -3,8 +3,10 @@
 Language models get a prefill pass (batch 2, 16 tokens, one row left-padded)
 and a decode step against the KV cache, so ops that differ between the two
 phases are both recorded. MoE routers are forced to round-robin assignments,
-with extra passes until every expert row has been read. Any parameter that
-never appears in a graph is reported as unexercised and gets no guessed role.
+with extra passes until every expert row has been read. A vision-language
+model also gets one pass on an image prompt (``vision_inputs``), so its vision
+tower counts as exercised; that graph is used for coverage only. Any parameter
+that never appears in a graph is reported as unexercised and gets no guessed role.
 """
 
 from __future__ import annotations
@@ -37,11 +39,14 @@ def build_ir(
     force_routing: bool = True,
     seed: int = 0,
     hash_params: bool = True,
+    vision_inputs: Mapping[str, Any] | None = None,
 ) -> ModelIR:
     """Capture ``model`` and derive its IR.
 
     ``example_inputs`` (a tuple of positional args or a dict of keyword args) is
     required for models that are neither causal LMs nor Hugging Face vision models.
+    ``vision_inputs`` are a vision-language model's processed image prompt (see
+    ``media.probe_inputs``).
     """
     model.eval()
     params, canonical = _param_table(model)
@@ -50,6 +55,7 @@ def build_ir(
     graphs: dict[str, OpGraph] = {}
     rows: dict[str, set[int]] = {}
     full: set[str] = set()
+    vision_read: set[str] = set()
     passes = 0
     gen = torch.Generator().manual_seed(seed)
     device = _device_of(model)
@@ -106,6 +112,14 @@ def build_ir(
             absorb(tape)
             tape.release()
             passes += 1
+        if vision_inputs is not None:
+            tape = Tape(model, "vision", force_routing=False, track_features=False)
+            with tape.recording():
+                model(**vision_inputs, use_cache=False)
+            vision_read = set(tape.graph.params_read())
+            absorb(tape)
+            tape.release()
+            passes += 1
 
     main = graphs.get("prefill") or graphs["forward"]
     shapes = {name: info.shape for name, info in params.items()}
@@ -115,6 +129,8 @@ def build_ir(
     coverage: dict[str, Coverage] = {}
     for name, info in params.items():
         phases = [phase for phase, g in graphs.items() if name in g.params_read()]
+        if name in vision_read:
+            phases.append("vision")
         read = bool(phases) or name in full or name in rows
         cov = Coverage(exercised=read, phases=phases)
         if name in rows and name not in full and info.shape:

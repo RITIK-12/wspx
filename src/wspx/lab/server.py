@@ -239,6 +239,7 @@ def main(argv: list[str] | None = None) -> None:
     from wspx.config import WspxConfig
     from wspx.lab.ir.capture import build_ir
     from wspx.lab.loader import load_hf
+    from wspx.lab.media import probe_inputs
     from wspx.lab.sdk import _cached_ir, _save_ir
     from wspx.project import extract
 
@@ -251,7 +252,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     ir = _cached_ir(store, loaded.fingerprint)
     if ir is None:
-        ir = build_ir(loaded.model, fingerprint=loaded.fingerprint, hash_params=False)
+        ir = build_ir(
+            loaded.model,
+            fingerprint=loaded.fingerprint,
+            hash_params=False,
+            vision_inputs=probe_inputs(loaded.processor, next(loaded.model.parameters()).device),
+        )
         _save_ir(store, ir)
     lab = Lab(
         loaded.model,

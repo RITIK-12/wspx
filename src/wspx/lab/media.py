@@ -290,3 +290,31 @@ def _decode(path: Path) -> tuple[Any, float | None]:
     if not frames:
         raise WspxError(f"{path.name}: no video frames")
     return np.stack(frames), rate
+
+
+PROBE_SIDE = 64
+
+
+def probe_inputs(processor: Any, device: torch.device | str) -> dict[str, Any] | None:
+    """A one-image prompt to capture a vision-language model's vision tower with.
+
+    ``None`` when there is no image processor or it cannot render one: the capture
+    then runs on text alone, as for a language model.
+    """
+    if processor is None or getattr(processor, "image_processor", None) is None:
+        return None
+    try:
+        from PIL import Image
+
+        image = Image.new("RGB", (PROBE_SIDE, PROBE_SIDE), (127, 127, 127))
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "image"}, {"type": "text", "text": "What is shown?"}],
+            }
+        ]
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        out = processor(text=[text], images=[image], return_tensors="pt")
+    except Exception:  # an unusual processor: capture still works, text only
+        return None
+    return {k: v.to(device) for k, v in out.items() if isinstance(v, torch.Tensor)}

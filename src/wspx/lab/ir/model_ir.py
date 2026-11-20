@@ -94,6 +94,10 @@ HandleLookup = Callable[[Handle, str], list[int]]
 """(handle, parameter) → unit indices along the tensor dim being narrowed."""
 
 
+IR_VERSION = 2
+"""Bumped when capture changes what an IR records; older cached IRs are rebuilt."""
+
+
 class ModelIR:
     def __init__(
         self,
@@ -151,6 +155,11 @@ class ModelIR:
     @property
     def unexercised(self) -> list[str]:
         return sorted(name for name, cov in self.coverage.items() if not cov.exercised)
+
+    @property
+    def vision_only(self) -> list[str]:
+        """Tensors read only on an image prompt: a vision-language model's vision tower."""
+        return sorted(name for name, cov in self.coverage.items() if cov.phases == ["vision"])
 
     def is_tied(self, param: str) -> bool:
         kinds = {r.kind for r in self.roles_of(param)}
@@ -396,7 +405,9 @@ class ModelIR:
             "unassigned": self.semantics.unassigned,
             "is_lm": self.is_lm,
             "vocab_size": self.vocab_size,
-            "phases": list(self.graphs),
+            "phases": list(self.graphs)
+            + (["vision"] if any("vision" in c.phases for c in self.coverage.values()) else []),
+            "vision_only": self.vision_only,
         }
 
     def render_info(self) -> str:
@@ -419,8 +430,16 @@ class ModelIR:
             lines.append(
                 f"UNEXERCISED ({len(s['unexercised'])}): {', '.join(s['unexercised'][:8])}"
             )
-        if s["unassigned"]:
-            lines.append(f"no role ({len(s['unassigned'])}): {', '.join(s['unassigned'][:8])}")
+        vision = set(s["vision_only"])
+        if vision:
+            lines.append(
+                f"vision tower: {len(vision)} tensors under {_common_prefix(sorted(vision))}*, "
+                "read on image prompts only. They sit before the language model's residual "
+                "stream, so they have no roles there; edit or grep them by raw parameter name"
+            )
+        unassigned = [n for n in s["unassigned"] if n not in vision]
+        if unassigned:
+            lines.append(f"no role ({len(unassigned)}): {', '.join(unassigned[:8])}")
         example = next((r.address for r in self.roles if r.kind == "writer"), None)
         if example:
             lines.append(f"addresses look like {example} · raw parameter names always work")
@@ -430,7 +449,7 @@ class ModelIR:
 
     def to_dict(self, *, with_graphs: bool = True) -> dict[str, Any]:
         return {
-            "version": 1,
+            "version": IR_VERSION,
             "fingerprint": self.fingerprint,
             "arch": self.arch,
             "params": {k: asdict(v) for k, v in self.params.items()},
@@ -520,3 +539,14 @@ def _human(n: int) -> str:
         if n >= size:
             return f"{n / size:.1f}{unit}"
     return str(n)
+
+
+def _common_prefix(names: list[str]) -> str:
+    """The dotted path every name shares, e.g. ``model.visual.``."""
+    parts = [n.split(".") for n in names]
+    shared: list[str] = []
+    for column in zip(*parts, strict=False):
+        if len(set(column)) != 1:
+            break
+        shared.append(column[0])
+    return ".".join(shared) + "." if shared else ""

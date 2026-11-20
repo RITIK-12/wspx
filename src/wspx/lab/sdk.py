@@ -20,6 +20,7 @@ from wspx.config import WspxConfig
 from wspx.errors import WspxError
 from wspx.lab.ir.capture import build_ir
 from wspx.lab.ir.model_ir import ModelIR
+from wspx.lab.media import probe_inputs
 from wspx.lab.session import Lab
 from wspx.store import Store
 
@@ -90,6 +91,7 @@ def open_lab(
             example_inputs=example_inputs,
             fingerprint=fingerprint,
             hash_params=hashes is None,
+            vision_inputs=probe_inputs(processor, next(module.parameters()).device),
         )
         _save_ir(st, ir)
     return Lab(
@@ -118,7 +120,12 @@ def _cached_ir(store: Store, fingerprint: str | None) -> ModelIR | None:
         return None
     import json
 
-    return ModelIR.from_dict(json.loads(raw))
+    from wspx.lab.ir.model_ir import IR_VERSION
+
+    data = json.loads(raw)
+    if data.get("version") != IR_VERSION:
+        return None  # captured by an older wspx: rebuild it
+    return ModelIR.from_dict(data)
 
 
 def _save_ir(store: Store, ir: ModelIR) -> None:
