@@ -162,6 +162,14 @@ class WorkingTree:
         target = dtype or (torch.float32 if name in self.state.promote else self._dtype[name])
         return materialize(self.base(name), deltas, dtype=target)
 
+    def materialize_state(
+        self, name: str, state: TreeState, *, dtype: torch.dtype | None = None
+    ) -> torch.Tensor:
+        """What ``name`` holds under ``state``, without touching the model."""
+        deltas = [self.delta(o) for o in state.merged.get(name, ())]
+        target = dtype or (torch.float32 if name in state.promote else self._dtype[name])
+        return materialize(self.base(name), deltas, dtype=target)
+
     def checkout(self, state: TreeState) -> dict[str, str]:
         """Make the live weights equal ``base + state``. Returns hashes of changed tensors."""
         old = self.state

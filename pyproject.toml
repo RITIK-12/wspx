@@ -125,6 +125,7 @@ ignore = [
     "PLR0915", # too many statements
     "PLR2004", # magic values: thresholds are documented where used
     "PLC0415", # imports inside functions keep heavy deps (torch) off the client path
+    "PERF401", # comprehension-vs-loop is a readability call, not a performance one
     "RUF001",  # typographic symbols (×, ≥, →) are intentional in user-facing text
     "RUF002",
     "RUF003",

@@ -36,6 +36,7 @@ def build_ir(
     param_hashes: Mapping[str, str] | None = None,
     force_routing: bool = True,
     seed: int = 0,
+    hash_params: bool = True,
 ) -> ModelIR:
     """Capture ``model`` and derive its IR.
 
@@ -121,10 +122,14 @@ def build_ir(
             cov.exercised = read and cov.rows_seen == cov.rows_total
         coverage[name] = cov
 
-    if param_hashes is None:
+    if param_hashes is not None:
+        hashes = dict(param_hashes)
+    elif hash_params:
         hashes = {name: tensor_hash(p) for name, p in model.named_parameters()}
     else:
-        hashes = dict(param_hashes)
+        hashes = {}  # computed lazily, before a tensor's first edit
+        if fingerprint is None:
+            raise ModelLoadError("a fingerprint is required when parameters are not hashed")
     for name, info in params.items():
         info.hash = hashes.get(name)
     if fingerprint is None:
