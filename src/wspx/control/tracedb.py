@@ -27,6 +27,8 @@ CREATE TABLE IF NOT EXISTS artefacts (id TEXT NOT NULL, kind TEXT NOT NULL, call
     ts REAL, PRIMARY KEY (id, call_id));
 CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, session TEXT NOT NULL,
     kind TEXT NOT NULL, source TEXT, payload TEXT NOT NULL, ts REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS driver_state (session TEXT PRIMARY KEY, runner TEXT NOT NULL,
+    state BLOB NOT NULL, ts REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS events_session ON events(session, id);
 CREATE INDEX IF NOT EXISTS calls_session ON tool_calls(session);
 """
@@ -91,6 +93,19 @@ class TraceDB:
             json.loads(r["data"])
             for r in self._exec("SELECT data FROM sessions ORDER BY updated DESC")
         ]
+
+    # driver checkpoints: one per session, the latest runner's
+    def put_driver_state(self, session: str, runner: str, state: bytes) -> None:
+        self._exec(
+            "INSERT OR REPLACE INTO driver_state VALUES (?,?,?,?)",
+            (session, runner, state, time.time()),
+        )
+
+    def driver_state(self, session: str, runner: str) -> bytes | None:
+        row = self._exec(
+            "SELECT state FROM driver_state WHERE session = ? AND runner = ?", (session, runner)
+        ).fetchone()
+        return bytes(row["state"]) if row else None
 
     # timeline
     def event(

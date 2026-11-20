@@ -44,7 +44,10 @@ class GoogleProvider:
         for msg in history:
             if msg.role == "assistant":
                 if msg.provider == self.name and msg.native is not None:
-                    out.append(msg.native)
+                    native = msg.native
+                    if isinstance(native, dict):  # restored from a runner checkpoint
+                        native = types.Content.model_validate(native)
+                    out.append(native)
                 else:
                     parts = [types.Part(text=msg.text)] if msg.text else []
                     parts += [

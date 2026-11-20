@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from pathlib import Path
@@ -174,6 +175,66 @@ def test_scripted_driver_runs_through_the_control_plane(tmp_path: Path) -> None:
         calls = [e["payload"] for e in export["events"] if e["kind"] == "tool_call"]
         assert calls[1]["data"]["handle"].startswith("p_")  # results in full, data included
         assert [c["message"] for c in export["commits"]["commits"]] == ["driver edit"]
+
+
+class Preempted(BaseException):
+    """The worker vanishing: nothing in the runner catches it."""
+
+
+def test_a_preempted_runner_resumes_over_the_api(tmp_path: Path) -> None:
+    """Seen live: Modal restarted the runner on the same input and it lost its history."""
+    from wspx.driver.run import run_from_env
+
+    class DiesAfter(Scripted):
+        def __init__(self, script: list[Any], steps: int) -> None:
+            super().__init__(script)
+            self.steps = steps
+
+        def step(self, *args: Any, **kw: Any) -> Any:
+            if len(self.requests) == self.steps:
+                raise Preempted
+            return super().step(*args, **kw)
+
+    envs: list[dict[str, str]] = []
+    edit = {"op": "ablate", "args": {"targets": "L1.mlp.down[:, 4]"}}
+    port = free_port()
+    client, manager = make(tmp_path, port=port)
+
+    def runner_factory(record: SessionRecord, env: dict[str, str]):  # type: ignore[no-untyped-def]
+        envs.append(env)
+
+        def target() -> None:
+            with contextlib.suppress(Preempted):
+                run_from_env(env, provider=DiesAfter([call("info"), call("edit", edit, n=1)], 2))
+
+        return target
+
+    manager.backend.runner_factory = runner_factory
+    with LiveServer(client.app, port):
+        sid = client.post(
+            "/api/sessions",
+            json={"model": "tiny", "driver": "anthropic:claude-opus-5-5", "task": "ablate unit 4"},
+            headers=USER,
+        ).json()["id"]
+        wait(lambda: bool(envs) and len(manager.trace.calls(sid)) == 2, timeout=60)
+        time.sleep(0.5)  # the first runner has died by its third request
+        (env,) = envs
+        commit = call("vcs", {"action": "commit", "message": "after the restart"}, n=2)
+        provider = Scripted([commit, done("resumed")])
+        result = run_from_env(env, provider=provider)  # Modal reruns the same input
+        assert (result.status, result.final_text) == ("done", "resumed")
+        assert provider.requests[0][0].text.startswith("ablate unit 4")
+        assert len(provider.requests[0]) == 5  # task, info and its result, edit and its result
+        assert any("restarted" in n for n in provider.requests[0][-1].notes)
+        repo = Repo(Store(tmp_path / "store"), manager.get(sid).fingerprint)
+        (latest, *_) = repo.log(repo.head(sid))
+        assert latest.message == "after the restart"
+        assert len(latest.patches) == 1  # the edit, applied once
+        kinds = [e["kind"] for e in manager.trace.events(sid)]
+        assert kinds.count("start") == 1
+        assert kinds.count("resume") == 1
+        # another start of the driver is a new runner: it does not pick up this checkpoint
+        assert manager.trace.driver_state(sid, "r_other") is None
 
 
 def test_tokens_are_scoped(tmp_path: Path) -> None:

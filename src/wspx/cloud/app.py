@@ -158,9 +158,15 @@ def gateway() -> object:
     return create_app(GatewayConfig.from_env())
 
 
-@app.function(image=driver_image, timeout=24 * 3600, restrict_modal_access=True)
+@app.function(
+    image=driver_image, timeout=24 * 3600, restrict_modal_access=True, nonpreemptible=True
+)
 def runner(env: dict[str, str]) -> str:
-    """One session's agent loop. It receives tokens, never provider keys."""
+    """One session's agent loop. It receives tokens, never provider keys.
+
+    Non-preemptible, so Modal does not move it mid-session; if it is restarted anyway,
+    Modal reruns the same input and the loop resumes from its checkpoint.
+    """
     from wspx.driver.run import run_from_env
 
     result = run_from_env(env)

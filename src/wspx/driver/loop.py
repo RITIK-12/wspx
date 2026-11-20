@@ -10,6 +10,12 @@ context limit older turns are compacted into a summary; the workspace table
 (live handles, branch and HEAD, latest check and test results) is re-injected
 after compaction and every few turns, so the model always knows what each
 handle holds.
+
+The conversation is checkpointed after every step. A runner restarted on the
+same input (a cloud worker replaced mid-session) resumes from the checkpoint
+instead of starting over, and re-sends the tool calls of an unfinished turn
+under their original ids, which the control plane answers from its record
+rather than running twice.
 """
 
 from __future__ import annotations
@@ -20,7 +26,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from wspx.driver.messages import Message, ToolOutput, Turn
+from wspx.driver.messages import Message, ToolCall, ToolOutput, Turn, dump_message, load_message
 from wspx.driver.providers import Provider
 from wspx.tools import TOOLS
 
@@ -46,6 +52,10 @@ class Hooks:
     """Human commands: ``{"type": "stop" | "pause" | "inject", "text"?}``."""
     workspace: Callable[[], str] = lambda: ""
     event: Callable[[dict[str, Any]], None] = lambda e: None
+    save_state: Callable[[dict[str, Any]], None] = lambda s: None
+    """Keep the conversation so far (called after every step)."""
+    load_state: Callable[[], dict[str, Any] | None] = lambda: None
+    """This runner's earlier checkpoint, when it is being restarted."""
 
 
 @dataclass
@@ -85,6 +95,9 @@ class Runner:
         self._tools = [t for t in provider.tools() if _tool_name(t) not in config.deny]
 
     def run(self) -> RunResult:
+        state = self.hooks.load_state()
+        if state:
+            return self._resume(state)
         workspace = self.hooks.workspace()
         first = self.config.task + (f"\n\nWorkspace:\n{workspace}" if workspace else "")
         self.history = [Message("user", text=first)]
@@ -101,7 +114,21 @@ class Runner:
                 "message": first,
             }
         )
-        pending: list[str] = []
+        self._checkpoint()
+        return self._loop([])
+
+    def _resume(self, state: dict[str, Any]) -> RunResult:
+        self.history = [load_message(m) for m in state.get("history") or []]
+        self.turns = int(state.get("turns", 0))
+        self.hooks.event({"type": "resume", "turns": self.turns, "messages": len(self.history)})
+        last = self.history[-1] if self.history else None
+        if last is not None and last.role == "assistant":
+            if not last.tool_calls:
+                return self._end("done", "the model finished", last.text)
+            self._finish_turn(last.tool_calls, [])
+        return self._loop([RESTARTED])
+
+    def _loop(self, pending: list[str]) -> RunResult:
         while True:
             state = self.hooks.gateway_state() or {}
             if state.get("halted"):
@@ -156,41 +183,52 @@ class Runner:
                 )
             )
             self._emit_turn(turn)
+            self._checkpoint()
             if turn.stop == "refusal":
                 return self._end("refused", "the model declined (refusal)", turn.text)
             if not turn.tool_calls:
                 return self._end("done", "the model finished", turn.text)
 
-            outputs = []
-            for call in turn.tool_calls:
-                started = time.perf_counter()
-                reply = self.hooks.tool(call.name, call.args, call.id)
-                self.hooks.event(
-                    {
-                        "type": "tool_call",
-                        "turn": self.turns,
-                        "call_id": call.id,
-                        "tool": call.name,
-                        "args": call.args,
-                        "ok": reply.ok,
-                        "summary": reply.text[:2000],
-                        "latency": time.perf_counter() - started,
-                    }
-                )
-                outputs.append(ToolOutput(call.id, call.name, reply.text, is_error=not reply.ok))
-                pending.extend(self._stuck(call.name, reply.text))
-            message = Message("tool", outputs=outputs)
-            self.history.append(message)
+            self._finish_turn(turn.tool_calls, pending)
             if (
                 turn.usage.input + turn.usage.cache_read + turn.usage.cache_write
                 > self.config.compact_at
             ):
                 self._compact()
+                self._checkpoint()
                 pending.append("Workspace:\n" + self.hooks.workspace())
             elif self.turns % self.config.workspace_every == 0:
                 table = self.hooks.workspace()
                 if table:
                     pending.append("Workspace:\n" + table)
+
+    def _finish_turn(self, calls: list[ToolCall], pending: list[str]) -> None:
+        """Run a turn's tool calls, append their results and checkpoint."""
+        outputs = []
+        for call in calls:
+            started = time.perf_counter()
+            reply = self.hooks.tool(call.name, call.args, call.id)
+            self.hooks.event(
+                {
+                    "type": "tool_call",
+                    "turn": self.turns,
+                    "call_id": call.id,
+                    "tool": call.name,
+                    "args": call.args,
+                    "ok": reply.ok,
+                    "summary": reply.text[:2000],
+                    "latency": time.perf_counter() - started,
+                }
+            )
+            outputs.append(ToolOutput(call.id, call.name, reply.text, is_error=not reply.ok))
+            pending.extend(self._stuck(call.name, reply.text))
+        self.history.append(Message("tool", outputs=outputs))
+        self._checkpoint()
+
+    def _checkpoint(self) -> None:
+        self.hooks.save_state(
+            {"turns": self.turns, "history": [dump_message(m) for m in self.history]}
+        )
 
     # ------------------------------------------------------------------ helpers
 
@@ -281,6 +319,14 @@ class Runner:
             {"type": "end", "status": status, "reason": reason, "turns": self.turns, "text": text}
         )
         return RunResult(status, self.turns, reason, text, self.history)
+
+
+RESTARTED = (
+    "Your process was restarted (the machine running it was replaced) and resumed from "
+    "its saved conversation, so nothing you saw is lost. Tool calls that were running "
+    "at the restart were re-sent under their original ids and answered from the record; "
+    "if anything looks off, `info --handles` and `vcs status` show the current state."
+)
 
 
 def _limit_message(text: str) -> str:

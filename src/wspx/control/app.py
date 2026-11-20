@@ -279,6 +279,21 @@ def create_app(
         await offload(lambda: manager.runner_event(sid, event))
         return {"ok": True}
 
+    @app.put("/api/sessions/{sid}/driver-state")
+    async def put_driver_state(
+        sid: str, runner: str, request: Request, _caller: str = Depends(session_caller)
+    ) -> dict[str, Any]:
+        body = await request.body()
+        await offload(lambda: manager.trace.put_driver_state(sid, runner, body))
+        return {"ok": True}
+
+    @app.get("/api/sessions/{sid}/driver-state")
+    def driver_state(sid: str, runner: str, _caller: str = Depends(session_caller)) -> Response:
+        state = manager.trace.driver_state(sid, runner)
+        if state is None:
+            return Response(status_code=204)
+        return Response(state, media_type="application/octet-stream")
+
     @app.get("/api/sessions/{sid}/commands")
     def commands(sid: str, _caller: str = Depends(session_caller)) -> dict[str, Any]:
         manager.touch(sid)

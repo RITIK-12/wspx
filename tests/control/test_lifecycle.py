@@ -339,3 +339,77 @@ def test_the_lab_network_check_is_recorded(tmp_path: Path) -> None:
         e for e in m.trace.events(record.id) if e["kind"] == "lab" and e["payload"]["tier"] == "hot"
     ]
     assert hot[-1]["payload"]["network"] == "blocked"
+
+
+class CountingLab(FakeLab):
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.release = threading.Event()
+        self.release.set()
+
+    def call(
+        self, tool: str, args: dict[str, Any], call_id: str, context: dict[str, Any]
+    ) -> dict[str, Any]:
+        self.calls.append(call_id)
+        self.release.wait(5)
+        return {"summary": f"{tool} ran", "ok": True, "handles": ["p_1"], "data": {"n": 1}}
+
+
+def test_a_driver_call_re_sent_under_its_id_runs_once(tmp_path: Path) -> None:
+    """A restarted runner re-sends its unfinished calls; an edit must not be applied twice."""
+    m, backend = manager(tmp_path)
+    backend.ready.set()
+    sid = m.create(model="x").id
+    m.lab(sid)
+    lab = CountingLab()
+    m.labs[sid] = lab  # type: ignore[assignment]
+    edit = {"op": "ablate", "args": {"targets": "L0.mlp.down[:, 1]"}}
+    first = m.tool(sid, "edit", edit, call_id="toolu_a", source="driver")
+    again = m.tool(sid, "edit", edit, call_id="toolu_a", source="driver")
+    assert lab.calls == ["toolu_a"]
+    assert first["ok"]
+    assert again["ok"]
+    assert "answered from the record" in again["summary"]
+    assert again["handles"] == ["p_1"]
+    assert again["data"] == {"n": 1}
+    # while the first is still running, the re-sent call waits for it rather than running
+    lab.release.clear()
+    out: dict[str, Any] = {}
+    running = threading.Thread(
+        target=lambda: out.update(m.tool(sid, "edit", edit, call_id="toolu_b", source="driver"))
+    )
+    running.start()
+    wait(lambda: lab.calls == ["toolu_a", "toolu_b"])
+    resent: dict[str, Any] = {}
+    waiter = threading.Thread(
+        target=lambda: resent.update(m.tool(sid, "edit", edit, call_id="toolu_b", source="driver"))
+    )
+    waiter.start()
+    time.sleep(0.1)
+    assert not resent
+    lab.release.set()
+    running.join(5)
+    waiter.join(5)
+    assert lab.calls == ["toolu_a", "toolu_b"]
+    assert resent["ok"]
+    assert "answered from the record" in resent["summary"]
+    # a human's call is never deduplicated, and a new id runs
+    m.tool(sid, "edit", edit, call_id="toolu_a", source="human")
+    m.tool(sid, "edit", edit, call_id="toolu_c", source="driver")
+    assert lab.calls == ["toolu_a", "toolu_b", "toolu_a", "toolu_c"]
+
+
+def test_each_driver_start_gets_its_own_runner_id(tmp_path: Path) -> None:
+    m, backend = manager(tmp_path)
+    seen: list[str] = []
+    backend.start_runner = lambda record, env: (  # type: ignore[method-assign]
+        seen.append(env["WSPX_RUNNER_ID"]) or FakeRunner()
+    )
+    sid = m.create(model="x", driver="anthropic:claude-opus-5-5").id
+    m.start_driver(sid)
+    m.pause(sid, "for the test")
+    m.runners[sid].stop()
+    m.start_driver(sid)
+    assert len(seen) == 2
+    assert seen[0] != seen[1]
+    assert all(r.startswith("r_") for r in seen)

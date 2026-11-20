@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -258,3 +259,64 @@ def test_the_runner_reads_denied_tools_from_its_environment(
     }
     run.run_from_env(env, provider=Scripted([]))
     assert seen["deny"] == frozenset({"run", "export"})
+
+
+def test_a_restarted_runner_resumes_its_checkpoint() -> None:
+    """Seen live: Modal restarted the runner on the same input and it began again, empty."""
+    saved: list[dict[str, Any]] = []
+    first = Runner(
+        Scripted([call("info"), call("edit", {"op": "ablate"}, n=1), done()]),
+        hooks(save_state=saved.append),
+        RunnerConfig("sys", "task"),
+    )
+    first.run()
+    assert len(saved) == 6  # the start, each turn, and each tool-using turn's results
+    # restart from the checkpoint taken after the edit's turn, before its result came back
+    state = saved[3]
+    assert state["history"][-1]["tool_calls"][0]["id"] == "c1"
+    sent: list[tuple[str, str]] = []
+
+    def tool(name: str, args: dict[str, Any], cid: str) -> ToolReply:
+        sent.append((name, cid))
+        return ToolReply(f"{name} ok")
+
+    provider = Scripted([done("resumed")])
+    h = hooks(tool=tool, load_state=lambda: state)
+    result = Runner(provider, h, RunnerConfig("sys", "task")).run()
+    assert (result.status, result.final_text, result.turns) == ("done", "resumed", 3)
+    assert sent == [("edit", "c1")]  # the unfinished call, re-sent under its own id
+    (request,) = provider.requests
+    assert [m.role for m in request] == ["user", "assistant", "tool", "assistant", "tool"]
+    assert request[0].text == "task"
+    assert any("restarted" in n for n in request[-1].notes)
+    kinds = [e["type"] for e in h.events]  # type: ignore[attr-defined]
+    assert kinds[0] == "resume"
+    assert "start" not in kinds
+
+
+def test_a_restart_after_the_model_finished_ends_again() -> None:
+    saved: list[dict[str, Any]] = []
+    Runner(
+        Scripted([done("all done")]), hooks(save_state=saved.append), RunnerConfig("s", "t")
+    ).run()
+    provider = Scripted([])
+    result = Runner(provider, hooks(load_state=lambda: saved[-1]), RunnerConfig("s", "t")).run()
+    assert (result.status, result.final_text) == ("done", "all done")
+    assert provider.requests == []
+
+
+def test_checkpoints_keep_provider_native_output() -> None:
+    from wspx.driver.messages import dump_message, load_message
+
+    class Native:
+        def model_dump(self, **kw: Any) -> dict[str, Any]:
+            return {"parts": [{"thought_signature": "c2ln"}], "role": "model"}
+
+    blocks = [{"type": "thinking", "thinking": "…", "signature": "sig"}]
+    for native, expect in [(blocks, blocks), (Native(), Native().model_dump())]:
+        msg = Message(
+            "assistant", "t", native=native, provider="p", tool_calls=[call("x").tool_calls[0]]
+        )
+        back = load_message(json.loads(json.dumps(dump_message(msg))))
+        assert back.native == expect
+        assert back.tool_calls == msg.tool_calls

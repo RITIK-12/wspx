@@ -68,6 +68,8 @@ class SessionManager:
         """Bumped by every kill --all and resume, so a stale halt read cannot undo them."""
         self._lab_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
         self._lab_gen: dict[str, int] = defaultdict(int)
+        self._inflight: dict[str, threading.Event] = {}
+        """Driver calls running now, by call id: a restarted runner re-sending one waits for it."""
         self._missed: dict[str, int] = defaultdict(int)
         self._epoch: dict[str, int] = defaultdict(int)
         """State-changing tool calls so far, per session: part of a repeated call's key."""
@@ -191,6 +193,8 @@ class SessionManager:
             "WSPX_RUNNER_TOKEN": mint(self.secret, sid, scope="runner"),
             "WSPX_LLM_TOKEN": mint(self.secret, sid, scope="llm"),
             "WSPX_TOOLS_DENY": ",".join(record.tools_deny),
+            # a cloud runner restarted on this same input resumes from its checkpoint
+            "WSPX_RUNNER_ID": "r_" + secrets.token_hex(6),
         }
         with self._lock:
             runner = self.runners.get(sid)
@@ -328,7 +332,56 @@ class SessionManager:
                 sid, denied_id, name, args, refusal, turn=turn, latency=0.0, source=source
             )
             return refusal
+        if call_id and source == "driver":
+            earlier = self._recorded(sid, call_id)
+            if earlier is not None:
+                return earlier
         call_id = call_id or "c_" + secrets.token_hex(5)
+        try:
+            return self._run_tool(record, name, args, call_id, source, turn, context)
+        finally:
+            done = self._inflight.pop(call_id, None)
+            if done is not None:
+                done.set()
+
+    def _recorded(self, sid: str, call_id: str) -> dict[str, Any] | None:
+        """The result of a driver call already run (or running) under this id, else ``None``.
+
+        Only a restarted runner re-sends an id; answering from the record keeps an edit
+        or a commit from being applied twice. A call not seen before is marked running.
+        """
+        with self._lock:
+            running = self._inflight.get(call_id)
+            row = None if running is not None else self.trace.call(call_id)
+            if running is None and row is None:
+                self._inflight[call_id] = threading.Event()
+                return None
+        if running is not None:
+            running.wait()
+            row = self.trace.call(call_id)
+        if row is None or row.get("session") != sid:
+            return {"summary": f"call {call_id} did not complete", "ok": False, "handles": []}
+        handles = [a["id"] for a in row.get("artefacts") or [] if a.get("kind") != "commit"]
+        return {
+            "summary": (row.get("summary") or "")
+            + "\n(answered from the record: this call id already ran)",
+            "ok": bool(row.get("ok")),
+            "handles": handles,
+            "data": json.loads(row["data"]) if row.get("data") else {},
+            "call_id": call_id,
+        }
+
+    def _run_tool(
+        self,
+        record: SessionRecord,
+        name: str,
+        args: dict[str, Any],
+        call_id: str,
+        source: str,
+        turn: int | None,
+        context: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        sid = record.id
         self.touch(sid)
         started = time.time()
         result = self._store_served(record, name, args) if sid not in self.labs else None

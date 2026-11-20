@@ -8,7 +8,7 @@ parts with thought signatures.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
 
@@ -38,6 +38,28 @@ class Message:
     outputs: list[ToolOutput] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     """Operator notes (nudges, workspace table, human steering) for the model."""
+
+
+def dump_message(msg: Message) -> dict[str, Any]:
+    """A message as JSON-ready data: provider-native output is dumped through pydantic."""
+    out = asdict(msg)
+    native = msg.native
+    if hasattr(native, "model_dump"):
+        native = native.model_dump(mode="json", exclude_none=True)
+    out["native"] = native
+    return out
+
+
+def load_message(data: dict[str, Any]) -> Message:
+    return Message(
+        role=data["role"],
+        text=data.get("text", ""),
+        native=data.get("native"),
+        provider=data.get("provider"),
+        tool_calls=[ToolCall(**c) for c in data.get("tool_calls") or []],
+        outputs=[ToolOutput(**o) for o in data.get("outputs") or []],
+        notes=list(data.get("notes") or []),
+    )
 
 
 @dataclass
