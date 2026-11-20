@@ -254,3 +254,39 @@ def test_mcp_endpoint(tmp_path: Path) -> None:
         assert "LlamaForCausalLM" in text
         assert "[call c_" in text
         assert json.loads(json.dumps(res))["result"]["isError"] is False
+
+
+def test_ui_views_are_served_from_the_store(tmp_path: Path) -> None:
+    client, manager = make(tmp_path)
+    with client:
+        sid = client.post("/api/sessions", json={"model": "tiny"}, headers=USER).json()["id"]
+        wait(lambda: sid in manager.labs)
+
+        def tool(name: str, args: dict[str, Any]) -> dict[str, Any]:
+            return client.post(
+                f"/api/sessions/{sid}/tools/{name}", json={"args": args}, headers=USER
+            ).json()
+
+        tool("edit", {"op": "ablate", "args": {"targets": "L0.mlp.down[:, 1]"}})
+        tool("vcs", {"action": "commit", "message": "first"})
+        tool("test", {"suite": "canary"})
+        trace = tool("trace", {"prompt": [1, 2, 3]})
+        manager.stop_lab(sid, "views must not need the lab")
+
+        arch = client.get(f"/api/sessions/{sid}/architecture", headers=USER).json()
+        assert arch["available"]
+        assert len(arch["blocks"]) == 3
+        assert any(r["address"] == "L0.mlp.down" for r in arch["blocks"][0]["roles"])
+        history = client.get(f"/api/sessions/{sid}/commits", headers=USER).json()
+        assert history["commits"][0]["message"] == "first"
+        assert history["commits"][0]["patches"][0]["op"] == "ablate"
+        matrix = client.get(f"/api/sessions/{sid}/runs", headers=USER).json()
+        canary = next(r for r in matrix["runs"] if r["suite"] == "canary")
+        assert canary["commits"] == [history["commits"][0]["short"]]
+        assert canary["checks"]
+        handles = client.get(f"/api/sessions/{sid}/handles", headers=USER).json()["handles"]
+        ref = next(h["ref"] for h in handles if h["key"] == trace["handles"][0])
+        obj = client.get(f"/api/objects/{ref}", headers=USER).json()
+        assert obj["kind"] == "forward"
+        assert obj["arrays"]["lens_ids"]
+        assert sid not in manager.labs

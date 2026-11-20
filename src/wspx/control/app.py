@@ -313,6 +313,33 @@ def create_app(
             raise HTTPException(404, "no such call")
         return found
 
+    # ------------------------------------------------------------------ views for the UI
+
+    from wspx.control import views
+
+    def _fp(sid: str) -> str | None:
+        return guarded(lambda: manager.get(sid)).fingerprint  # type: ignore[no-any-return]
+
+    @app.get("/api/sessions/{sid}/architecture", dependencies=[Depends(user)])
+    def architecture(sid: str) -> dict[str, Any]:
+        return views.architecture(store, _fp(sid))
+
+    @app.get("/api/sessions/{sid}/commits", dependencies=[Depends(user)])
+    def commits(sid: str) -> dict[str, Any]:
+        return views.commits(store, _fp(sid), sid)
+
+    @app.get("/api/sessions/{sid}/runs", dependencies=[Depends(user)])
+    def runs(sid: str) -> dict[str, Any]:
+        return views.runs(store, _fp(sid), sid)
+
+    @app.get("/api/sessions/{sid}/handles", dependencies=[Depends(user)])
+    def handles(sid: str) -> dict[str, Any]:
+        return views.handles(store, sid)
+
+    @app.get("/api/objects/{oid}", dependencies=[Depends(user)])
+    def json_object(oid: str) -> Any:
+        return guarded(lambda: views.json_object(store, oid))
+
     # ------------------------------------------------------------------ spend and safety
 
     def need_gateway() -> GatewayAdmin:
