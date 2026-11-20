@@ -564,7 +564,7 @@ class Lab:
             HandleKind.DIRECTION,
             f"dir:{name}",
             d.provenance,
-            description=f"difference of means at L{d.layer}, separation {d.separation:.2f}",
+            description=f"difference of means at L{d.layer}, {d.describe_separation()}",
             size=f"{d.vector.numel()}-d",
             call_id=self.context.get("call_id"),
         )
@@ -1621,8 +1621,7 @@ class DirectionRef:
     def summary(self) -> str:
         d = self.direction
         return (
-            f"{self.handle} · ‖v‖ {float(d.vector.norm()):.3g} · separation {d.separation:.2f} "
-            f"({d.n_pos} vs {d.n_neg} prompts)"
+            f"{self.handle} · ‖v‖ {float(d.vector.norm()):.3g} · {d.describe_separation()}"
             f"\ntop writers:\n{self.writers if isinstance(self.writers, str) else self.writers.summary}"
         )
 

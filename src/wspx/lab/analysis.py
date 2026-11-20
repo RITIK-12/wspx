@@ -153,8 +153,24 @@ class Direction:
     provenance: str
     n_pos: int
     n_neg: int
-    separation: float
-    """Mean projection gap between the two sets, in units of the pooled std."""
+    separation: float | None
+    """Held-out gap between the two sets in pooled-std units: each prompt is scored on the
+    direction built without it. ``None`` with fewer than two prompts a side, where there is
+    nothing to hold out (in-sample, any two prompts separate perfectly)."""
+    held_out: tuple[int, int] | None = None
+    """(prompts on their own side when left out, all prompts)."""
+
+    def describe_separation(self) -> str:
+        if self.separation is None or self.held_out is None:
+            return (
+                f"separation not measured ({self.n_pos} vs {self.n_neg} prompts: "
+                "it needs at least 2 a side)"
+            )
+        k, n = self.held_out
+        return (
+            f"held-out separation {self.separation:.2f} ({k}/{n} prompts on their own side "
+            "when left out)"
+        )
 
 
 def contrast(
@@ -183,19 +199,39 @@ def contrast(
     pos_acts = _residuals(model, ir, probe, text, positive, point, position, batch_size)
     neg_acts = _residuals(model, ir, probe, text, negative, point, position, batch_size)
     vector = pos_acts.mean(0) - neg_acts.mean(0)
-    unit = vector / vector.norm().clamp_min(1e-30)
-    p, n = pos_acts @ unit, neg_acts @ unit
-    pooled = math.sqrt((float(p.var(correction=0)) + float(n.var(correction=0))) / 2) or 1e-30
     provenance = f"contrast.L{layer}-resid.n{len(positive) + len(negative)}"
+    separation, held_out = _held_out_separation(pos_acts, neg_acts)
     return Direction(
-        name,
-        vector,
-        layer,
-        provenance,
-        len(positive),
-        len(negative),
-        (float(p.mean()) - float(n.mean())) / pooled,
+        name, vector, layer, provenance, len(positive), len(negative), separation, held_out
     )
+
+
+def _held_out_separation(
+    pos: torch.Tensor, neg: torch.Tensor
+) -> tuple[float | None, tuple[int, int] | None]:
+    """Leave-one-out: score each prompt against the midpoint, along the direction built
+    without it. In-sample, a difference of means separates any few prompts in a wide
+    residual stream, so only held-out scores say whether the direction generalises."""
+    n_p, n_n = pos.shape[0], neg.shape[0]
+    if n_p < 2 or n_n < 2:
+        return None, None
+    pos, neg = pos.double(), neg.double()
+    sum_p, sum_n = pos.sum(0), neg.sum(0)
+    mean_p, mean_n = sum_p / n_p, sum_n / n_n
+    rest_p = (sum_p - pos) / (n_p - 1)  # each positive's side without it
+    rest_n = (sum_n - neg) / (n_n - 1)
+    score_p = _along(pos - (rest_p + mean_n) / 2, rest_p - mean_n)
+    score_n = _along(neg - (mean_p + rest_n) / 2, mean_p - rest_n)
+    pooled = math.sqrt((float(score_p.var(correction=0)) + float(score_n.var(correction=0))) / 2)
+    if pooled == 0.0:
+        return None, None
+    right = int((score_p > 0).sum()) + int((score_n < 0).sum())
+    return (float(score_p.mean()) - float(score_n.mean())) / pooled, (right, n_p + n_n)
+
+
+def _along(x: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    out: torch.Tensor = (x * v).sum(1) / v.norm(dim=1).clamp_min(1e-30)
+    return out
 
 
 def _residuals(

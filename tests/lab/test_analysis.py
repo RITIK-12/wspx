@@ -156,11 +156,33 @@ class TestProbesAndTraces:
     def test_contrast_finds_planted_direction(self, llama: tuple) -> None:  # type: ignore[type-arg]
         model, ir = llama
         probe, text = Probe(model, ir), Text(None)
-        pos = [[1, 9, 2, i] for i in range(10, 20)]
-        neg = [[1, 9, 2, i] for i in range(60, 70)]
+        # the sides share their last token and vary before it: a difference every prompt has
+        pos = [[1, i, 2, 10] for i in range(20, 30)]
+        neg = [[1, i, 2, 60] for i in range(20, 30)]
         d = analysis.contrast(model, ir, probe, text, pos, neg, name="x", layer=1)
         assert d.provenance == "contrast.L1-resid.n20"
+        assert d.separation is not None
         assert d.separation > 1.0
+        assert d.held_out is not None
+        assert d.held_out[1] == 20
+        assert d.held_out[0] >= 18
+        assert "held-out separation" in d.describe_separation()
+
+    def test_contrast_separation_is_held_out(self, llama: tuple) -> None:  # type: ignore[type-arg]
+        """Seen live: 1-vs-1 contrasts reported huge separations that meant nothing."""
+        model, ir = llama
+        probe, text = Probe(model, ir), Text(None)
+        one = analysis.contrast(model, ir, probe, text, [[1, 9, 2, 10]], [[1, 9, 2, 60]], name="a")
+        assert one.separation is None
+        assert one.held_out is None
+        assert "not measured (1 vs 1 prompts" in one.describe_separation()
+        # the same token mix on both sides: in-sample this separates perfectly in a wide
+        # residual stream; held out it does not
+        gen = torch.Generator().manual_seed(0)
+        mixed = torch.randint(10, 90, (12, 4), generator=gen).tolist()
+        noise = analysis.contrast(model, ir, probe, text, mixed[:6], mixed[6:], name="n", layer=1)
+        assert noise.separation is not None
+        assert noise.separation < 1.0
 
     def test_traces(self, llama: tuple) -> None:  # type: ignore[type-arg]
         model, ir = llama

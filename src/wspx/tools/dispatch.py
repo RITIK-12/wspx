@@ -78,7 +78,13 @@ def _run(lab: Lab, name: str, a: Any) -> ToolResult:
             position=a.position,
         )
         return ToolResult(
-            d.summary, {"handle": d.handle, "separation": d.direction.separation}, [d.handle]
+            d.summary,
+            {
+                "handle": d.handle,
+                "separation": d.direction.separation,
+                "held_out": list(d.direction.held_out) if d.direction.held_out else None,
+            },
+            [d.handle],
         )
     if name == "generate":
         return lab.generate(
