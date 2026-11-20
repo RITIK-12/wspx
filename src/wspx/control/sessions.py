@@ -231,17 +231,21 @@ class SessionManager:
         if result is None:
             if sid not in self.labs:
                 note = "(lab cold start {:.0f} s)"
-            handle = self.lab(sid)
             ctx = {"caller": source, "driver": record.driver, **(context or {})}
-            result = handle.call(name, args, call_id, ctx)
-            self._persist(sid, result)
-            result.pop("journal", None)
+            try:
+                result = self.lab(sid).call(name, args, call_id, ctx)
+            except WspxError as exc:  # recorded like any other failed call, never dropped
+                result = {"summary": f"{name}: {exc}", "ok": False, "handles": [], "data": {}}
+                note = ""
+            else:
+                self._persist(sid, result)
+                result.pop("journal", None)
             if note:
                 note = note.format(time.time() - started)
         latency = time.time() - started
         result["summary"] = (result.get("summary") or "") + (f"\n{note}" if note else "")
         result["call_id"] = call_id
-        result["summary"] += self._observe(sid, name, args, result)
+        result["summary"] += self._observe(sid, name, args, result, source)
         self.trace.tool_call(
             sid, call_id, name, args, result, turn=turn, latency=latency, source=source
         )
@@ -281,13 +285,24 @@ class SessionManager:
             "data": {"served_by": "store"},
         }
 
-    def _observe(self, sid: str, name: str, args: dict[str, Any], result: dict[str, Any]) -> str:
-        """Repetition across tool calls also counts as a loop (the gateway decides)."""
+    def _observe(
+        self, sid: str, name: str, args: dict[str, Any], result: dict[str, Any], source: str
+    ) -> str:
+        """Repetition across tool calls also counts as a loop (the gateway decides).
+
+        The gateway already sees the built-in driver's calls in the model's responses, so
+        only other callers' calls are counted here (each call is counted once). Outcomes
+        are only visible here.
+        """
         if self.gateway is None:
             return ""
         notes = []
         try:
-            verdicts = [self.gateway.observe(sid, "call", {"tool": name, "args": args}, label=name)]
+            verdicts = (
+                []
+                if source == "driver"
+                else [self.gateway.observe(sid, "call", {"tool": name, "args": args}, label=name)]
+            )
             codes = sorted(set(_CODE_RE.findall(result.get("summary") or "")))
             if codes:
                 verdicts.append(
@@ -305,7 +320,7 @@ class SessionManager:
                 continue
             self.trace.event(sid, "loop", verdict)
             if verdict["action"] == "stop":
-                self.pause(sid, f"loop detected: {verdict['message']}")
+                self.pause(sid, f"loop detected: {verdict['message']}", source="wspx")
                 notes.append(f"\n⚠ session paused: {verdict['message']}")
             else:
                 notes.append(f"\n⚠ {verdict['message']}")
@@ -317,10 +332,12 @@ class SessionManager:
         self.last_activity[sid] = time.time()
         self.idle_since.pop(sid, None)
 
-    def command(self, sid: str, kind: str, text: str | None = None) -> None:
+    def command(
+        self, sid: str, kind: str, text: str | None = None, *, source: str = "human"
+    ) -> None:
         self.get(sid)
         self.commands[sid].append({"type": kind, **({"text": text} if text else {})})
-        self.trace.event(sid, "command", {"type": kind, "text": text}, source="human")
+        self.trace.event(sid, "command", {"type": kind, "text": text}, source=source)
 
     def take_commands(self, sid: str) -> list[dict[str, Any]]:
         out = []
@@ -328,11 +345,11 @@ class SessionManager:
             out.append(self.commands[sid].popleft())
         return out
 
-    def pause(self, sid: str, reason: str) -> None:
+    def pause(self, sid: str, reason: str, *, source: str = "human") -> None:
         record = self.get(sid)
         record.status, record.reason = "paused", reason
         self._save(record)
-        self.command(sid, "pause")
+        self.command(sid, "pause", source=source)
         if self.gateway is not None:
             with contextlib.suppress(WspxError):
                 self.gateway.pause(sid, reason)

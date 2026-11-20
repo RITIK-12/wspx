@@ -329,3 +329,45 @@ def test_projects_ship_their_files_and_settings_to_the_lab(tmp_path: Path) -> No
     assert workdir is not None
     assert (workdir / "data" / "loops.jsonl").read_text() == '{"prompt": "Wait"}\n'
     assert WspxConfig.discover(workdir).check.max_rel_norm == 0.01
+
+
+def test_each_tool_call_is_counted_once_for_loop_detection(tmp_path: Path) -> None:
+    """The gateway sees the built-in driver's calls in its responses; the control plane
+    counts only other callers', so A, B, A is not mistaken for a loop."""
+    seen: list[tuple[str, str]] = []
+
+    class Gateway:
+        def observe(self, sid: str, kind: str, key: Any, label: str = "") -> None:
+            seen.append((kind, label))
+
+    client, manager = make(tmp_path)
+    with client:
+        sid = client.post("/api/sessions", json={"model": "tiny"}, headers=USER).json()["id"]
+        wait(lambda: sid in manager.labs)
+        manager.gateway = Gateway()
+        manager.tool(sid, "info", {}, source="driver")
+        assert ("call", "info") not in seen
+        manager.tool(sid, "info", {}, source="mcp")
+        assert seen.count(("call", "info")) == 1
+
+
+def test_lab_failures_are_results_not_crashes() -> None:
+    import httpx
+
+    from wspx.control.backend import _post_tool
+    from wspx.errors import LabUnavailable
+
+    failing = httpx.Client(
+        base_url="http://lab",
+        transport=httpx.MockTransport(lambda r: httpx.Response(500, text="boom")),
+    )
+    result = _post_tool(failing, "edit", {}, "c_1", {})
+    assert result["ok"] is False
+    assert "HTTP 500" in result["summary"]
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("refused", request=request)
+
+    gone = httpx.Client(base_url="http://lab", transport=httpx.MockTransport(refuse))
+    with pytest.raises(LabUnavailable):
+        _post_tool(gone, "edit", {}, "c_1", {})

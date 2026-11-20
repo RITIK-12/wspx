@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import traceback
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
@@ -44,6 +45,9 @@ def call(
         )
     except WspxError as exc:
         return ToolResult(f"{name}: {exc}", ok=False)
+    except Exception as exc:  # a tool answers with what went wrong; it never takes the lab down
+        traceback.print_exc()
+        return ToolResult(f"{name} failed: {type(exc).__name__}: {exc}", ok=False)
 
 
 def _run(

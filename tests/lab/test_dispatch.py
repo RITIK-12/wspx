@@ -67,6 +67,16 @@ def test_edit_ops_explain_their_arguments(lab) -> None:  # type: ignore[no-untyp
     assert "orthogonalize" not in unknown.summary  # not offered where it cannot run
 
 
+def test_unexpected_failures_come_back_as_results(lab, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    def boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(lab, "info", boom)
+    result = call(lab, "info")
+    assert not result.ok
+    assert "RuntimeError: kaboom" in result.summary
+
+
 def test_ls_filters_by_layers_alone(lab) -> None:  # type: ignore[no-untyped-def]
     rows = call(lab, "ls", {"layers": "1"}).data["rows"]
     assert rows

@@ -11,6 +11,8 @@ from typing import Any, Protocol
 
 import httpx
 
+from wspx.errors import LabUnavailable
+
 
 @dataclass
 class SessionRecord:
@@ -66,6 +68,31 @@ class Backend(Protocol):
     def stop_all(self) -> int: ...
 
 
+class _Poster(Protocol):
+    def post(self, url: str, *, json: Any) -> Any: ...
+
+
+def _post_tool(
+    client: _Poster, tool: str, args: dict[str, Any], call_id: str, context: dict[str, Any]
+) -> dict[str, Any]:
+    """One tool call to a lab server. A failure inside the lab comes back as a failed result."""
+    try:
+        r = client.post(
+            f"/tool/{tool}", json={"args": args, "call_id": call_id, "context": context}
+        )
+    except httpx.HTTPError as exc:
+        raise LabUnavailable(f"the lab did not answer: {exc}") from exc
+    if r.status_code >= 400:
+        return {
+            "summary": f"{tool}: the lab failed (HTTP {r.status_code}): {r.text[:300]}",
+            "ok": False,
+            "handles": [],
+            "data": {},
+        }
+    data: dict[str, Any] = r.json()
+    return data
+
+
 class HttpLab:
     """A lab reached over HTTP (a sandbox's encrypted port and connect token)."""
 
@@ -87,12 +114,7 @@ class HttpLab:
     def call(
         self, tool: str, args: dict[str, Any], call_id: str, context: dict[str, Any]
     ) -> dict[str, Any]:
-        r = self.client.post(
-            f"/tool/{tool}", json={"args": args, "call_id": call_id, "context": context}
-        )
-        r.raise_for_status()
-        data: dict[str, Any] = r.json()
-        return data
+        return _post_tool(self.client, tool, args, call_id, context)
 
     def heartbeat(self, lease_s: float) -> dict[str, Any]:
         r = self.client.post("/heartbeat", json={"lease_s": lease_s}, timeout=30)
@@ -118,12 +140,7 @@ class InProcessLab:
     def call(
         self, tool: str, args: dict[str, Any], call_id: str, context: dict[str, Any]
     ) -> dict[str, Any]:
-        r = self.client.post(
-            f"/tool/{tool}", json={"args": args, "call_id": call_id, "context": context}
-        )
-        r.raise_for_status()
-        data: dict[str, Any] = r.json()
-        return data
+        return _post_tool(self.client, tool, args, call_id, context)
 
     def heartbeat(self, lease_s: float) -> dict[str, Any]:
         data: dict[str, Any] = self.client.post("/heartbeat", json={"lease_s": lease_s}).json()
