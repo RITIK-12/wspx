@@ -91,7 +91,9 @@ def suite(
         import inspect
 
         try:
-            source = inspect.getsource(func)
+            # the whole file: a constant or helper the suite uses changes its results too
+            module = inspect.getmodule(func)
+            source = func.__qualname__ + "\n" + inspect.getsource(module or func)
         except (OSError, TypeError):
             source = func.__qualname__
         s = Suite(
