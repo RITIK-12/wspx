@@ -15,7 +15,7 @@ def lab(tmp_path: Path):  # type: ignore[no-untyped-def]
 
 
 def test_end_to_end_through_the_tool_surface(lab) -> None:  # type: ignore[no-untyped-def]
-    assert call(lab, "info").ok
+    assert call(lab, "arch").ok
     grep = call(lab, "grep", {"expression": "colnorm > 1σ", "in": "L*.mlp.down", "top": 3})
     assert grep.ok
     assert grep.handles[0].startswith("@r1")
@@ -72,18 +72,23 @@ def test_unexpected_failures_come_back_as_results(lab, monkeypatch) -> None:  # 
     def boom(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("kaboom")
 
-    monkeypatch.setattr(lab, "info", boom)
-    result = call(lab, "info")
+    monkeypatch.setattr(lab, "arch", boom)
+    result = call(lab, "arch")
     assert not result.ok
     assert "RuntimeError: kaboom" in result.summary
 
 
-def test_ls_filters_by_layers_alone(lab) -> None:  # type: ignore[no-untyped-def]
-    rows = call(lab, "ls", {"layers": "1"}).data["rows"]
+def test_arch_lists_a_layer_by_its_exact_keys(lab) -> None:  # type: ignore[no-untyped-def]
+    rows = call(lab, "arch", {"scope": "L1"}).data["rows"]
     assert rows
-    assert all(address.startswith("L1.") for address, *_ in rows)
-    downs = call(lab, "ls", {"scope": "L*.mlp.down", "layers": "0-1"}).data["rows"]
-    assert [address for address, *_ in downs] == ["L0.mlp.down", "L1.mlp.down"]
+    assert all(r["key"].startswith("L1.") for r in rows)
+    assert all(r["param"].startswith("model.layers.1.") for r in rows)
+    downs = call(lab, "arch", {"scope": "L0-1.mlp.down"}).data["rows"]
+    # a short name checked against the module tree shows the key it stands for
+    assert [r["key"] for r in downs] == [
+        "L0.mlp.down = L0.mlp.down_proj",
+        "L1.mlp.down = L1.mlp.down_proj",
+    ]
 
 
 def test_attribution_shows_the_requested_number_of_units(lab) -> None:  # type: ignore[no-untyped-def]
@@ -151,7 +156,7 @@ def test_grep_results_are_named_after_their_scope(lab) -> None:  # type: ignore[
     hits = call(lab, "grep", {"expression": "colnorm > 0σ", "in": "L*.mlp.down", "top": 2})
     assert "mlp-down" in hits.handles[0]
     assert "showing the top 2" in hits.summary
-    ranked = call(lab, "grep", {"fires_on": [[1, 2, 3]], "in": "L*.mlp.down", "top": 2})
+    ranked = call(lab, "activations", {"prompts": [[1, 2, 3]], "in": "L*.mlp.down", "top": 2})
     assert "top 2 of 192 cols ranked by mean |activation|" in ranked.summary
     assert " 0 ms" not in ranked.summary
 
@@ -259,10 +264,10 @@ def test_a_merge_that_needs_review_says_why(lab) -> None:  # type: ignore[no-unt
     )
 
 
-def test_ls_leads_with_the_count(lab) -> None:  # type: ignore[no-untyped-def]
-    listed = call(lab, "ls", {"limit": 3})
+def test_arch_scope_leads_with_the_count(lab) -> None:  # type: ignore[no-untyped-def]
+    listed = call(lab, "arch", {"scope": "L*.*", "limit": 3})
     first = listed.summary.splitlines()[0]
-    assert first.startswith(f"{len(listed.data['rows'])} address(es) match")
+    assert first.startswith(f"{len(listed.data['rows'])} tensor(s) match")
     assert "the first 3 are listed" in first
 
 

@@ -64,7 +64,7 @@ class TestGrep:
         u = model.lm_head.weight.detach().float()[5]
         cos = ((w * g[:, None]).T @ u) / ((w * g[:, None]).norm(dim=0) * u.norm())
         best = int(cos.argmax())
-        assert res.hits[0].address == f"L1.mlp.down[:, {best}]"
+        assert res.hits[0].address == f"L1.mlp.down_proj[:, {best}]"  # the exact key
         assert res.hits[0].score == pytest.approx(float(cos.max()), rel=1e-5)
         assert res.candidates == 96
         assert res.axis == "col"

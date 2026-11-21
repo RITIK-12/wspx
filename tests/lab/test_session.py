@@ -46,10 +46,12 @@ NEG = [[1, 9, 2, i] for i in range(60, 72)]
 
 class TestWorkflow:
     def test_grep_contrast_edit_check_commit(self, lab: Lab) -> None:
-        info = lab.info().summary
+        info = lab.arch().summary
         assert "LlamaForCausalLM" in info
         assert "branch exp" in info
-        assert "L0.mlp.down" in lab.ls("L0.*").summary
+        listed = lab.arch("L0").summary
+        assert "L0.mlp.down_proj" in listed
+        assert "L0.mlp.down " not in listed  # each tensor once, by its key
 
         hits = lab.grep("colnorm", scope="L*.mlp.down", top=5, name="big")
         assert hits.handle.startswith("@r1:")

@@ -447,48 +447,43 @@ def steer(text: Annotated[str, typer.Argument()], session: Session = None) -> No
 
 
 @app.command()
-def info(
-    session: Session = None, handles: Annotated[bool, typer.Option("--handles")] = False
-) -> None:
-    """Model outline: blocks, layer types, residual stream, tying, coverage."""
-    _tool(session, "info", {"handles": handles})
-
-
-@app.command()
-def ls(
-    scope: Annotated[str, typer.Argument()] = "L*.*",
+def arch(
+    scope: Annotated[str | None, typer.Argument()] = None,
     session: Session = None,
-    role: Annotated[str | None, typer.Option("--role")] = None,
-    layers: Annotated[str | None, typer.Option("--layers")] = None,
-    limit: Annotated[int, typer.Option("--limit")] = 100,
+    handles: Annotated[bool, typer.Option("--handles")] = False,
+    limit: Annotated[int, typer.Option("--limit")] = 200,
 ) -> None:
-    """List addresses matching a scope."""
-    _tool(session, "ls", {"scope": scope, "role": role, "layers": layers, "limit": limit})
+    """The architecture map; with a scope (L9, a key or glob), the tensors it matches."""
+    _tool(session, "arch", {"scope": scope, "handles": handles, "limit": limit})
 
 
 @app.command()
 def grep(
-    expression: Annotated[str | None, typer.Argument()] = None,
+    expression: Annotated[str, typer.Argument()],
     session: Session = None,
     scope: Annotated[str | None, typer.Option("--in")] = None,
     axis: Annotated[str | None, typer.Option("--axis")] = None,
     top: Annotated[int, typer.Option("--top")] = 20,
     name: Annotated[str | None, typer.Option("--as")] = None,
-    fires_on: Annotated[str | None, typer.Option("--fires-on")] = None,
 ) -> None:
-    """Search weights for units matching an expression (or firing on prompts)."""
+    """Rank weight units by an expression (arithmetic on the weights, no forward pass)."""
     _tool(
         session,
         "grep",
-        {
-            "expression": expression,
-            "in": scope,
-            "axis": axis,
-            "top": top,
-            "name": name,
-            "fires_on": fires_on,
-        },
+        {"expression": expression, "in": scope, "axis": axis, "top": top, "name": name},
     )
+
+
+@app.command()
+def activations(
+    prompts: Annotated[str, typer.Argument(help="A .jsonl prompt file or one prompt.")],
+    session: Session = None,
+    scope: Annotated[str | None, typer.Option("--in")] = None,
+    top: Annotated[int, typer.Option("--top")] = 20,
+    name: Annotated[str | None, typer.Option("--as")] = None,
+) -> None:
+    """Rank the input features of matrices by activation on prompts (runs the model)."""
+    _tool(session, "activations", {"prompts": prompts, "in": scope, "top": top, "name": name})
 
 
 @app.command()

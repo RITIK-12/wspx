@@ -6,22 +6,24 @@ from wspx.tools import TOOLS, anthropic_tools, gemini_tools, mcp_tools, openai_t
 from wspx.tools.schemas import GrepArgs
 
 
-def test_every_tool_from_the_design_is_present() -> None:
-    assert set(TOOLS) == {
-        "info",
-        "ls",
-        "grep",
+def test_tools_come_in_groups_map_first() -> None:
+    groups = [t.description.split("]", 1)[0].lstrip("[") for t in TOOLS.values()]
+    assert list(TOOLS) == [
+        "arch",
         "show",
-        "contrast",
+        "grep",
         "generate",
         "trace",
+        "activations",
+        "contrast",
         "edit",
         "check",
         "test",
         "vcs",
         "export",
         "run",
-    }
+    ]
+    assert groups == ["map"] + ["inspect"] * 2 + ["probe"] * 4 + ["edit"] * 2 + ["keep"] * 4
 
 
 @pytest.mark.parametrize("export", [mcp_tools, anthropic_tools, openai_tools, gemini_tools])

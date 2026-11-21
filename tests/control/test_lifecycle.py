@@ -123,13 +123,13 @@ def test_stop_cancels_a_lab_that_is_starting(tmp_path: Path) -> None:
     assert sid not in m.labs
     assert not backend.runners  # the prewarm did not go on to start the driver
 
-    late = m.tool(sid, "info", {}, source="driver")  # a driver call still in flight
+    late = m.tool(sid, "arch", {}, source="driver")  # a driver call still in flight
     assert not late["ok"]
     assert "stopped" in late["summary"]
     assert backend.labs_started == 1
 
     backend.ready.set()
-    assert m.tool(sid, "info", {}, source="human")["ok"]  # a person can still wake it
+    assert m.tool(sid, "arch", {}, source="human")["ok"]  # a person can still wake it
     assert backend.labs_started == 2
 
 
@@ -138,7 +138,7 @@ def test_calls_queued_behind_a_cancelled_start_do_not_restart_the_lab(tmp_path: 
     sid = m.create(model="m").id
     assert backend.starting.wait(5)
     results: list[Any] = []
-    queued = threading.Thread(target=lambda: results.append(m.tool(sid, "info", {})))
+    queued = threading.Thread(target=lambda: results.append(m.tool(sid, "arch", {})))
     queued.start()
     time.sleep(0.05)  # the call waits on the lab start
     m.stop_lab(sid, "stopped")
@@ -210,7 +210,7 @@ def test_a_failed_start_fails_the_calls_queued_behind_it(tmp_path: Path) -> None
     assert backend.starting.wait(5)
     results: list[Any] = []
     queued = [
-        threading.Thread(target=lambda: results.append(m.tool(sid, "info", {}))) for _ in range(2)
+        threading.Thread(target=lambda: results.append(m.tool(sid, "arch", {}))) for _ in range(2)
     ]
     for t in queued:
         t.start()
@@ -222,7 +222,7 @@ def test_a_failed_start_fails_the_calls_queued_behind_it(tmp_path: Path) -> None
     assert [r["ok"] for r in results] == [False, False]
     assert all("failed to start: no GPU available" in r["summary"] for r in results)
     wait(lambda: m.get(sid).status == "error")
-    assert m.tool(sid, "info", {}, source="human")["ok"] is False  # a new call tries again
+    assert m.tool(sid, "arch", {}, source="human")["ok"] is False  # a new call tries again
     assert backend.labs_started == 2
 
 
@@ -278,7 +278,7 @@ def test_denied_tools_are_refused_for_the_driver_and_recorded(tmp_path: Path) ->
     assert not out["ok"]
     assert "turned off" in out["summary"]
     assert m.tool(record.id, "run", {"script": "a.py"}, source="human")["ok"]
-    assert m.tool(record.id, "info", {}, source="driver")["ok"]
+    assert m.tool(record.id, "arch", {}, source="driver")["ok"]
     calls = [e for e in m.trace.events(record.id) if e["kind"] == "tool_call"]
     assert any(e["payload"]["tool"] == "run" and not e["payload"]["ok"] for e in calls)
     m.start_driver(record.id)
@@ -292,7 +292,7 @@ def test_gpu_time_runs_out_and_stops_the_driver_and_lab(tmp_path: Path) -> None:
     record = m.create(model="x", driver="anthropic:claude-opus-5-5", max_lab_s=600)
     m.lab(record.id)
     m.start_driver(record.id)
-    assert "[GPU time left: 10 min of 10 min]" in m.tool(record.id, "info", {})["summary"]
+    assert "[GPU time left: 10 min of 10 min]" in m.tool(record.id, "arch", {})["summary"]
     assert record.lab_since is not None
     m.tick(now=record.lab_since + 300)
     assert record.id in m.labs

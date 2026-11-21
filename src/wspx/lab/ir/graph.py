@@ -69,6 +69,9 @@ class OpGraph:
     values: dict[int, Value] = field(default_factory=dict)
     inputs: list[int] = field(default_factory=list)
     outputs: list[int] = field(default_factory=list)
+    calls: list[str] = field(default_factory=list)
+    """Module calls in order: modules that own parameters, and the children of module lists
+    (a layer stack). A layer that runs three times appears three times."""
 
     @cached_property
     def consumers(self) -> dict[int, list[tuple[int, int]]]:
@@ -95,6 +98,7 @@ class OpGraph:
             "values": [asdict(v) for v in self.values.values()],
             "inputs": self.inputs,
             "outputs": self.outputs,
+            "calls": self.calls,
         }
 
     @classmethod
@@ -115,7 +119,14 @@ class OpGraph:
             v["id"]: Value(v["id"], tuple(v["shape"]), v["dtype"], v["producer"])
             for v in data["values"]
         }
-        return cls(data["phase"], nodes, values, list(data["inputs"]), list(data["outputs"]))
+        return cls(
+            data["phase"],
+            nodes,
+            values,
+            list(data["inputs"]),
+            list(data["outputs"]),
+            list(data.get("calls", [])),
+        )
 
 
 def compress_indices(indices: list[int]) -> list[list[int]]:

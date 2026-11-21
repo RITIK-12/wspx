@@ -140,7 +140,7 @@ def lab(tmp_path: Path) -> Any:
 
 
 def test_every_reading_tool_takes_image_prompts(lab: Any) -> None:
-    info = call(lab, "info").summary
+    info = call(lab, "arch").summary
     assert "images or video" in info
     assert "scenes (4)" in info
     first, second = {"item": "scenes/0"}, {"item": "scenes/1"}
@@ -161,7 +161,7 @@ def test_every_reading_tool_takes_image_prompts(lab: Any) -> None:
         {"positive": [first, second], "negative": "prompts/scenes.jsonl", "name": "d"},
     )
     assert diff.ok, diff.summary
-    fires = call(lab, "grep", {"fires_on": [first, {"item": "scenes/3"}], "top": 3})
+    fires = call(lab, "activations", {"prompts": [first, {"item": "scenes/3"}], "top": 3})
     assert fires.ok, fires.summary
     assert "fires-on" in fires.summary
 
@@ -332,7 +332,7 @@ def test_prompt_lists_that_arrive_as_strings_are_understood(lab: Any) -> None:
     ]:
         out = call(lab, "contrast", {"positive": positive, "negative": negative, "name": "d"})
         assert out.ok, out.summary
-    fires = call(lab, "grep", {"fires_on": items, "top": 2})
+    fires = call(lab, "activations", {"prompts": items, "top": 2})
     assert fires.ok, fires.summary
     gen = call(lab, "generate", {"prompt": json.dumps({"item": "scenes/0"}), "max_tokens": 2})
     assert gen.ok, gen.summary
@@ -357,11 +357,10 @@ def test_info_counts_the_vision_tower_on_image_prompts(lab: Any) -> None:
     vision = lab.ir.vision_only
     assert vision
     assert all(name.startswith("model.visual.") for name in vision)
-    info = call(lab, "info", {}).summary
+    info = call(lab, "arch", {}).summary
     assert "UNEXERCISED" not in info
     assert "phases prefill, decode, vision" in info
-    assert f"vision tower: {len(vision)} tensors under model.visual.*" in info
-    assert "model.visual" not in info.split("vision tower:")[0]  # not listed as roleless
+    assert f"model.visual ({len(vision)} tensors; read on image prompts only" in info
     hits = call(
         lab, "grep", {"expression": "rownorm", "in": "model.visual.blocks.*.mlp.linear_fc2.weight"}
     )

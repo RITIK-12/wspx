@@ -109,7 +109,7 @@ def test_tools_over_the_api_persist_through_the_journal(tmp_path: Path) -> None:
             assert r.status_code == 200, r.text
             return r.json()
 
-        assert tool("info", {})["ok"]
+        assert tool("arch", {})["ok"]
         grep = tool("grep", {"expression": "colnorm", "in": "L*.mlp.down", "top": 3})
         assert grep["handles"][0].startswith("@r1")
         assert tool("edit", {"op": "ablate", "args": {"targets": "L0.mlp.down[:, 1]"}})["ok"]
@@ -133,7 +133,7 @@ def test_tools_over_the_api_persist_through_the_journal(tmp_path: Path) -> None:
 
         # a cold lab still answers store-served tools
         manager.stop_lab(sid, "test")
-        cold = tool("info", {})
+        cold = tool("arch", {})
         assert cold["data"]["served_by"] == "store"
         assert "lab cold" in cold["summary"]
         warm = tool("show", {"address": "L0.mlp.down[:, 1]"})
@@ -142,7 +142,7 @@ def test_tools_over_the_api_persist_through_the_journal(tmp_path: Path) -> None:
 
 def test_scripted_driver_runs_through_the_control_plane(tmp_path: Path) -> None:
     script = [
-        call("info"),
+        call("arch"),
         call("edit", {"op": "ablate", "args": {"targets": "L1.mlp.down[:, 4]"}}, n=1),
         call("vcs", {"action": "commit", "message": "driver edit"}, n=2),
         done("all done"),
@@ -205,7 +205,7 @@ def test_a_preempted_runner_resumes_over_the_api(tmp_path: Path) -> None:
 
         def target() -> None:
             with contextlib.suppress(Preempted):
-                run_from_env(env, provider=DiesAfter([call("info"), call("edit", edit, n=1)], 2))
+                run_from_env(env, provider=DiesAfter([call("arch"), call("edit", edit, n=1)], 2))
 
         return target
 
@@ -224,7 +224,7 @@ def test_a_preempted_runner_resumes_over_the_api(tmp_path: Path) -> None:
         result = run_from_env(env, provider=provider)  # Modal reruns the same input
         assert (result.status, result.final_text) == ("done", "resumed")
         assert provider.requests[0][0].text.startswith("ablate unit 4")
-        assert len(provider.requests[0]) == 5  # task, info and its result, edit and its result
+        assert len(provider.requests[0]) == 5  # task, arch and its result, edit and its result
         assert any("restarted" in n for n in provider.requests[0][-1].notes)
         repo = Repo(Store(tmp_path / "store"), manager.get(sid).fingerprint)
         (latest, *_) = repo.log(repo.head(sid))
@@ -260,10 +260,10 @@ def test_kill_resume_and_ingest(tmp_path: Path) -> None:
     with client:
         sid = client.post("/api/sessions", json={"model": "tiny"}, headers=USER).json()["id"]
         wait(lambda: sid in manager.labs)
-        r = client.post(f"/api/sessions/{sid}/tools/info", json={"args": {}}, headers=USER).json()
+        r = client.post(f"/api/sessions/{sid}/tools/arch", json={"args": {}}, headers=USER).json()
         hook = {
             "hook_event_name": "PostToolUse",
-            "tool_name": "mcp__wspx__info",
+            "tool_name": "mcp__wspx__arch",
             "tool_response": [{"type": "text", "text": f"… [call {r['call_id']}]"}],
         }
         joined = client.post(
@@ -321,7 +321,7 @@ def test_mcp_endpoint(tmp_path: Path) -> None:
                 "jsonrpc": "2.0",
                 "id": 2,
                 "method": "tools/call",
-                "params": {"name": "info", "arguments": {}},
+                "params": {"name": "arch", "arguments": {}},
             },
             headers=headers,
         ).json()
@@ -420,10 +420,10 @@ def test_each_tool_call_is_counted_once_for_loop_detection(tmp_path: Path) -> No
         sid = client.post("/api/sessions", json={"model": "tiny"}, headers=USER).json()["id"]
         wait(lambda: sid in manager.labs)
         manager.gateway = Gateway()
-        manager.tool(sid, "info", {}, source="driver")
-        assert ("call", "info") not in seen
-        manager.tool(sid, "info", {}, source="mcp")
-        assert seen.count(("call", "info")) == 1
+        manager.tool(sid, "arch", {}, source="driver")
+        assert ("call", "arch") not in seen
+        manager.tool(sid, "arch", {}, source="mcp")
+        assert seen.count(("call", "arch")) == 1
 
 
 def test_lookups_that_miss_between_ones_that_match_are_not_a_loop(tmp_path: Path) -> None:
@@ -452,11 +452,13 @@ def test_lookups_that_miss_between_ones_that_match_are_not_a_loop(tmp_path: Path
         wait(lambda: sid in manager.labs)
         manager.gateway = Gateway()  # type: ignore[assignment]
         for _ in range(4):
-            assert not manager.tool(sid, "ls", {"scope": "no.such.weights*"}, source="driver")["ok"]
-            assert manager.tool(sid, "ls", {"scope": "L0.*"}, source="driver")["ok"]
+            assert not manager.tool(sid, "arch", {"scope": "no.such.weights*"}, source="driver")[
+                "ok"
+            ]
+            assert manager.tool(sid, "arch", {"scope": "L0.*"}, source="driver")["ok"]
         assert actions == []
         for _ in range(3):
-            manager.tool(sid, "ls", {"scope": "no.such.weights*"}, source="driver")
+            manager.tool(sid, "arch", {"scope": "no.such.weights*"}, source="driver")
         assert actions == ["nudge"]
         no_op = {"op": "scale", "args": {"targets": "L0.mlp.down", "factor": 1.0}}
         for _ in range(3):

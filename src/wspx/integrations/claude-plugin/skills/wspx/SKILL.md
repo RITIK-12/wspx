@@ -11,30 +11,49 @@ statistics and handles; heavy computation happens next to the weights.
 
 ## Workflow
 
-1. **info** — see the model: blocks, layer types, residual stream, tying, coverage.
-2. **grep / contrast / trace** — find where a behaviour lives.
-   - `grep 'writes(" Wait") > 0.3' --in 'L*.mlp.down'` ranks the units that write a token.
+The tools come in groups; each description starts with its group.
+
+1. **[map] arch** — read this first. It is compiled when the model loads, from the
+   module tree and a traced forward pass, never guessed: the layer stack, how many
+   times each layer runs (a looped model's shared layers run more than once), the
+   layer types, what sits before and after the stack, experts, routers and the
+   model's config. `arch L9` (or any key or glob) lists those tensors with their
+   kind, shape, input and output axes, expert count and run count.
+2. **[inspect] show / grep** — arithmetic on the weights, no forward pass.
+   - `grep 'writes(" Wait") > 0.3' --in 'L*.mlp.down_proj'` ranks the units that
+     write a token; expert tensors are split per expert.
+3. **[probe] generate / trace / activations / contrast** — these run the model.
+   - `trace` shows the logit lens over each layer's output, top writer units and
+     routes; `--vs` diffs two commits; a reference input gives an attribution
+     "stack trace".
+   - `activations` ranks the input features of matrices by how strongly they fire
+     on prompts.
    - `contrast` builds a direction from two prompt sets and lists its top writers.
-   - `trace` shows the logit lens, top writer units and routes; `--vs` diffs two
-     commits; a reference input gives an attribution "stack trace".
-3. **edit** — stage an op (`project_out`, `ablate`, `scale`, `bake_steer`,
-   `rank_one_write`, `transplant`, …). It is checked statically and numerically
-   before it is staged.
-4. **check** — smoke-check what is staged: KL against the base on a canary,
-   perplexity and degenerate output.
-5. **test** — run suites; use `--vs base` or `--vs <commit>` for paired deltas.
-6. **vcs commit** — commits run check first. Use branches for experiments,
-   `vcs diff`, `vcs revert` (exact) and `vcs bisect` when something regresses.
+4. **[edit] edit / check** — stage an op (`project_out`, `ablate`, `scale`,
+   `bake_steer`, `rank_one_write`, `transplant`, …), checked statically and
+   numerically before it is staged; then `check` it: KL against the base on a
+   canary, perplexity and degenerate output.
+5. **[keep] test / vcs / export** — `test --vs base` for paired deltas; commits
+   run check first. Use branches for experiments, `vcs diff`, `vcs revert`
+   (exact) and `vcs bisect` when something regresses.
 
-## Addresses and handles
+## Keys and handles
 
-- Addresses name weights: `L19.mlp.down[:, 8812]`, `L7.attn.q.h3`,
-  `L12.moe.e5.up`, `embed[" Wait"]`, `L*.mlp.down`, `L8-12.attn.o`. Raw
-  parameter names always work.
+- Every tensor has an exact key from the module tree: `L9.self_attn.o_proj` is
+  layer 9's `self_attn.o_proj.weight` (`L<n>` is the n-th child of the layer
+  stack; `.weight` is dropped, `.bias` is kept). `embed` and `unembed` are the
+  model's input and output embeddings. Outside the stack a key is the parameter
+  name. Raw parameter names and globs (`L*.mlp.experts.*`, `L6-17.*`) always work.
+- Slices pick units: `L9.mlp.down_proj[:, 812]`, `embed[" Wait"]`, and
+  `L9.mlp.experts.down_proj[3]` for expert 3. `L9` alone is the whole layer.
+- Every result names the exact key it touched. Short names such as `L9.mlp.down`
+  are accepted only where `arch` lists them (checked against the module tree).
+- An edit to a layer that runs several times changes every pass, since the passes
+  share the tensor. Probes address passes as `L6@2`.
 - Handles name results: `@r1:<slug>` (result sets), `dir:<name>` (directions),
   `p_…` (patches), `t_…` (traces), commits and branches. Pass handles instead of
-  copying data, e.g. `edit project_out dir:loop L19.mlp.down cols=@r1`.
-- `info --handles` lists every live handle with what it holds. Trust the id,
+  copying data, e.g. `edit project_out dir:loop L19.mlp.down_proj cols=@r1`.
+- `arch --handles` lists every live handle with what it holds. Trust the id,
   not your memory of what it was.
 
 ## Rules

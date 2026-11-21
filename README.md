@@ -54,34 +54,38 @@ result. `wspx sessions export` writes it as `trace.jsonl`, `transcript.md` and
 Every tool the agent has is also a command:
 
 ```bash
-wspx info
-wspx grep 'writes(" Wait") > 0.3' --in 'L*.mlp.down' --top 5
+wspx arch
+wspx arch L19
+wspx grep 'writes(" Wait") > 0.3' --in 'L*.mlp.down_proj' --top 5
 wspx contrast data/loops.jsonl data/clean.jsonl --name loop
-wspx edit project_out direction=dir:loop 'targets=["L15.mlp.down","L19.mlp.down"]' cols=@r1
+wspx edit project_out direction=dir:loop 'targets=["L15.mlp.down_proj","L19.mlp.down_proj"]' cols=@r1
 wspx check
 wspx test --vs base
 wspx vcs commit -m "Project out the loop direction in L15/L19 down_proj"
 ```
 
-| Tool | Does |
-|---|---|
-| `info` | Outline of the model: blocks, layer types, residual stream |
-| `ls` | Addresses matching a scope |
-| `grep` | Ranks weight units by an expression, or by what fires on prompts |
-| `show` | Stats, histogram, spectrum and vocabulary of a slice |
-| `contrast` | A direction from two prompt sets, and its top writers |
-| `generate` | Samples from the current weights |
-| `trace` | Logit lens and top writers; diff (`--vs`) and attribution traces |
-| `edit` | Stages `ablate`, `set`, `scale`, `project_out`, `bake_steer`, `rank_one_write` or `transplant` (`source="base"` restores weights) |
-| `check` | Static, numeric and smoke diagnostics, each with suggested fixes |
-| `test` | Test suites, paired against another revision |
-| `vcs` | `status`, `diff`, `commit`, `log`, `checkout`, `branch`, `revert`, `bisect`, `blame`, `merge` (strategies include `orthogonalize`) |
-| `export` | Merged safetensors, PEFT adapter, GGUF or a portable bundle |
-| `run` | A Python script in the lab, with the SDK loaded |
+| Group | Tool | Does |
+|---|---|---|
+| map | `arch` | The model's map: layer stack, how many times each layer runs, layer types, experts, config; with a scope, its tensors |
+| inspect | `show` | Stats, histogram, spectrum and vocabulary of a slice |
+| inspect | `grep` | Ranks weight units by an expression (no forward pass) |
+| probe | `generate` | Samples from the current weights |
+| probe | `trace` | Logit lens and top writers; diff (`--vs`) and attribution traces |
+| probe | `activations` | Ranks input features by how strongly they fire on prompts |
+| probe | `contrast` | A direction from two prompt sets, and its top writers |
+| edit | `edit` | Stages `ablate`, `set`, `scale`, `project_out`, `bake_steer`, `rank_one_write` or `transplant` (`source="base"` restores weights) |
+| edit | `check` | Static, numeric and smoke diagnostics, each with suggested fixes |
+| keep | `test` | Test suites, paired against another revision |
+| keep | `vcs` | `status`, `diff`, `commit`, `log`, `checkout`, `branch`, `revert`, `bisect`, `blame`, `merge` (strategies include `orthogonalize`) |
+| keep | `export` | Merged safetensors, PEFT adapter, GGUF or a portable bundle |
+| keep | `run` | A Python script in the lab, with the SDK loaded |
 
-Weights are addressed by role, derived from the model's actual computation:
-`L19.mlp.down[:, 8812]`, `L7.attn.q.h3`, `L12.moe.e5.up`, `embed[" Wait"]`.
-Raw parameter names work too. Results come back as handles (`@r1`, `dir:loop`,
+Every tensor has an exact key from the model's module tree: `L19.mlp.down_proj`
+is the `mlp.down_proj.weight` of the layer stack's 19th child, `embed` and
+`unembed` are the input and output embeddings, and anything outside the stack is
+named by its parameter name. Slices pick units (`L19.mlp.down_proj[:, 8812]`,
+`L12.mlp.experts.up_proj[5]` for expert 5, `embed[" Wait"]`), and raw parameter
+names and globs work too. Results come back as handles (`@r1`, `dir:loop`,
 `p_8f2a91c0`) that later commands accept.
 
 ## Claude Code and Codex
@@ -105,9 +109,9 @@ pip install "wspx[lab]"
 import wspx
 
 m = wspx.session("Qwen/Qwen3-0.6B", store="./wspx-store")
-hits = m.grep('writes(" Wait") > 0.3', scope="L*.mlp.down", top=50)
+hits = m.grep('writes(" Wait") > 0.3', scope="L*.mlp.down_proj", top=50)
 d = m.contrast("data/loops.jsonl", "data/clean.jsonl", name="loop")
-p = m.edit.project_out(d, ["L15.mlp.down", "L19.mlp.down"], cols=hits)
+p = m.edit.project_out(d, ["L15.mlp.down_proj", "L19.mlp.down_proj"], cols=hits)
 print(m.check(p).summary())
 print(m.commit("Project out the loop direction"))
 ```
@@ -222,15 +226,15 @@ fetch, code execution, MCP connectors), so an agent only has wspx's tools.
 `wspx new --deny-tool run --max-gpu-time 2h --grace 5m` turns tools off and caps
 GPU time for one session.
 
-## Supported models
+## Models
 
-Any PyTorch model whose forward pass runs. Tested against Llama, Mistral,
-Qwen3, Qwen3-MoE, Qwen3.5, Gemma 3, Gemma 4, Phi-3/Phi-4, OLMo 2, GPT-2,
-Falcon, Mixtral, gpt-oss, DeepSeek-V3, Jamba, Bamba, Mamba, ViT and ResNet, and
-plain MLPs, CNNs, LSTMs and GRUs.
+Any PyTorch model whose forward pass runs. When a model loads, wspx compiles a
+map of it from its module tree and one traced forward pass: the layer stack, how
+many times each layer runs, and every tensor's key, kind, shape and axes. `wspx
+arch` prints it. Nothing in the map is guessed from names or patterns.
 
-Vision-language checkpoints (Qwen3-VL, GLM-4.1V, Qwen3.5, Gemma 3) load with
-their vision tower and processor, and take text, image and video prompts.
+Vision-language checkpoints load with their vision tower and processor, and take
+text, image and video prompts.
 
 ## Development
 

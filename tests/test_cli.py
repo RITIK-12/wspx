@@ -59,7 +59,7 @@ def test_config_roundtrip() -> None:
 
 
 def test_commands_need_a_deployment() -> None:
-    result = runner.invoke(main.app, ["info", "--session", "s_1"])
+    result = runner.invoke(main.app, ["arch", "--session", "s_1"])
     assert result.exit_code != 0
 
 
@@ -161,7 +161,7 @@ def test_init_then_new_takes_defaults_and_files_from_the_project(
     state = cli_config.load()
     assert state.current(str(project.resolve())) == "s_new"
     assert state.current("") == ""
-    assert runner.invoke(main.app, ["info"]).exit_code == 0
+    assert runner.invoke(main.app, ["arch"]).exit_code == 0
     assert fake.calls[-1][0] == "s_new"
 
 
@@ -196,7 +196,7 @@ def test_every_tool_is_a_command_with_every_argument() -> None:
     commands = {c.name or c.callback.__name__: c.callback for c in main.app.registered_commands}  # type: ignore[union-attr]
     assert set(TOOLS) <= set(commands)
     # vcs maps its arguments onto positionals and options per action; grep spells `in` --in
-    mapped = {"vcs": set(), "grep": {"in"}}
+    mapped = {"vcs": set(), "grep": {"in"}, "activations": {"in"}}
     for name, spec in TOOLS.items():
         fields = {f.alias or k for k, f in spec.args.model_fields.items()}
         params = set(inspect.signature(commands[name]).parameters)

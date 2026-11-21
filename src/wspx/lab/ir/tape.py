@@ -187,10 +187,14 @@ class Tape(TorchDispatchMode):  # type: ignore[no-untyped-call]
     @contextmanager
     def recording(self) -> Iterator[Tape]:
         names = {id(m): n for n, m in self._model.named_modules(remove_duplicate=False)}
+        logged = _logged_modules(self._model)
         handles = []
 
         def pre(module: torch.nn.Module, _args: Any) -> None:
-            self._stack.append(names.get(id(module), type(module).__name__))
+            path = names.get(id(module), type(module).__name__)
+            self._stack.append(path)
+            if self.active and id(module) in logged:
+                self.graph.calls.append(path)
 
         def post(_module: torch.nn.Module, _args: Any, _out: Any) -> None:
             if self._stack:
@@ -795,6 +799,17 @@ _VIEW_LIKE = frozenset(
         "alias",
     }
 )
+
+
+def _logged_modules(model: torch.nn.Module) -> set[int]:
+    """Modules whose calls go in the call log: parameter owners and module-list children."""
+    out: set[int] = set()
+    for module in model.modules():
+        if any(True for _ in module.parameters(recurse=False)):
+            out.add(id(module))
+        if isinstance(module, torch.nn.ModuleList | torch.nn.Sequential):
+            out.update(id(child) for child in module.children())
+    return out
 
 
 def is_view_like(name: str) -> bool:

@@ -353,31 +353,39 @@ class Environment:
 
 
 def unit_batches(
-    ir: ModelIR, params: dict[str, torch.Tensor], targets: list[Target], axis: str | None
+    ir: ModelIR,
+    params: dict[str, torch.Tensor],
+    targets: list[Target],
+    axis: str | None,
+    prefer: str | None = None,
 ) -> Iterator[UnitBatch]:
-    """Split each target into units along ``axis`` (default: the role's unit axis)."""
+    """Split each target into units along ``axis``; expert tensors are split per expert first.
+
+    The default axis is fixed by recorded facts (see :func:`_default_axis`); every unit is
+    labelled with the tensor's structural key and its index in the whole tensor.
+    """
     for target in targets:
         weight = params[target.param].detach()
         index = normalize_index(target.index, weight.dim())
-        role = target.role or ir.primary_role(target.param)
-        experts = role is not None and role.experts is not None and isinstance(index[0], slice)
-        if experts:
+        role = ir.primary_role(target.param)
+        experts = role is not None and role.experts is not None
+        if experts and isinstance(index[0], slice):
             count = weight.shape[0]
-            rows = range(*index[0].indices(count))  # type: ignore[union-attr]
-            for e in rows:
+            for e in range(*index[0].indices(count)):
                 sub = Target(target.param, (e, *index[1:]), target.address, target.role)
-                yield from _units(ir, weight, sub, axis, expert=e)
+                yield from _units(ir, weight, sub, axis, prefer, expert=e)
         else:
-            expert = (
-                index[0]
-                if isinstance(index[0], int) and role is not None and role.experts
-                else None
-            )
-            yield from _units(ir, weight, target, axis, expert=expert)
+            expert = index[0] if experts and isinstance(index[0], int) else None
+            yield from _units(ir, weight, target, axis, prefer, expert=expert)
 
 
 def _units(
-    ir: ModelIR, weight: torch.Tensor, target: Target, axis: str | None, expert: int | None
+    ir: ModelIR,
+    weight: torch.Tensor,
+    target: Target,
+    axis: str | None,
+    prefer: str | None,
+    expert: int | None,
 ) -> Iterator[UnitBatch]:
     index = normalize_index(target.index, weight.dim())
     block = select(weight, index).float()
@@ -386,12 +394,11 @@ def _units(
         block = block.reshape(1)
         free = [0]
     if axis is None:
-        axis = _default_axis(ir, target, free)
-    role = target.role or ir.primary_role(target.param)
-    base = role.address if role is not None and target.role is not None else target.param
-    if expert is not None and ".experts." in base:
-        base = base.replace(".experts.", f".e{expert}.")
+        axis = _default_axis(ir, target, free, prefer)
+    key = ir.key_of(target.param)
+    lead = f"{expert}, " if expert is not None else ""
     if axis == "tensor":
+        label = f"{key}[{expert}]" if expert is not None else key
         yield UnitBatch(
             target,
             expert,
@@ -399,7 +406,7 @@ def _units(
             [0],
             "tensor",
             whole=block,
-            addresses=[base],
+            addresses=[label],
             globals=[0],
         )
         return
@@ -416,35 +423,50 @@ def _units(
     size = weight.shape[unit_dim]
     sel = index[unit_dim]
     globals_ = list(range(*sel.indices(size))) if isinstance(sel, slice) else list(sel)  # type: ignore[arg-type]
-    view = list(range(size))
-    if target.role is not None:
-        rsel = ir._role_index(target.role)[unit_dim]
-        view = list(range(*rsel.indices(size))) if isinstance(rsel, slice) else list(rsel)  # type: ignore[arg-type]
-    position = {g: i for i, g in enumerate(view)}
-    locals_ = [position.get(g, g) for g in globals_]
-    in_view = target.role is not None and all(g in position for g in globals_)
-    name = base if in_view else target.param
-    pick = locals_ if in_view else globals_
-    addresses = (
-        [f"{name}[{u}]" for u in pick]
-        if axis in ("row", "elem")
-        else [f"{name}[:, {u}]" for u in pick]
-    )
+    if axis in ("row", "elem"):
+        addresses = [f"{key}[{lead}{u}]" for u in globals_]
+    else:
+        addresses = [f"{key}[{lead}:, {u}]" for u in globals_]
     yield UnitBatch(
-        target, expert, vectors, pick, axis, whole=block, addresses=addresses, globals=globals_
+        target, expert, vectors, globals_, axis, whole=block, addresses=addresses, globals=globals_
     )
 
 
-def _default_axis(ir: ModelIR, target: Target, free: list[int]) -> str:
-    role = target.role or ir.primary_role(target.param)
-    if len(free) != 2 or role is None or role.in_dim is None or role.out_dim is None:
-        return "row" if len(free) == 2 else ("elem" if len(free) == 1 else "tensor")
-    writes_residual = role.kind in ("writer", "embed", "pos_embed", "stem") or (
-        role.kind == "expert" and role.address.endswith(".down")
-    )
-    unit_dim = role.in_dim if writes_residual else role.out_dim
-    if role.kind in ("embed", "unembed", "pos_embed"):
-        unit_dim = 0 if role.kind != "unembed" else role.out_dim
+def _default_axis(ir: ModelIR, target: Target, free: list[int], prefer: str | None = None) -> str:
+    """The unit axis, from facts only.
+
+    ``writes(...)`` scores what each input feature writes: vectors along the output axis the
+    op recorded. ``reads(...)`` scores what each output feature reads: vectors along the input
+    axis. Otherwise a matrix whose output is the model width (and input is not) is split
+    into its input features (what each neuron writes); any other matrix into output features.
+    Embedding tables are split into token rows, the unembedding into vocabulary rows.
+    """
+    if len(free) != 2:
+        return "elem" if len(free) == 1 else ("tensor" if not free else "row")
+    role = ir.primary_role(target.param)
+    shape = ir.params[ir.canonical(target.param)].shape
+    hidden = ir.structure.get("hidden")
+    if role is not None and role.kind in ("embed", "pos_embed"):
+        unit_dim = 0
+    elif role is not None and role.kind == "unembed" and role.out_dim is not None:
+        unit_dim = role.out_dim
+    elif role is not None and role.in_dim is not None and role.out_dim is not None:
+        if prefer == "writes":
+            unit_dim = role.in_dim
+        elif prefer == "reads":
+            unit_dim = role.out_dim
+        elif hidden and shape[role.out_dim] == hidden and shape[role.in_dim] != hidden:
+            unit_dim = role.in_dim
+        else:
+            unit_dim = role.out_dim
+    elif prefer is not None and hidden:
+        # no recorded contraction: the axis whose vectors are width-long
+        a, b = free
+        unit_dim = a if shape[b] == hidden else b
+    else:
+        unit_dim = free[0]
+    if unit_dim not in free:
+        return "row"
     return "col" if free.index(unit_dim) == 1 else "row"
 
 
@@ -693,8 +715,9 @@ def grep(
     tree = parse(expression)
     key = ranking_key(tree)
     boolean = _is_boolean(tree)
-    if axis is None:  # colnorm and rownorm name their axis; readers default to rows otherwise
-        names = set(re.findall(r"[a-z]+", expression))
+    names = set(re.findall(r"[a-z]+", expression))
+    prefer = "writes" if "writes" in names else "reads" if "reads" in names else None
+    if axis is None:  # colnorm and rownorm name their axis
         axis = "col" if "colnorm" in names else "row" if "rownorm" in names else None
     started = time.perf_counter()
     skipped: list[str] = []
@@ -705,7 +728,7 @@ def grep(
         every block of a wide scope at once and ran out of memory)."""
         for target in targets:
             try:
-                yield from unit_batches(env.ir, env.params, [target], axis)
+                yield from unit_batches(env.ir, env.params, [target], axis, prefer)
             except GrepError:
                 if lone:
                     raise

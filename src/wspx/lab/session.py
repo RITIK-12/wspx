@@ -302,12 +302,18 @@ class Lab:
 
     # ------------------------------------------------------------------ info / ls
 
-    def info(self, *, handles: bool = False) -> ToolResult:
+    def arch(
+        self, scope: str | None = None, *, handles: bool = False, limit: int = 200
+    ) -> ToolResult:
+        """The architecture map; with a scope, the tensors it matches and their facts."""
+        if scope:
+            return self._arch_scope(scope, limit)
         head = self.repo.head(self.session)
         branch = self.repo.current_branch(self.session) or "(detached)"
         lines = [
             self.ir.render_info(),
-            f"branch {branch} · HEAD {short(head) if head else '(base)'} · {len(self.staged)} staged patch(es)",
+            f"branch {branch} · HEAD {short(head) if head else '(base)'} · "
+            f"{len(self.staged)} staged patch(es)",
         ]
         if self.text.media is not None:
             lines.append(
@@ -326,37 +332,52 @@ class Lab:
         if handles:
             lines.append("handles:\n" + self.handles.table(limit=200))
         return ToolResult(
-            "\n".join(lines), {"summary": self.ir.summary(), "branch": branch, "head": head}
+            "\n".join(lines),
+            {"summary": self.ir.summary(), "branch": branch, "head": head},
         )
 
-    def ls(
-        self,
-        scope: str = "L*.*",
-        *,
-        role: str | None = None,
-        layers: str | None = None,
-        limit: int = 100,
-    ) -> ToolResult:
-        if role is not None or layers is not None:
-            head, _, rest = scope.partition(".") if scope.startswith("L") else ("L*", "", "*")
-            scope = f"L{layers or head[1:]}.{role or rest or '*'}"
+    def _arch_scope(self, scope: str, limit: int) -> ToolResult:
+        if re.fullmatch(r"L[\d*,\-]+", scope):
+            scope += ".*"  # a layer (or range) on its own: everything in it
         targets = self.resolve(scope)
         rows = []
         for t in targets:
             info = self.ir.params[t.param]
             shape = tuple(select(torch.empty(info.shape, device="meta"), t.index).shape)
-            kind = t.role.kind if t.role else "param"
-            rows.append((t.address, kind, t.param, shape, info.dtype))
-        if not rows:
-            return ToolResult("(nothing matches)", {"rows": []})
+            role = self.ir.primary_role(t.param)
+            key = self.ir.key_of(t.param)
+            name = key if t.address in (key, t.param) else f"{t.address} = {key}"
+            facts = []
+            if role is not None and role.in_dim is not None:
+                facts.append(f"in {role.in_dim} · out {role.out_dim}")
+            if role is not None and role.experts:
+                facts.append(f"{role.experts} experts on dim 0")
+            runs = self.ir.runs_of(t.param)
+            if runs > 1:
+                facts.append(f"runs {runs}×")
+            rows.append(
+                {
+                    "key": name,
+                    "kind": role.kind if role is not None else "param",
+                    "shape": list(shape),
+                    "dtype": info.dtype,
+                    "facts": " · ".join(facts),
+                    "param": t.param,
+                }
+            )
         # the count leads, so output budgets that trim the end never hide it
-        head = f"{len(rows)} address(es) match {scope}" + (
+        head = f"{len(rows)} tensor(s) match {scope}" + (
             f"; the first {limit} are listed (narrow the scope or raise limit)"
             if len(rows) > limit
             else ""
         )
-        lines = [f"{a:<28} {k:<9} {tuple(s)!s:<16} {d:<9} {p}" for a, k, p, s, d in rows[:limit]]
-        return ToolResult("\n".join([head, *lines]), {"rows": [list(r[:3]) for r in rows]})
+        lines = [
+            f"{r['key']}  {r['kind']}  {tuple(r['shape'])!s}  {r['dtype']}"
+            + (f"  {r['facts']}" if r["facts"] else "")
+            + (f"  {r['param']}" if r["param"] not in r["key"] else "")
+            for r in rows[:limit]
+        ]
+        return ToolResult("\n".join([head, *lines]), {"rows": rows})
 
     # ------------------------------------------------------------------ grep
 
@@ -368,24 +389,38 @@ class Lab:
         axis: str | None = None,
         top: int = DEFAULT_TOP,
         name: str | None = None,
-        fires_on: Sequence[Prompt] | str | None = None,
+    ) -> GrepHits:
+        """Rank weight units by an expression: arithmetic on the weights, no forward pass."""
+        if not expression:
+            raise GrepError("grep needs an expression")
+        if scope is None:
+            scope = _default_scope(expression)
+        env = Environment(
+            self.ir, dict(self.params), token_id=self._token_or_id, direction=self.direction
+        )
+        result = grep(env, expression, self.resolve(scope), axis=axis)
+        return self._register_hits(result, ("grep", _scope_label(scope)), name, top)
+
+    def activations(
+        self,
+        prompts: Sequence[Prompt] | str,
+        *,
+        scope: str | None = None,
+        top: int = DEFAULT_TOP,
+        name: str | None = None,
+    ) -> GrepHits:
+        """Rank the input features of matrices by mean |activation| on prompts (runs the model)."""
+        result = self._activation_grep(self._prompts(prompts), scope)
+        return self._register_hits(result, ("fires-on", _scope_label(scope)), name, top)
+
+    def _register_hits(
+        self, result: GrepResult, slug: tuple[str, str], name: str | None, top: int
     ) -> GrepHits:
         top = max(1, min(int(top), MAX_TOP))
-        if fires_on is not None:
-            result = self._activation_grep(self._prompts(fires_on), scope)
-        else:
-            if not expression:
-                raise GrepError("grep needs an expression or --fires-on prompts")
-            if scope is None:
-                scope = _default_scope(expression)
-            env = Environment(
-                self.ir, dict(self.params), token_id=self._token_or_id, direction=self.direction
-            )
-            result = grep(env, expression, self.resolve(scope), axis=axis)
         entry = self.handles.register_result(
             (
-                result.expression.split(" ")[0] if fires_on is None else "fires-on",
-                _scope_label(scope),
+                result.expression.split(" ")[0] if slug[0] == "grep" else slug[0],
+                slug[1],
             ),
             name=name,
             description=(
@@ -407,13 +442,42 @@ class Lab:
         return token if isinstance(token, int) else self._token_id(token)
 
     def _activation_grep(self, prompts: list[Prompt], scope: str | None) -> GrepResult:
-        """Writer units ranked by mean |activation| over the prompts' tokens."""
+        """Input features of 2-D matrices ranked by mean |activation| over the prompts' tokens.
+
+        A unit is one input feature: the module's input, which a matrix contracts along its
+        recorded input axis. Tensors in the scope that are not such matrices are listed as
+        skipped, never dropped silently. Without a scope: every matrix whose output is the
+        model width (what each neuron writes).
+        """
         from wspx.lab.probe import writer_units
 
-        params = [t.param for t in self.resolve(scope)] if scope else writer_units(self.ir)
-        units = [p for p in params if p in writer_units(self.ir)]
+        params = (
+            list(dict.fromkeys(t.param for t in self.resolve(scope)))
+            if scope
+            else writer_units(self.ir)
+        )
+        units: list[str] = []
+        skipped: list[str] = []
+        for param in params:
+            role = self.ir.primary_role(param)
+            if (
+                len(self.ir.params[param].shape) == 2
+                and role is not None
+                and role.in_dim is not None
+            ):
+                units.append(param)
+            else:
+                why = (
+                    f"{role.experts} experts in one tensor"
+                    if role is not None and role.experts
+                    else "not a 2-D matrix that an op contracts"
+                )
+                skipped.append(f"{self.ir.key_of(param)} ({why})")
         if not units:
-            raise GrepError("--fires-on ranks writer units; the scope has none")
+            raise GrepError(
+                "activations ranks the input features of 2-D matrices; the scope has none"
+                + (f" (skipped: {', '.join(skipped[:5])})" if skipped else "")
+            )
         started = time.perf_counter()
         size = analysis.MEDIA_BATCH if any(is_media(p) for p in prompts) else 16
         totals: dict[str, torch.Tensor] = {}
@@ -426,14 +490,29 @@ class Lab:
             m = mask.unsqueeze(-1).float()
             count += float(m.sum())
             for param in units:
+                if param not in cap.units:
+                    continue  # the module did not run on these prompts
                 part = (cap.units[param].float().abs() * m).sum((0, 1))
                 totals[param] = totals[param] + part if param in totals else part
         scores: list[Hit] = []
         for param in units:
             role = self.ir.primary_role(param)
+            assert role is not None
+            assert role.in_dim is not None
+            width = self.ir.params[param].shape[role.in_dim]
+            key = self.ir.key_of(param)
+            if param not in totals:
+                skipped.append(f"{key} (did not run on these prompts)")
+                continue
+            if totals[param].numel() != width:
+                skipped.append(f"{key} (its module's input is not its {width} input features)")
+                continue
             mean = (totals[param] / count).tolist()
-            addr = role.address if role else param
-            scores.extend(Hit(f"{addr}[:, {j}]", param, None, j, s) for j, s in enumerate(mean))
+            cols = role.in_dim == 1
+            scores.extend(
+                Hit(f"{key}[:, {j}]" if cols else f"{key}[{j}]", param, None, j, s)
+                for j, s in enumerate(mean)
+            )
         scores.sort(key=lambda h: -h.score)
         return GrepResult(
             f"mean |activation| on {len(prompts)} prompt(s)",
@@ -443,6 +522,7 @@ class Lab:
             scores,
             scores,
             seconds=time.perf_counter() - started,
+            skipped=skipped,
         )
 
     def _prompts(self, value: Sequence[Prompt] | Prompt) -> list[Prompt]:

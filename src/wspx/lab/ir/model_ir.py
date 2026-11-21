@@ -31,6 +31,7 @@ from wspx.addressing import (
 from wspx.errors import AddressError
 from wspx.lab.ir.graph import OpGraph, expand_runs
 from wspx.lab.ir.semantics import Role, Semantics
+from wspx.lab.ir.structure import strip_weight
 
 Selector = int | slice | list[int]
 
@@ -94,8 +95,9 @@ HandleLookup = Callable[[Handle, str], list[int]]
 """(handle, parameter) → unit indices along the tensor dim being narrowed."""
 
 
-IR_VERSION = 2
-"""Bumped when capture changes what an IR records; older cached IRs are rebuilt."""
+IR_VERSION = 3
+"""Bumped when capture changes what an IR records; older cached IRs are rebuilt.
+3: the deterministic structure (layer stack, loops, structural keys, per-tensor facts)."""
 
 
 class ModelIR:
@@ -113,6 +115,7 @@ class ModelIR:
         vocab_size: int | None = None,
         labels: dict[int, str] | None = None,
         capture: dict[str, Any] | None = None,
+        structure: dict[str, Any] | None = None,
     ) -> None:
         self.fingerprint = fingerprint
         self.arch = arch
@@ -125,6 +128,8 @@ class ModelIR:
         self.vocab_size = vocab_size
         self.labels = labels or {}
         self.capture = capture or {}
+        self.structure = structure or {}
+        """Read off the module tree and the call log (see ``structure.py``)."""
         self._alias = {a: p.name for p in params.values() for a in p.aliases}
         self._by_param: dict[str, list[Role]] = defaultdict(list)
         for role in semantics.roles:
@@ -134,6 +139,19 @@ class ModelIR:
 
     def canonical(self, name: str) -> str:
         return self._alias.get(name, name)
+
+    def key_of(self, param: str) -> str:
+        """A tensor's structural key (``L9.self_attn.o_proj``), or its name without one."""
+        name = self.canonical(param)
+        return str(self.structure.get("keys", {}).get(name, name))
+
+    def runs_of(self, param: str) -> int:
+        """How many times the layer holding this tensor runs per forward pass (1 outside it)."""
+        stack = self.structure.get("stack")
+        layer = self.structure.get("layer_of", {}).get(self.canonical(param))
+        if stack is None or layer is None:
+            return 1
+        return int(stack["runs"][layer]) or 1
 
     def roles_of(self, param: str) -> list[Role]:
         return list(self._by_param.get(self.canonical(param), []))
@@ -217,7 +235,17 @@ class ModelIR:
 
         direct = [r for r in in_range if fnmatch.fnmatchcase(rest(r), pattern)]
         if direct:
-            return self._from_roles(_dedupe_globbed(direct) if addr.has_glob else direct)
+            return self._from_roles(self._dedupe_glob(direct) if addr.has_glob else direct)
+        if not addr.has_glob:
+            # A key naming a module (L6, L9.self_attn) is every tensor under it.
+            under = [
+                r
+                for r in in_range
+                if r.address == self.key_of(r.param)
+                and (not pattern or rest(r).startswith(pattern + "."))
+            ]
+            if under:
+                return self._from_roles(under)
 
         # Sub-selectors: expert (e5), head (h3) and recurrent gate (forget).
         parts = list(addr.path)
@@ -267,6 +295,14 @@ class ModelIR:
                 index[0] = list(range(k * size, (k + 1) * size))
             targets.append(Target(role.param, tuple(index), str(addr.with_slice(None)), role))
         return targets
+
+    def _dedupe_glob(self, roles: list[Role]) -> list[Role]:
+        """A glob selects each tensor once, by its structural key: short names (and their
+        sub-selections) of a tensor the glob already covers by key are dropped."""
+        keyed = {r.param for r in roles if r.address == self.key_of(r.param)}
+        return _dedupe_globbed(
+            [r for r in roles if r.address == self.key_of(r.param) or r.param not in keyed]
+        )
 
     def _select_head(
         self, addr: Address, role: Role, info: ParamInfo, index: list[Selector], head: int
@@ -375,20 +411,23 @@ class ModelIR:
     # ------------------------------------------------------------------ summary
 
     def layer_types(self) -> list[tuple[str, str]]:
-        """Compressed block layout, e.g. ``[("0-23", "attn+mlp"), ("24-31", "ssm+mlp")]``."""
+        """Layers grouped by structure, e.g. ``[("L0-4, L6-10", "SlidingDecoderLayer"), …]``."""
+        stack = self.structure.get("stack")
+        if stack:
+            return [(_layers_text(v["layers"]), v["class"]) for v in stack["variants"]]
         kinds = [("+".join(b.branches) or "?") for b in self.semantics.blocks]
         out: list[tuple[str, str]] = []
         start = 0
         for i in range(1, len(kinds) + 1):
             if i == len(kinds) or kinds[i] != kinds[start]:
-                span = str(start) if i - 1 == start else f"{start}-{i - 1}"
-                out.append((span, kinds[start]))
+                out.append((_layers_text(list(range(start, i))), kinds[start]))
                 start = i
         return out
 
     def summary(self) -> dict[str, Any]:
         total = sum(p.numel for p in self.params.values())
         exercised = sum(1 for c in self.coverage.values() if c.exercised)
+        stack = self.structure.get("stack")
         return {
             "arch": self.arch,
             "fingerprint": self.fingerprint,
@@ -396,6 +435,9 @@ class ModelIR:
             "numel": total,
             "blocks": self.num_blocks,
             "layers": self.layer_types(),
+            "stack": stack["path"] if stack else None,
+            "runs": stack["segments"] if stack else None,
+            "hidden": self.structure.get("hidden"),
             "embed": self.semantics.embed,
             "unembed": self.semantics.unembed,
             "tied": self.semantics.tied,
@@ -411,39 +453,165 @@ class ModelIR:
         }
 
     def render_info(self) -> str:
+        """The architecture map, read off the module tree and the call log (``arch``)."""
         s = self.summary()
+        st = self.structure
         dtypes = sorted({p.dtype for p in self.params.values()})
+        width = f" · width {st['hidden']}" if st.get("hidden") else ""
         lines = [
-            f"{self.arch} · {_human(s['numel'])} params in {s['params']} tensors · {', '.join(dtypes)}",
+            f"{self.arch} · {_human(s['numel'])} params in {s['params']} tensors · "
+            f"{', '.join(dtypes)}{width}",
             f"fingerprint {self.fingerprint[:23]}…",
         ]
-        if s["layers"]:
-            layout = ", ".join(f"L{span}: {kind}" for span, kind in s["layers"])
-            lines.append(f"{s['blocks']} blocks on a residual stream: {layout}")
+        stack = st.get("stack")
+        if stack:
+            lines.extend(self._render_stack(stack))
+        elif self.semantics.blocks:
+            layout = ", ".join(f"{span}: {kind}" for span, kind in s["layers"])
+            lines.append(f"{s['blocks']} blocks (inferred from the traced graph): {layout}")
         else:
-            lines.append(f"{s['blocks']} layers, no residual stream")
-        if s["embed"] or s["unembed"]:
-            tie = " (tied)" if s["tied"] else ""
-            lines.append(f"embed {s['embed']} · unembed {s['unembed']}{tie}")
-        lines.append(f"coverage {s['coverage']} params exercised · phases {', '.join(s['phases'])}")
+            lines.append("no layer stack in the module tree; keys are parameter names")
+        lines.extend(self._render_ends())
+        lines.extend(self._render_experts())
         if s["unexercised"]:
             lines.append(
                 f"UNEXERCISED ({len(s['unexercised'])}): {', '.join(s['unexercised'][:8])}"
             )
-        vision = set(s["vision_only"])
-        if vision:
+        lines.append(
+            f"coverage {s['coverage']} tensors exercised · phases {', '.join(s['phases'])}"
+        )
+        config = st.get("config") or {}
+        if config:
+            entries = " · ".join(f"{k}={_config_value(v)}" for k, v in config.items())
+            lines.append(f"config: {entries}")
+        lines.extend(f"note: {n}" for n in self.semantics.notes)
+        layer_of = st.get("layer_of", {})
+        example = next((n for n in self.params if n in layer_of and n.endswith(".weight")), None)
+        if example is not None:
             lines.append(
-                f"vision tower: {len(vision)} tensors under {_common_prefix(sorted(vision))}*, "
-                "read on image prompts only. They sit before the language model's residual "
-                "stream, so they have no roles there; edit or grep them by raw parameter name"
+                f"keys: {self.key_of(example)} = {example} · raw names and globs work too · "
+                "slices like [:, 5] or [3] (expert 3)"
             )
-        unassigned = [n for n in s["unassigned"] if n not in vision]
-        if unassigned:
-            lines.append(f"no role ({len(unassigned)}): {', '.join(unassigned[:8])}")
-        example = next((r.address for r in self.roles if r.kind == "writer"), None)
-        if example:
-            lines.append(f"addresses look like {example} · raw parameter names always work")
+        aliases = sorted(
+            {
+                r.address.split(".", 1)[1]
+                for r in self.roles
+                if r.block is not None and "." in r.address and r.address != self.key_of(r.param)
+            }
+        )
+        if aliases:
+            lines.append(
+                "short names checked against the module tree also work: "
+                + ", ".join(f"L<n>.{a}" for a in aliases[:12])
+                + (" …" if len(aliases) > 12 else "")
+            )
         return "\n".join(lines)
+
+    def _render_stack(self, stack: dict[str, Any]) -> list[str]:
+        n = stack["size"]
+        where = stack["path"] or "(the model itself)"
+        lines = [f"layer stack: {where} · {n} layers, L0-L{n - 1}"]
+        order = ", ".join(_span(a, b) for a, b in stack["order"])
+        lines.append(f"run order: {order} · {stack['calls']} layer calls per forward pass")
+        for a, b, times in stack["segments"]:
+            if times > 1:
+                lines.append(
+                    f"  {_span(a, b)} run {times} times with the same weights: an edit there "
+                    f"changes every pass; their activations are {_span(a, b)}@1…@{times}"
+                )
+            elif times == 0:
+                lines.append(f"  {_span(a, b)} did not run in the traced pass")
+        lines.append("layer types (arch L<n> lists one layer's tensors):")
+        for i, v in enumerate(stack["variants"]):
+            label = chr(ord("A") + i) if i < 26 else str(i)
+            lines.append(
+                f"  {label}  {_layers_text(v['layers'])} · {v['class']} · "
+                f"{len(v['tensors'])} tensors"
+            )
+        return lines
+
+    def _render_ends(self) -> list[str]:
+        st = self.structure
+        lines: list[str] = []
+
+        def named(param: str) -> str:
+            info = self.params[param]
+            key = self.key_of(param)
+            shape = "×".join(map(str, info.shape))
+            return (
+                f"{key} ({param}, {shape})"
+                if key != (strip_weight(param) or param)
+                else f"{key} ({shape})"
+            )
+
+        before = [*([st["embed"]] if st.get("embed") else []), *st.get("pos_embed", [])]
+        before += st.get("stem", [])
+        if before:
+            lines.append("before the stack: " + ", ".join(named(p) for p in before[:8]))
+        after = [p for p in st.get("final", []) if p not in st.get("final_norm_params", [])]
+        tail = [named(p) for p in after[:6]]
+        if st.get("final_norm"):
+            tail.append(f"final norm {st['final_norm']}")
+        if st.get("tied"):
+            tail.append("unembed (tied: the same tensor as embed)")
+        elif st.get("unembed"):
+            tail.append(named(st["unembed"]))
+        if tail:
+            lines.append("after the stack: " + ", ".join(tail))
+        placed = set(st.get("layer_of", {})) | set(before) | set(st.get("final", []))
+        placed |= {st.get("unembed")}
+        # Group the rest by where its path branches off the layer stack's path
+        # (model.visual beside model.language_model.layers), else by owning module.
+        others = {o["path"]: o for o in st.get("others", [])}
+        stack = st.get("stack")
+        base = stack["path"].split(".") if stack and stack["path"] else []
+        rest: dict[str, list[str]] = defaultdict(list)
+        for name, info in self.params.items():
+            if name in placed:
+                continue
+            parts = name.split(".")
+            shared = 0
+            while shared < min(len(base), len(parts) - 1) and parts[shared] == base[shared]:
+                shared += 1
+            group = ".".join(parts[: shared + 1]) if stack else (info.module or name)
+            rest[group].append(name)
+        vision = set(self.vision_only)
+        if rest:
+            parts = []
+            for prefix, names in sorted(rest.items()):
+                count = len(names)
+                inner = [o for p, o in others.items() if p.startswith(prefix + ".")]
+                notes = [f"{count} tensor{'s' if count != 1 else ''}"]
+                if vision and all(n in vision for n in names):
+                    notes.append("read on image prompts only")
+                if inner:
+                    notes.append(f"its own stack {inner[0]['path']}, {inner[0]['size']} layers")
+                parts.append(f"{prefix} ({'; '.join(notes)})")
+            lines.append("other modules (keys are their parameter names): " + ", ".join(parts))
+        return lines
+
+    def _render_experts(self) -> list[str]:
+        experts: dict[str, set[int]] = defaultdict(set)
+        counts: dict[str, int] = {}
+        routers: dict[str, set[int]] = defaultdict(set)
+        for role in self.roles:
+            if role.block is None or role.address != self.key_of(role.param):
+                continue
+            rel = role.address.split(".", 1)[1] if "." in role.address else ""
+            if role.kind == "expert" and role.experts:
+                experts[rel].add(role.block)
+                counts[rel] = role.experts
+            elif role.kind == "router":
+                routers[rel].add(role.block)
+        lines = []
+        for rel, layers in sorted(experts.items()):
+            lines.append(
+                f"experts: L*.{rel} holds {counts[rel]} experts on dim 0 "
+                f"(in {_layers_text(sorted(layers))}); L<n>.{rel}[e] is expert e"
+            )
+        for rel, layers in sorted(routers.items()):
+            lines.append(f"router: L*.{rel} (in {_layers_text(sorted(layers))})")
+        return lines
 
     # ------------------------------------------------------------------ io
 
@@ -460,6 +628,7 @@ class ModelIR:
             "vocab_size": self.vocab_size,
             "labels": {str(k): v for k, v in self.labels.items()},
             "capture": self.capture,
+            "structure": self.structure,
             "graphs": {k: g.to_dict() for k, g in self.graphs.items()} if with_graphs else {},
         }
 
@@ -489,6 +658,7 @@ class ModelIR:
             vocab_size=data.get("vocab_size"),
             labels={int(k): v for k, v in data.get("labels", {}).items()},
             capture=data.get("capture", {}),
+            structure=data.get("structure", {}),
         )
 
 
@@ -550,3 +720,29 @@ def _common_prefix(names: list[str]) -> str:
             break
         shared.append(column[0])
     return ".".join(shared) + "." if shared else ""
+
+
+def _span(a: int, b: int) -> str:
+    return f"L{a}" if a == b else f"L{a}-{b}"
+
+
+def _layers_text(layers: list[int]) -> str:
+    """``[1, 2, 3, 4, 18, 19]`` → ``L1-4, L18-19``."""
+    runs: list[list[int]] = []
+    for i in layers:
+        if runs and runs[-1][1] == i - 1:
+            runs[-1][1] = i
+        else:
+            runs.append([i, i])
+    return ", ".join(_span(a, b) for a, b in runs)
+
+
+def _config_value(value: Any) -> str:
+    if isinstance(value, list) and value and all(isinstance(v, int) for v in value):
+        ints = [int(v) for v in value]
+        if ints == sorted(set(ints)) and len(ints) > 3:
+            return "[" + _layers_text(ints).replace("L", "") + "]"
+        return "[" + ",".join(map(str, ints)) + "]"
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)

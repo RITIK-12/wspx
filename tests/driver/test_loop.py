@@ -231,7 +231,7 @@ def test_denied_tools_are_not_offered() -> None:
     start = next(e for e in runner.hooks.events if e["type"] == "start")  # type: ignore[attr-defined]
     assert "run" not in start["tools"]
     assert "export" not in start["tools"]
-    assert "info" in start["tools"]
+    assert "arch" in start["tools"]
 
 
 def test_the_runner_reads_denied_tools_from_its_environment(

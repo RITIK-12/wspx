@@ -73,7 +73,7 @@ lab = [
     "starlette>=1.10",
     "torch>=2.15",
     "torchvision",
-    "transformers>=5.23",
+    "transformers>=5.24",
     "uvicorn>=0.54",
 ]
 peft = ["peft>=0.22"]

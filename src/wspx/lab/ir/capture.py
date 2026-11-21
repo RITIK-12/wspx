@@ -20,7 +20,8 @@ import torch
 from wspx.errors import ModelLoadError
 from wspx.lab.ir.graph import OpGraph
 from wspx.lab.ir.model_ir import Coverage, ModelIR, ParamInfo
-from wspx.lab.ir.semantics import RecurrentLayout, derive
+from wspx.lab.ir.semantics import RecurrentLayout, Semantics, derive
+from wspx.lab.ir.structure import build_structure, structural_semantics
 from wspx.lab.ir.tape import Tape, _iter_tensors
 from wspx.lab.tensors import dtype_name, tensor_hash
 
@@ -124,7 +125,19 @@ def build_ir(
     main = graphs.get("prefill") or graphs["forward"]
     shapes = {name: info.shape for name, info in params.items()}
     module_of = {name: info.module for name, info in params.items()}
-    semantics = derive(main, shapes, module_of=module_of, recurrent=recurrent)
+    try:
+        traced = derive(main, shapes, module_of=module_of, recurrent=recurrent)
+    except Exception as exc:  # the structure below does not depend on it
+        traced = Semantics(notes=[f"the traced graph gave no short names ({type(exc).__name__})"])
+    structure = build_structure(
+        model,
+        params,
+        canonical,
+        graphs,
+        fallback_embed=traced.embed,
+        fallback_unembed=traced.unembed,
+    )
+    semantics = structural_semantics(traced, structure, params)
 
     coverage: dict[str, Coverage] = {}
     for name, info in params.items():
@@ -176,6 +189,7 @@ def build_ir(
         vocab_size=_vocab_size(model) if is_lm else None,
         labels=labels,
         capture={"method": "tape", "passes": passes, "batch": BATCH, "tokens": PREFILL_TOKENS},
+        structure=structure,
     )
 
 

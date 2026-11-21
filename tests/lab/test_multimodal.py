@@ -67,9 +67,9 @@ def test_every_tool_works_on_a_vision_language_model(kind: str, tmp_path: Path) 
     torch.manual_seed(0)
     model = T.AutoModelForImageTextToText.from_config(config(kind)).eval()
     lab = open_lab(model, store=tmp_path / "s", workdir=tmp_path)
-    assert "2 blocks on a residual stream" in call(lab, "info").summary
+    assert "· 2 layers, L0-L1" in call(lab, "arch").summary
     steps: list[tuple[str, dict[str, Any]]] = [
-        ("ls", {"limit": 3}),
+        ("arch", {"scope": "L*.*", "limit": 3}),
         ("grep", {"expression": "colnorm > 1σ", "top": 2}),  # the default scope, readers included
         ("generate", {"prompt": [1, 2, 3], "max_tokens": 4}),
         ("trace", {"prompt": [1, 2, 3, 4]}),

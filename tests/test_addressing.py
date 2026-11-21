@@ -49,9 +49,11 @@ class TestShortAddresses:
         with pytest.raises(AddressError, match="reversed"):
             parse_address("L12-8.mlp.down")
 
-    def test_layer_without_role_rejected(self) -> None:
-        with pytest.raises(AddressError, match="needs a role"):
-            parse_address("L3")
+    def test_a_bare_layer_is_the_layer_itself(self) -> None:
+        addr = parse_address("L3")
+        assert addr.kind is ScopeKind.SHORT
+        assert addr.path == ()
+        assert parse_address("L3[oc=5]").slice is not None
 
 
 class TestSlices:

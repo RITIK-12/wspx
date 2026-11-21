@@ -191,9 +191,8 @@ def parse_address(text: str) -> Address:
     head, _, rest = scope_text.partition(".")
     layer_match = _LAYERS_RE.match(head)
     if layer_match:
-        if not rest:
-            raise AddressError(f"{text!r}: a layer scope needs a role, e.g. {head}.mlp.down")
-        parts = tuple(rest.split("."))
+        # ``L6`` alone is the layer itself: its own tensor if it has one, else all of it.
+        parts = tuple(rest.split(".")) if rest else ()
         for part in parts:
             if not _ROLE_PART_RE.match(part):
                 raise AddressError(f"{text!r}: invalid role segment {part!r}")

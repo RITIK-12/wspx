@@ -1,7 +1,10 @@
-"""Conformance (§8, S1): tiny random-init models built from real configs.
+"""The compile step is exact (§8, S1), checked on tiny random-init models built from real configs.
 
-Each must bind and exercise 100% of its parameters, derive a role for every
-one of them, and expose the expected addresses. No downloads are needed.
+These architectures are regression fixtures, not a list of supported models: any
+PyTorch model compiles the same way. For each one, every tensor must be exercised and
+get exactly one structural key; ``L{i}`` must be the layer stack's i-th child; the
+layer count must match the config; and every short name kept from the traced graph
+must land inside the layer it names. No downloads are needed.
 """
 
 from __future__ import annotations
@@ -246,17 +249,40 @@ def _check(model: Any, expected: list[str], *, lm: bool) -> None:
     torch.manual_seed(0)
     ir = build_ir(model.eval())
     assert ir.unexercised == [], ir.render_info()
-    assert ir.semantics.unassigned == [], ir.semantics.unassigned
+    stack = ir.structure["stack"]
+    assert stack is not None, ir.render_info()
+
+    # One structural key per tensor, all distinct, each pointing where it says.
+    keyed = [r for r in ir.roles if r.address == ir.key_of(r.param)]
+    assert sorted(r.param for r in keyed) == sorted(ir.params)
+    assert len({r.address for r in keyed}) == len(keyed)
+    prefix = f"{stack['path']}." if stack["path"] else ""
+    for role in keyed:
+        if role.block is not None:
+            child = stack["children"][role.block]
+            assert role.param.startswith(f"{prefix}{child}."), (role.address, role.param)
+            assert role.address == f"L{role.block}" or role.address.startswith(f"L{role.block}.")
+    # Short names from the traced graph survive only inside their own layer.
+    layer_of = ir.structure["layer_of"]
+    for role in ir.roles:
+        if role.block is not None and role.address != ir.key_of(role.param):
+            assert layer_of.get(role.param) == role.block, (role.address, role.param)
+
     addresses = {r.address for r in ir.roles}
     missing = [a for a in expected if a not in addresses]
     assert not missing, (missing, sorted(addresses))
     for address in expected:
         assert ir.resolve(address)
     if lm:
+        text = model.config.get_text_config()
+        assert stack["size"] == text.num_hidden_layers
+        assert stack["runs"] == [1] * stack["size"]
         assert set(ir.graphs) == {"prefill", "decode"}
-        assert ir.num_blocks == 2
+        assert ir.num_blocks == stack["size"]
         assert ir.semantics.embed is not None
         assert ir.semantics.unembed is not None
+        assert ir.resolve("embed")
+        assert ir.resolve("unembed")
 
 
 @pytest.mark.parametrize("arch", sorted(LLMS))
@@ -288,3 +314,66 @@ def test_all_experts_exercised_with_more_experts_than_slots() -> None:
     experts = ir.coverage["model.layers.0.mlp.experts.gate_up_proj"]
     assert (experts.rows_seen, experts.rows_total) == (128, 128)
     assert ir.capture["passes"] >= 3
+
+
+def test_a_looped_transformer_compiles_to_its_physical_layers() -> None:
+    """Inkling-2-Mini (seen live): 24 layers whose middle 12 run three times, attention
+    residuals every 6 layers and a short convolution inside each attention. The traced
+    graph read 96 blocks; the module tree and the call log give 24 layers and the loop."""
+    local = [i for i in range(24) if i % 6 != 5]
+    text = {
+        "model_type": "inkling2_loop_text",
+        "vocab_size": 256,
+        "unpadded_vocab_size": 250,
+        "hidden_size": 64,
+        "num_hidden_layers": 24,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 16,
+        "swa_head_dim": 16,
+        "swa_num_attention_heads": 4,
+        "swa_num_key_value_heads": 2,
+        "d_rel": 4,
+        "local_layer_ids": local,
+        "n_layers_per_attn_res_block": 6,
+        "n_routed_experts": 8,
+        "num_experts_per_tok": 2,
+        "intermediate_size": 32,
+        "loop_config": {"core_start": 6, "core_end": 18, "num_passes": 3, "gate_rank": 8},
+    }
+    vision = {
+        "model_type": "inkling2_vision",
+        "text_hidden_size": 64,
+        "hidden_size": 32,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 2,
+        "projection_hidden_dim": 64,
+        "posemb_grid_size": 4,
+    }
+    config = T.AutoConfig.for_model("inkling2_loop", text_config=text, vision_config=vision)
+    torch.manual_seed(0)
+    model = T.AutoModelForImageTextToText.from_config(config).eval()
+    ir = build_ir(model)
+    stack = ir.structure["stack"]
+    assert (stack["path"], stack["size"]) == ("model.language_model.layers", 24)
+    assert stack["runs"] == [1] * 6 + [3] * 12 + [1] * 6
+    assert stack["segments"] == [[0, 5, 1], [6, 17, 3], [18, 23, 1]]
+    assert stack["calls"] == 48
+    # layer 0, sliding, full attention, looped sliding, looped full
+    assert [v["layers"][0] for v in stack["variants"]] == [0, 1, 5, 6, 11]
+    assert ir.key_of("model.language_model.layers.9.self_attn.o_proj.linear.weight") == (
+        "L9.self_attn.o_proj.linear"
+    )
+    experts = ir.primary_role("model.language_model.layers.9.mlp.experts.down_proj")
+    assert experts is not None
+    assert (experts.kind, experts.experts) == ("expert", 8)
+    router = ir.primary_role("model.language_model.layers.9.mlp.gate.weight")
+    assert router is not None
+    assert router.kind == "router"
+    assert ir.structure["final_norm"] == "model.language_model.norm"
+    assert ir.semantics.unembed == "lm_head.weight"
+    info = ir.render_info()
+    assert "L6-17 run 3 times with the same weights" in info
+    assert "24 layers, L0-L23" in info
+    # The traced graph's short names named the wrong layers here, so none survive.
+    assert all(r.address == ir.key_of(r.param) or r.block is None for r in ir.roles)

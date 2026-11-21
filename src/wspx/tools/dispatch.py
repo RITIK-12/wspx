@@ -51,18 +51,13 @@ def call(
 def _run(lab: Lab, name: str, a: Any) -> ToolResult:
     from wspx.lab.session import ToolResult
 
-    if name == "info":
-        return lab.info(handles=a.handles)
-    if name == "ls":
-        return lab.ls(a.scope, role=a.role, layers=a.layers, limit=a.limit)
-    if name == "grep":
-        hits = lab.grep(
-            a.expression,
-            scope=a.scope,
-            axis=a.axis,
-            top=a.top,
-            name=a.name,
-            fires_on=prompt_arg(a.fires_on),
+    if name == "arch":
+        return lab.arch(a.scope, handles=a.handles, limit=a.limit)
+    if name in ("grep", "activations"):
+        hits = (
+            lab.grep(a.expression, scope=a.scope, axis=a.axis, top=a.top, name=a.name)
+            if name == "grep"
+            else lab.activations(prompt_arg(a.prompts), scope=a.scope, top=a.top, name=a.name)
         )
         return ToolResult(
             hits.summary, {"handle": hits.handle, "hits": [h.__dict__ for h in hits]}, [hits.handle]

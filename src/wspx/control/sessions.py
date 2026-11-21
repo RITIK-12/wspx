@@ -32,7 +32,7 @@ LEASE_S = 300.0
 MISSED_HEARTBEATS = 3
 """Consecutive failed heartbeats before a lab is given up on (and terminated)."""
 RECENT_CALL_S = 120.0
-STORE_SERVED = frozenset({"info", "ls"})
+STORE_SERVED = frozenset({"arch"})
 _CODE_RE = re.compile(r"\b([EW]\d{3})\b")
 
 
@@ -428,7 +428,8 @@ class SessionManager:
         from wspx.lab.ir.model_ir import ModelIR
 
         ir = ModelIR.from_dict(json.loads(raw))
-        if name == "info":
+        scope = args.get("scope")
+        if not scope:
             head = self.store.refs.read(f"sessions/{record.id}/HEAD")
             return {
                 "summary": ir.render_info()
@@ -437,12 +438,17 @@ class SessionManager:
                 "handles": [],
                 "data": {"summary": ir.summary(), "served_by": "store"},
             }
-        scope = args.get("scope") or "L*.*"
+        if re.fullmatch(r"L[\d*,\-]+", scope):
+            scope += ".*"
         try:
             targets = ir.resolve(scope)
         except WspxError as exc:
-            return {"summary": f"ls: {exc}", "ok": False, "handles": [], "data": {}}
-        lines = [f"{t.address:<28} {t.param}" for t in targets[: int(args.get("limit", 100))]]
+            return {"summary": f"arch: {exc}", "ok": False, "handles": [], "data": {}}
+        limit = int(args.get("limit", 200))
+        lines = [f"{len(targets)} tensor(s) match {scope}"] + [
+            f"{ir.key_of(t.param)}  {tuple(ir.params[t.param].shape)}  {t.param}"
+            for t in targets[:limit]
+        ]
         return {
             "summary": "\n".join(lines) + "\n(lab cold: served from the store)",
             "ok": True,

@@ -46,17 +46,17 @@ class _Args(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
 
-class InfoArgs(_Args):
+class ArchArgs(_Args):
+    scope: str | None = Field(
+        None,
+        description="Omit for the whole map. A layer ('L9', 'L6-17'), a key or glob "
+        "('L*.mlp.experts.*', 'L9.self_attn.o_proj') or raw parameter names: lists each "
+        "matching tensor with its kind, shape, dtype, input/output axes, experts and runs.",
+    )
     handles: bool = Field(
         False, description="Also list every live handle with a one-line description."
     )
-
-
-class LsArgs(_Args):
-    scope: str = Field("L*.*", description="Address or glob, e.g. 'L*.mlp.down' or 'L8-12.attn.*'.")
-    role: str | None = Field(None, description="Role path such as 'attn.o' (combine with layers).")
-    layers: str | None = Field(None, description="Block selection: 'N', 'N-M' or '*'.")
-    limit: int = Field(100, ge=1, le=1000)
+    limit: int = Field(200, ge=1, le=2000, description="Tensors listed for a scope.")
 
 
 class GrepArgs(_Args):
@@ -65,19 +65,35 @@ class GrepArgs(_Args):
         description="e.g. 'writes(\" Wait\") > 0.3', 'colnorm > 4σ', 'cos(dir:loop) > 0.5', "
         "'nan or absmax > 1e3'. Fields: norm colnorm rownorm absmax mean std kurtosis max min rank nan inf.",
     )
-    scope: str | None = Field(None, alias="in", description="Where to search, e.g. 'L*.mlp.down'.")
+    scope: str | None = Field(
+        None, alias="in", description="Keys or globs to search, e.g. 'L*.mlp.experts.down_proj'."
+    )
     axis: Literal["row", "col", "tensor", "elem"] | None = Field(
         None,
-        description="Unit of search; default is the role's unit (writers: columns, readers: rows).",
+        description="Unit of search. Default: writes() scores columns (what each input feature "
+        "writes), reads() rows; otherwise a matrix whose output is the model width is split "
+        "into its input features, any other into rows. Expert tensors are split per expert.",
     )
     top: int = Field(20, ge=1, le=200, description="Hits to return (the full ranking is saved).")
     name: str | None = Field(
         None, description="Your name for the result set, shown with its handle."
     )
-    fires_on: list[Prompt] | str | None = Field(
+
+
+class ActivationsArgs(_Args):
+    prompts: list[Prompt] | str = Field(
+        description="An array of prompts (text, token ids or image prompts) or a .jsonl prompt "
+        "file; units are ranked by mean |activation| over their tokens."
+    )
+    scope: str | None = Field(
         None,
-        description="Activation grep: rank writer units by activation on an array of prompts "
-        "(text, token ids or image prompts), or on a .jsonl prompt file.",
+        alias="in",
+        description="Matrices whose input features to rank (default: every matrix whose output "
+        "is the model width). Tensors that are not 2-D matrices are listed as skipped.",
+    )
+    top: int = Field(20, ge=1, le=200, description="Hits to return (the full ranking is saved).")
+    name: str | None = Field(
+        None, description="Your name for the result set, shown with its handle."
     )
 
 
@@ -242,80 +258,89 @@ class ToolSpec:
 TOOLS: dict[str, ToolSpec] = {
     spec.name: spec
     for spec in [
+        # ---- map: what the model is, read off its module tree and a traced forward pass
         ToolSpec(
-            "info",
-            InfoArgs,
-            "Model outline: blocks, layer types, residual stream, tying, coverage, branch "
-            "and HEAD. Start here.",
+            "arch",
+            ArchArgs,
+            "[map] The architecture map, compiled when the model loaded: the layer stack and "
+            "how many times each layer runs, layer types, what sits before and after the "
+            "stack, experts, routers, config, branch and HEAD. With a scope, the tensors it "
+            "matches. Every key here is exact: L9.self_attn.o_proj is layers.9's o_proj "
+            "weight. Start here.",
             lab=False,
         ),
+        # ---- inspect: arithmetic on the weights, no forward pass
         ToolSpec(
-            "ls",
-            LsArgs,
-            "List addresses matching a scope (glob, role, layer range) with shapes.",
-            lab=False,
+            "show",
+            ShowArgs,
+            "[inspect] Summarise a slice of weights: stats, histogram, spectrum, vocabulary "
+            "tokens; raw values only on request (capped).",
         ),
         ToolSpec(
             "grep",
             GrepArgs,
-            "Search weights for units matching an expression, or units that fire on "
-            "prompts. Returns ranked addresses and saves the full ranking as a result set @rN.",
+            "[inspect] Rank weight units by an expression (no forward pass). Hits are exact "
+            "keys with indices; the full ranking is saved as a result set @rN.",
+        ),
+        # ---- probe: runs the model
+        ToolSpec("generate", GenerateArgs, "[probe] Sample from the current working tree."),
+        ToolSpec(
+            "trace",
+            TraceArgs,
+            "[probe] Forward trace (logit lens over each layer's output, writers, routes), "
+            "diff trace (--vs) or attribution trace (with a reference input).",
         ),
         ToolSpec(
-            "show",
-            ShowArgs,
-            "Summarise a slice of weights: stats, histogram, spectrum, vocabulary "
-            "tokens; raw values only on request (capped).",
+            "activations",
+            ActivationsArgs,
+            "[probe] Rank the input features of matrices by how strongly they activate on "
+            "prompts. Saves the ranking as a result set @rN.",
         ),
         ToolSpec(
             "contrast",
             ContrastArgs,
-            "Build a direction from two prompt sets (difference of means of the "
-            "residual stream), save it as dir:<name>, and list its top writers.",
+            "[probe] Build a direction from two prompt sets (difference of means of a layer's "
+            "output), save it as dir:<name>, and list its top writers.",
             mutates=True,
         ),
-        ToolSpec("generate", GenerateArgs, "Sample from the current working tree."),
-        ToolSpec(
-            "trace",
-            TraceArgs,
-            "Forward trace (logit lens, writers, routes), diff trace (--vs) or "
-            "attribution trace (with a reference input). Returns a summary and a trace handle.",
-        ),
+        # ---- edit: change weights, then check the change
         ToolSpec(
             "edit",
             EditArgs,
-            "Stage an op into the working tree. It compiles to concrete deltas, is "
+            "[edit] Stage an op into the working tree. It compiles to concrete deltas, is "
             "checked statically and numerically, and returns a patch handle p_….",
             mutates=True,
         ),
         ToolSpec(
             "check",
             CheckArgs,
-            "Diagnostics for staged edits: static, numeric and smoke (canary KL, "
+            "[edit] Diagnostics for staged edits: static, numeric and smoke (canary KL, "
             "perplexity, degenerate output). Every diagnostic lists fixes.",
         ),
+        # ---- keep: evaluate, version and ship
         ToolSpec(
             "test",
             TestArgs,
-            "Run suites on the working tree; paired deltas with --vs. Held-out suites "
+            "[keep] Run suites on the working tree; paired deltas with --vs. Held-out suites "
             "return aggregates only.",
         ),
         ToolSpec(
             "vcs",
             VcsArgs,
-            "Version control: status, diff, commit, log, checkout, branch, revert, bisect, "
-            "blame, merge. Commits run check first.",
+            "[keep] Version control: status, diff, commit, log, checkout, branch, revert, "
+            "bisect, blame, merge. Commits run check first.",
             mutates=True,
         ),
         ToolSpec(
             "export",
             ExportArgs,
-            "Export the working tree: merged checkpoint, PEFT adapter, GGUF or portable bundle.",
+            "[keep] Export the working tree: merged checkpoint, PEFT adapter, GGUF or "
+            "portable bundle.",
         ),
         ToolSpec(
             "run",
             RunArgs,
-            "Run a Python script in the lab with the SDK preloaded (no network, no "
+            "[keep] Run a Python script in the lab with the SDK preloaded (no network, no "
             "secrets). Output is capped; the full log is saved.",
             mutates=True,
         ),

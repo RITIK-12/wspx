@@ -66,6 +66,9 @@ def architecture(store: Store, fingerprint: str | None) -> dict[str, Any]:
         "unexercised": sorted(k for k, c in coverage.items() if not c.get("exercised")),
         "unassigned": sem.get("unassigned", []),
         "head_dims": sem.get("head_dims", {}),
+        "structure": {
+            k: ir.get("structure", {}).get(k) for k in ("hidden", "stack", "final_norm", "config")
+        },
     }
 
 
