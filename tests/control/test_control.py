@@ -426,6 +426,44 @@ def test_each_tool_call_is_counted_once_for_loop_detection(tmp_path: Path) -> No
         assert seen.count(("call", "info")) == 1
 
 
+def test_lookups_that_miss_between_ones_that_match_are_not_a_loop(tmp_path: Path) -> None:
+    """Exploring a new model, an agent tries names that do not exist (E101) between many
+    that do; only the same diagnostic on calls in a row is a loop. One no-op edit after
+    another is still caught."""
+    from wspx.loops import LoopDetector
+
+    detector = LoopDetector(threshold=3)
+    actions: list[str] = []
+
+    class Gateway:
+        def observe(self, sid: str, kind: str, key: Any, label: str = "") -> Any:
+            verdict = detector.observe(sid, kind, key, label=label)
+            if verdict is None:
+                return None
+            actions.append(verdict.action)
+            return verdict.to_dict()
+
+        def pause(self, sid: str, reason: str) -> None:
+            pass
+
+    client, manager = make(tmp_path)
+    with client:
+        sid = client.post("/api/sessions", json={"model": "tiny"}, headers=USER).json()["id"]
+        wait(lambda: sid in manager.labs)
+        manager.gateway = Gateway()  # type: ignore[assignment]
+        for _ in range(4):
+            assert not manager.tool(sid, "ls", {"scope": "no.such.weights*"}, source="driver")["ok"]
+            assert manager.tool(sid, "ls", {"scope": "L0.*"}, source="driver")["ok"]
+        assert actions == []
+        for _ in range(3):
+            manager.tool(sid, "ls", {"scope": "no.such.weights*"}, source="driver")
+        assert actions == ["nudge"]
+        no_op = {"op": "scale", "args": {"targets": "L0.mlp.down", "factor": 1.0}}
+        for _ in range(3):
+            assert "E105" in manager.tool(sid, "edit", no_op, source="driver")["summary"]
+        assert actions == ["nudge", "nudge"]
+
+
 def test_lab_failures_are_results_not_crashes() -> None:
     import httpx
 

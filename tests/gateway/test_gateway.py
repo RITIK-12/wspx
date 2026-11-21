@@ -400,6 +400,18 @@ class TestLoopDetector:
         d.turn("s")
         assert d.observe("s", "outcome", "E105") is None  # a different outcome breaks the run
 
+    def test_a_step_without_the_signal_breaks_the_run(self) -> None:
+        d = LoopDetector(threshold=3, window=10)
+        for kind, key in (("outcome", "E101"), ("empty", "empty")):
+            for _ in range(4):  # one miss between clean steps, four times over
+                assert d.observe("s", kind, key) is None
+                assert d.observe("s", kind, None) is None
+            assert d.observe("s", kind, key) is None
+            assert d.observe("s", kind, key) is None
+            v = d.observe("s", kind, key)  # three in a row is a run
+            assert v is not None
+            assert (v.action, v.count) == ("nudge", 3)
+
     def test_window(self) -> None:
         d = LoopDetector(threshold=3, window=4)
         for i in range(12):

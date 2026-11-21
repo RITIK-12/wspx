@@ -343,8 +343,10 @@ def create_app(config: GatewayConfig) -> Starlette:
                     epochs[session] = state + 1
             if obs.text.strip():
                 verdicts.append(loops.observe(session, "output", obs.text))
-            if not obs.tool_calls and not obs.text.strip():
-                verdicts.append(loops.observe(session, "empty", "empty", label="empty turn"))
+            empty = not obs.tool_calls and not obs.text.strip()
+            verdicts.append(
+                loops.observe(session, "empty", "empty" if empty else None, label="empty turn")
+            )
         messages = []
         for v in verdicts:
             if v is None:

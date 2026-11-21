@@ -5,11 +5,17 @@ a long experiment that keeps doing new things is never interrupted.
 
 =============  ==================================================================
 call           the same tool with identical arguments N times within W turns
-outcome        the same diagnostic N times running, or successive no-op edits
+outcome        the same diagnostic on N tool calls running, or successive no-op edits
 output         the same (normalised) assistant message N times within W turns
 error          the same error recurring N times within W turns
 empty          N turns running with no tool call and no new content
 =============  ==================================================================
+
+"Running" means consecutive: for ``outcome`` and ``empty``, a step without that
+signal (a tool call with no diagnostic, a turn that did something) breaks the
+run, reported as ``observe(session, kind, None)``. Without that, an agent that
+looks up a few names that do not exist while exploring a new model piles up
+"no weights match" across dozens of successful calls and is stopped as a loop.
 
 The first detection of a pattern nudges; if that pattern repeats again, the
 verdict is stop. Resuming is the user's decision.
@@ -86,7 +92,13 @@ class LoopDetector:
             self._sessions[session].turn += 1
 
     def observe(self, session: str, kind: Kind, key: Any, *, label: str = "") -> Verdict | None:
+        """Record one step; ``key=None`` means the step showed no such signal."""
         if not self.enabled:
+            return None
+        if key is None:
+            if kind in CONSECUTIVE:
+                with self._lock:
+                    self._sessions[session].run.pop(kind, None)
             return None
         digest = key if isinstance(key, str) and len(key) == 16 else fingerprint(key)
         with self._lock:

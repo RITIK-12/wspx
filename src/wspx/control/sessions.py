@@ -73,6 +73,8 @@ class SessionManager:
         self._missed: dict[str, int] = defaultdict(int)
         self._epoch: dict[str, int] = defaultdict(int)
         """State-changing tool calls so far, per session: part of a repeated call's key."""
+        self._outcome_run: set[str] = set()
+        """Sessions whose last tool call reported a diagnostic: a clean call ends that run."""
         self._lab_why: dict[str, str] = {}
         """Why the last generation ended: calls that waited on it fail with this."""
         """Bumped by every lab stop: a start begun under an older value is abandoned."""
@@ -468,15 +470,16 @@ class SessionManager:
                 [] if source == "driver" else [self.gateway.observe(sid, "call", key, label=name)]
             )
             codes = sorted(set(_CODE_RE.findall(result.get("summary") or "")))
-            if codes:
-                verdicts.append(
-                    self.gateway.observe(sid, "outcome", ",".join(codes), label=",".join(codes))
-                )
-            no_op = "E105" in codes
-            if no_op:
-                verdicts.append(
-                    self.gateway.observe(sid, "outcome", "no-op edit", label="no-op edit")
-                )
+            # One outcome per call: a no-op edit's E105 and its "no-op edit" reported apart
+            # alternated, so successive no-op edits never added up to a run.
+            outcome = "no-op edit" if "E105" in codes else ",".join(codes)
+            if outcome:
+                self._outcome_run.add(sid)
+                verdicts.append(self.gateway.observe(sid, "outcome", outcome, label=outcome))
+            elif sid in self._outcome_run:
+                # a clean call ends the run: one request when a run ends, not one per call
+                self._outcome_run.discard(sid)
+                verdicts.append(self.gateway.observe(sid, "outcome", None))
         except WspxError:
             return ""
         for verdict in verdicts:
