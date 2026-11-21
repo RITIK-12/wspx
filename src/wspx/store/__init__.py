@@ -53,8 +53,12 @@ class Store:
         return self.path(rel).is_file()
 
     def glob(self, rel: str, pattern: str) -> list[str]:
-        """Relative paths of files under ``rel`` matching ``pattern``."""
-        base = self.path(rel)
+        """Relative paths of files under ``rel`` matching ``pattern``, in this store's own root.
+
+        ``Store.path`` rather than ``self.path``: an overlay's ``path`` falls back to its base
+        store, whose files are not under the overlay's root (the overlay globs both itself).
+        """
+        base = Store.path(self, rel)
         if not base.is_dir():
             return []
         root = self.root.resolve()

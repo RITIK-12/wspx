@@ -72,3 +72,17 @@ def test_journal_is_validated(tmp_path: Path) -> None:
             store,
             {"refs": [{"op": "update", "name": "heads/x", "value": "evil", "expected": None}]},
         )
+
+
+def test_glob_finds_files_that_exist_only_in_the_base_store(tmp_path: Path) -> None:
+    """Seen live: on Modal, vcs diff failed with '…/runs/…json is not in the subpath of
+    /tmp/wspx-overlay' once a canary run from an earlier session sat in the base store."""
+    real = Store(tmp_path / "real")
+    real.write_file("runs/tree/canary/0.json", b"{}")
+    overlay = OverlayStore(real.root, tmp_path / "overlay")
+    assert overlay.glob("runs/tree/canary", "*.json") == ["runs/tree/canary/0.json"]
+    overlay.write_file("runs/tree/canary/1.json", b"{}")
+    assert overlay.glob("runs/tree/canary", "*.json") == [
+        "runs/tree/canary/0.json",
+        "runs/tree/canary/1.json",
+    ]
