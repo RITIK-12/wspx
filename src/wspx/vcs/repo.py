@@ -151,13 +151,20 @@ def normalize_tree(tree: dict[str, Any] | None) -> dict[str, Any]:
     }
 
 
-def tree_key(tree: dict[str, Any] | None) -> str:
-    """Short hash of the weights a tree describes: the eval-cache key (same weights, same key)."""
+def tree_key(tree: dict[str, Any] | None, *, base: str) -> str:
+    """Short hash of the weights a tree describes on ``base``: the eval-cache key.
+
+    The base model's fingerprint is part of the key. A tree lists patches only, so without
+    it every model's unedited base (the empty tree) shares one key, and a test on one model
+    returned another model's cached run.
+    """
     import hashlib
 
     from wspx.store import canonical_json
 
-    return hashlib.sha256(canonical_json(normalize_tree(tree))).hexdigest()[:16]
+    return hashlib.sha256(canonical_json({"base": base, "tree": normalize_tree(tree)})).hexdigest()[
+        :16
+    ]
 
 
 class Repo:

@@ -298,7 +298,7 @@ class Lab:
         return self.at_state(TreeState())
 
     def tree_key(self, state: TreeState | None = None) -> str:
-        return tree_key((state or self.tree.state).to_dict())
+        return tree_key((state or self.tree.state).to_dict(), base=self.repo.base)
 
     # ------------------------------------------------------------------ info / ls
 
@@ -1194,19 +1194,37 @@ class Lab:
         return TreeState.from_dict(self.repo.tree_of_oid(self.repo.resolve(rev, self.session)))
 
     def _behaviour_diff(self, sa: TreeState, sb: TreeState) -> list[str]:
+        """Cached runs of this project's current suites at both trees, paired.
+
+        Only the suites as they are now (name, content hash and seed), so an older version
+        of a suite, or another project's suite, never shows. Held-out and blind suites are
+        left out: their scores reach the driver only through ``test``, which counts them.
+        """
         ka, kb = self.tree_key(sa), self.tree_key(sb)
-        out = []
-        for rel_b in self.store.glob(f"runs/{kb}", "*/*.json"):
-            suite_file = rel_b.split("/", 2)[2]
-            raw_a = self.store.read_file(f"runs/{ka}/{suite_file}")
-            raw_b = self.store.read_file(rel_b)
-            if raw_a is not None and raw_b is not None:
-                ra, rb = runner.RunResult.from_json(raw_a), runner.RunResult.from_json(raw_b)
-                p = runner.paired(rb, ra)
-                out.append(
-                    f"  behaviour {rb.suite}: {ra.pass_rate:.1%} → {rb.pass_rate:.1%} "
-                    f"(Δ {p.mean_delta:+.3f}, {p.flips_up} fixed, {p.flips_down} broken)"
-                )
+        try:
+            suites = self._suites()
+        except Exception as exc:  # a broken test file must not break diff
+            return [f"  (behaviour not compared: the test files did not load: {exc})"]
+        out, withheld = [], 0
+        for suite in suites.values():
+            rel = f"{suite.name}/{suite.hash}-{suite.seed}.json"
+            raw_a = self.store.read_file(f"runs/{ka}/{rel}")
+            raw_b = self.store.read_file(f"runs/{kb}/{rel}")
+            if raw_a is None or raw_b is None:
+                continue
+            ra, rb = runner.RunResult.from_json(raw_a), runner.RunResult.from_json(raw_b)
+            if not (self._data_unchanged(ra) and self._data_unchanged(rb)):
+                continue
+            if suite.heldout or ra.aggregate_only or rb.aggregate_only:
+                withheld += 1
+                continue
+            p = runner.paired(rb, ra)
+            out.append(
+                f"  behaviour {rb.suite}: {ra.pass_rate:.1%} → {rb.pass_rate:.1%} "
+                f"(Δ {p.mean_delta:+.3f}, {p.flips_up} fixed, {p.flips_down} broken)"
+            )
+        if withheld:
+            out.append(f"  ({withheld} held-out or blind suite(s) not shown; `test` reports them)")
         return out
 
     def blame(self, address: str) -> ToolResult:

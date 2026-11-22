@@ -192,6 +192,50 @@ class TestSuites:
     def test_builtin_canary(self, lab: Lab) -> None:
         assert "canary [dev] 32/32" in lab.test("canary").summary
 
+    def test_the_eval_cache_is_per_model(self, lab: Lab, tmp_path: Path) -> None:
+        """Seen live: every model's unedited base shared one cache key, so a test on a new
+        model returned another model's cached run."""
+        assert "cached" not in lab.test("canary").summary
+        (tmp_path / "other").mkdir()
+        other = open_lab(
+            tiny_llama(seed=1), store=tmp_path / "store", workdir=tmp_path / "other", branch="o"
+        )
+        assert other.ir.fingerprint != lab.ir.fingerprint
+        assert "cached" not in other.test("canary").summary
+        assert "cached" in lab.test("canary").summary
+
+    def test_diff_shows_current_suites_and_never_held_out_ones(self, lab: Lab) -> None:
+        """Seen live: vcs diff listed another project's held-out suite to the driver, and three
+        versions of one suite with different scores."""
+        tests = lab.workdir / "wtests"
+        tests.mkdir()
+        source = textwrap.dedent("""
+            from wspx.testing import suite, expect
+
+            @suite(split="dev", seed=0)
+            def near(model):
+                for i in range(4):
+                    yield expect.kl(model.kl_vs_base([1, i + 2]), at_most={limit})
+
+            @suite(split="heldout", seed=1)
+            def secret(model):
+                for i in range(4):
+                    yield expect.true(model.kl_vs_base([1, i + 2]) < 1.0, "close to base")
+        """)
+        (tests / "suites.py").write_text(source.format(limit="1.0"))
+        lab.edit.scale("L0.mlp.down[:, 0:4]", factor=0.5)
+        lab.test("near", vs="base")
+        lab.test("secret", vs="base")
+        asked = lab.heldout_queries
+        lines = lab.diff("base").data["behaviour"]
+        assert any(line.startswith("  behaviour near:") for line in lines)
+        assert not any("secret" in line for line in lines)
+        assert "1 held-out or blind suite(s) not shown" in lines[-1]
+        assert lab.heldout_queries == asked
+        (tests / "suites.py").write_text(source.format(limit="2.0"))  # a new version of `near`
+        lines = lab.diff("base").data["behaviour"]
+        assert not any("near" in line for line in lines)
+
     def test_bisect_finds_the_breaking_commit(self, lab: Lab) -> None:
         (lab.workdir / "wtests").mkdir()
         (lab.workdir / "wtests" / "near.py").write_text(

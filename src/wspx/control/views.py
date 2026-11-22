@@ -119,7 +119,7 @@ def commits(
                 "status": commit.status,
                 "author": commit.author,
                 "patches": patches,
-                "tree": tree_key(tree),
+                "tree": tree_key(tree, base=commit.base),
                 "tensors": len(normalize_tree(tree)["merged"]),
                 "forced": commit.forced,
                 "merge": commit.merge,
@@ -137,7 +137,7 @@ def commits(
 def runs(store: Store, fingerprint: str | None, session: str) -> dict[str, Any]:
     """Every cached eval run on a commit of this session: the commits × suites matrix."""
     history = commits(store, fingerprint, session)
-    by_tree: dict[str, list[str]] = {tree_key(None): ["base"]}
+    by_tree: dict[str, list[str]] = {tree_key(None, base=fingerprint or ""): ["base"]}
     for c in history["commits"]:
         by_tree.setdefault(c["tree"], []).append(c["short"])
     rows = []
