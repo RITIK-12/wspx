@@ -96,7 +96,8 @@ HandleLookup = Callable[[Handle, str], list[int]]
 
 
 IR_VERSION = 4
-"""4: roles at every key without a layer stack, and the ``gate`` kind."""
+"""4: roles at every key without a layer stack, the ``gate`` kind, and per-tensor facts from a
+vision-language model's image pass."""
 
 KIND_LEGEND = (
     ("writer", "output is model-width and reaches the stream"),

@@ -57,6 +57,7 @@ def build_ir(
     rows: dict[str, set[int]] = {}
     full: set[str] = set()
     vision_read: set[str] = set()
+    vision_graph: OpGraph | None = None
     passes = 0
     gen = torch.Generator().manual_seed(seed)
     device = _device_of(model)
@@ -118,6 +119,7 @@ def build_ir(
             with tape.recording():
                 model(**vision_inputs, use_cache=False)
             vision_read = set(tape.graph.params_read())
+            vision_graph = tape.graph
             absorb(tape)
             tape.release()
             passes += 1
@@ -136,6 +138,7 @@ def build_ir(
         graphs,
         fallback_embed=traced.embed,
         fallback_unembed=traced.unembed,
+        fact_graphs={"vision": vision_graph} if vision_graph is not None else None,
     )
     semantics = structural_semantics(traced, structure, params)
 

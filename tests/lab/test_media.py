@@ -365,6 +365,12 @@ def test_info_counts_the_vision_tower_on_image_prompts(lab: Any) -> None:
         lab, "grep", {"expression": "rownorm", "in": "model.visual.blocks.*.mlp.linear_fc2.weight"}
     )
     assert hits.ok, hits.summary
+    # Seen live on Inkling-2-Mini: the image pass never reached the per-tensor facts, so every
+    # vision matrix was kind `param` with no in/out axes and grep guessed its axis.
+    fc2 = lab.ir.primary_role("model.visual.blocks.0.mlp.linear_fc2.weight")
+    assert fc2 is not None
+    assert (fc2.in_dim, fc2.out_dim) == (1, 0)
+    assert fc2.kind != "param"
 
 
 def test_an_ir_from_an_older_capture_is_rebuilt(tmp_path: Path) -> None:

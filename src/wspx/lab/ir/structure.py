@@ -57,8 +57,14 @@ def build_structure(
     *,
     fallback_embed: str | None = None,
     fallback_unembed: str | None = None,
+    fact_graphs: dict[str, OpGraph] | None = None,
 ) -> dict[str, Any]:
-    """The structure record stored in the IR (see the module docstring)."""
+    """The structure record stored in the IR (see the module docstring).
+
+    ``fact_graphs`` (a vision-language model's image pass) add per-tensor facts for tensors
+    the text passes never read; their lookups and routers do not change the text model's
+    ends.
+    """
     main = graphs.get("prefill") or graphs.get("forward") or next(iter(graphs.values()), None)
     calls = list(main.calls) if main is not None else []
     numel = {name: _numel(info.shape) for name, info in params.items()}
@@ -86,6 +92,9 @@ def build_structure(
         hidden = _config_int(model, "hidden_size")
 
     facts, routers, embedding_reads = _facts(params, graphs)
+    if fact_graphs:
+        for name, fact in _facts(params, fact_graphs)[0].items():
+            facts.setdefault(name, fact)
     owners: dict[str, list[str]] = {}
     for name, info in params.items():
         owners.setdefault(info.module, []).append(name)
