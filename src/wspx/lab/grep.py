@@ -396,9 +396,8 @@ def _units(
     if axis is None:
         axis = _default_axis(ir, target, free, prefer)
     key = ir.key_of(target.param)
-    lead = f"{expert}, " if expert is not None else ""
     if axis == "tensor":
-        label = f"{key}[{expert}]" if expert is not None else key
+        label = _label(key, index, None, 0)
         yield UnitBatch(
             target,
             expert,
@@ -412,24 +411,46 @@ def _units(
         return
     if block.dim() == 1:
         if axis not in ("elem", "row", "col"):
-            raise GrepError(f"{target.address} is 1-D; use --axis elem or tensor")
+            raise GrepError(f"{target.address} is 1-D; use axis elem or tensor")
         unit_dim, axis = free[0], "elem"
         vectors = block.reshape(-1, 1)
     elif block.dim() == 2:
         unit_dim = free[0] if axis == "row" else free[1]
         vectors = block if axis == "row" else block.T
+    elif axis == "row":  # a conv kernel (out, in, k) and the like: one unit per leading index
+        unit_dim = free[0]
+        vectors = block.reshape(block.shape[0], -1)
     else:
-        raise GrepError(f"{target.address}: {block.dim()}-D selection; narrow it to a matrix")
+        raise GrepError(
+            f"{target.address}: {block.dim()}-D selection has no {axis}s; use axis row (one "
+            "unit per leading index) or tensor, or slice it to a matrix"
+        )
     size = weight.shape[unit_dim]
     sel = index[unit_dim]
     globals_ = list(range(*sel.indices(size))) if isinstance(sel, slice) else list(sel)  # type: ignore[arg-type]
-    if axis in ("row", "elem"):
-        addresses = [f"{key}[{lead}{u}]" for u in globals_]
-    else:
-        addresses = [f"{key}[{lead}:, {u}]" for u in globals_]
+    addresses = [_label(key, index, unit_dim, u) for u in globals_]
     yield UnitBatch(
-        target, expert, vectors, globals_, axis, whole=block, addresses=addresses, globals=globals_
+        target,
+        expert,
+        vectors,
+        globals_,
+        axis,
+        whole=block if block.dim() <= 2 else vectors,  # rank of a kernel: of its unit matrix
+        addresses=addresses,
+        globals=globals_,
     )
+
+
+def _label(key: str, index: tuple[Any, ...], unit_dim: int | None, unit: int) -> str:
+    """The address of one unit in the whole tensor: every index the selection fixed stays
+    in place (``query[0]`` rows are ``query[0, u]``, expert columns ``down[e, :, u]``)."""
+    parts = [
+        str(unit) if d == unit_dim else str(s) if isinstance(s, int) else ":"
+        for d, s in enumerate(index)
+    ]
+    while parts and parts[-1] == ":":
+        parts.pop()
+    return f"{key}[{', '.join(parts)}]" if parts else key
 
 
 def _default_axis(ir: ModelIR, target: Target, free: list[int], prefer: str | None = None) -> str:
@@ -721,6 +742,7 @@ def grep(
         axis = "col" if "colnorm" in names else "row" if "rownorm" in names else None
     started = time.perf_counter()
     skipped: list[str] = []
+    reasons: list[str] = []
     lone = len(targets) == 1
 
     def batches() -> Iterator[UnitBatch]:
@@ -729,11 +751,12 @@ def grep(
         for target in targets:
             try:
                 yield from unit_batches(env.ir, env.params, [target], axis, prefer)
-            except GrepError:
+            except GrepError as exc:
                 if lone:
                     raise
                 if target.address not in skipped:  # a wide scope skips what has no units
                     skipped.append(target.address)
+                    reasons.append(str(exc))
 
     # σ thresholds need the population of the left side across the whole scope: a first pass.
     thresholds: list[str] = []
@@ -780,6 +803,10 @@ def grep(
             if k:
                 hits.append(hit)
     if used_axis is None:
+        if reasons:  # the weights exist; none splits into units this way
+            raise GrepError(
+                f"all {len(skipped)} tensor(s) in the scope were skipped; the first: {reasons[0]}"
+            )
         raise GrepError("scope contains no weights")
     order = lambda h: (math.isnan(h.score), -h.score if not math.isnan(h.score) else 0.0)  # noqa: E731
     scores.sort(key=order)

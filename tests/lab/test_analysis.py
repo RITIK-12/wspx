@@ -107,6 +107,63 @@ class TestGrep:
         assert resolved[0].index[1] == units
 
 
+class _Kernels(torch.nn.Module):
+    """A depthwise short convolution (8, 1, 3) and a (3, 4, 8) query tensor."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tok = torch.nn.Embedding(20, 8)
+        self.conv = torch.nn.Conv1d(8, 8, 3, padding=2, groups=8)
+        self.query = torch.nn.Parameter(torch.randn(3, 4, 8))
+        self.head = torch.nn.Linear(8, 20, bias=False)
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        x = self.tok(ids)
+        c = self.conv(x.transpose(1, 2))[..., : ids.shape[1]].transpose(1, 2)
+        gate = torch.einsum("qhd,bsd->bsqh", self.query, x).mean((-1, -2)).unsqueeze(-1)
+        return self.head(x + c * torch.sigmoid(gate))
+
+
+@pytest.fixture(scope="module")
+def kernels() -> tuple[torch.nn.Module, ModelIR]:
+    torch.manual_seed(0)
+    model = _Kernels().eval()
+    return model, build_ir(model, example_inputs=(torch.randint(0, 20, (2, 5)),))
+
+
+class TestGrepShapes:
+    """Seen live on Inkling-2-Mini: rows of ``message_input.query[0]`` were labelled
+    ``query[2]`` (another slice), and a scope of 3-D conv kernels said "scope contains no
+    weights" although every tensor existed."""
+
+    def test_labels_keep_every_fixed_index(self, kernels: tuple) -> None:  # type: ignore[type-arg]
+        model, ir = kernels
+        env = env_for(model, ir)
+        rows = grep(env, "norm", ir.resolve("query[0]"), axis="row")
+        assert sorted(h.address for h in rows.hits) == [f"query[0, {u}]" for u in range(4)]
+        cols = grep(env, "norm", ir.resolve("query[2]"), axis="col")
+        assert {h.address for h in cols.hits} == {f"query[2, :, {u}]" for u in range(8)}
+        one = grep(env, "norm", ir.resolve("query[1, 3]"), axis="elem")
+        assert {h.address for h in one.hits} == {f"query[1, 3, {u}]" for u in range(8)}
+        whole = grep(env, "norm", ir.resolve("query[1]"), axis="tensor")
+        assert [h.address for h in whole.hits] == ["query[1]"]
+
+    def test_a_kernel_ranks_by_its_leading_index(self, kernels: tuple) -> None:  # type: ignore[type-arg]
+        model, ir = kernels
+        res = grep(env_for(model, ir), "absmax", ir.resolve("conv"))
+        assert (res.axis, res.candidates) == ("row", 8)
+        best = int(model.conv.weight.detach().abs().amax(dim=(1, 2)).argmax())
+        assert res.hits[0].address == f"conv[{best}]"
+
+    def test_a_scope_with_no_units_says_why(self, kernels: tuple) -> None:  # type: ignore[type-arg]
+        model, ir = kernels
+        scope = ir.resolve("conv") + ir.resolve("query")
+        with pytest.raises(
+            GrepError, match=r"all 2 tensor\(s\) in the scope were skipped.*no cols"
+        ):
+            grep(env_for(model, ir), "norm", scope, axis="col")
+
+
 class TestIndexAndShow:
     def test_index_roundtrip(self, llama: tuple, tmp_path: Path) -> None:  # type: ignore[type-arg]
         model, ir = llama
