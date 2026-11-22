@@ -6,7 +6,7 @@
 * vocabulary projections: the tokens each writer unit writes most and each
   reader unit reads most (final-norm and pre-norm scales folded in).
 
-It answers ``info``, ``ls``, ``show --stats/--vocab`` and stat greps while the
+It answers ``arch``, ``show --stats/--vocab`` and stat greps while the
 lab is cold, and annotates grep hits. At commit time the lab refreshes the
 entries of the tensors it touched.
 """

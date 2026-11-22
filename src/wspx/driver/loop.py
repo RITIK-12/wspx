@@ -325,7 +325,7 @@ RESTARTED = (
     "Your process was restarted (the machine running it was replaced) and resumed from "
     "its saved conversation, so nothing you saw is lost. Tool calls that were running "
     "at the restart were re-sent under their original ids and answered from the record; "
-    "if anything looks off, `info --handles` and `vcs status` show the current state."
+    "if anything looks off, `arch` with handles=true and `vcs status` show the current state."
 )
 
 

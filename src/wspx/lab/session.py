@@ -300,7 +300,7 @@ class Lab:
     def tree_key(self, state: TreeState | None = None) -> str:
         return tree_key((state or self.tree.state).to_dict(), base=self.repo.base)
 
-    # ------------------------------------------------------------------ info / ls
+    # ------------------------------------------------------------------ arch
 
     def arch(
         self, scope: str | None = None, *, handles: bool = False, limit: int = 200

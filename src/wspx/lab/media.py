@@ -117,7 +117,7 @@ class Media:
         return self._sets[name]
 
     def sets(self) -> dict[str, int]:
-        """Stored prompt sets and their sizes (for ``info``)."""
+        """Stored prompt sets and their sizes (for ``arch``)."""
         folder = self.root / self.prompt_dir
         if not folder.is_dir():
             return {}

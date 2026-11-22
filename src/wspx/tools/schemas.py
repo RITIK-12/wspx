@@ -31,7 +31,7 @@ class ChatMessage(TypedDict):
 class MediaPrompt(TypedDict, total=False):
     """An image or video prompt (vision-language models): chat ``messages``, rendered with the
     model's chat template, plus an optional ``reply`` the answer starts with. Or a stored prompt:
-    ``{"item": "<set>/<n>"}`` (``info`` lists the sets). File paths are relative to the project."""
+    ``{"item": "<set>/<n>"}`` (``arch`` lists the sets). File paths are relative to the project."""
 
     messages: list[ChatMessage]
     reply: str

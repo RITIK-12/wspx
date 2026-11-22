@@ -49,3 +49,24 @@ def test_provider_shapes() -> None:
     assert openai_tools()[0]["type"] == "function"
     assert "parameters_json_schema" in gemini_tools()[0]
     assert mcp_tools()[0]["inputSchema"]["type"] == "object"
+
+
+def test_no_text_names_a_tool_that_was_removed() -> None:
+    """Seen live: after `info` and `ls` became `arch`, the workspace notes, the restart
+    message and the image-prompt schema still told the driver to call `info`."""
+    import re
+    from pathlib import Path
+
+    import wspx
+
+    root = Path(wspx.__file__).parent
+    pattern = re.compile(r"`{1,2}(info|ls)\b(?!\.)")
+    hits = [
+        f"{path.relative_to(root)}:{n}"
+        for path in [*root.rglob("*.py"), *root.rglob("*.md")]
+        if "control/ui" not in path.as_posix()
+        for n, line in enumerate(path.read_text().splitlines(), 1)
+        if pattern.search(line)
+    ]
+    assert hits == []
+    assert "info" not in json.dumps(mcp_tools()).replace("information", "")

@@ -106,7 +106,7 @@ class HandleTable:
             lines.append(f"{entry.display}{size}{desc}")
         hidden = len(self._entries) - len(rows)
         if hidden > 0:
-            lines.insert(0, f"(+{hidden} older handles; `info --handles` lists all)")
+            lines.insert(0, f"(+{hidden} older handles; `arch` with handles=true lists all)")
         return "\n".join(lines)
 
     def dump(self) -> list[dict[str, Any]]:
