@@ -33,7 +33,8 @@ The tools come in groups; each description starts with its group.
 4. **[edit] edit / check** — stage an op (`project_out`, `ablate`, `scale`,
    `bake_steer`, `rank_one_write`, `transplant`, …), checked statically and
    numerically before it is staged; then `check` it: KL against the base on a
-   canary, perplexity and degenerate output.
+   canary (and an image canary on a vision-language model), perplexity and
+   degenerate output.
 5. **[keep] test / vcs / export** — `test --vs base` for paired deltas; commits
    run check first. Use branches for experiments, `vcs diff`, `vcs revert`
    (exact) and `vcs bisect` when something regresses.

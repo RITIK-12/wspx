@@ -56,7 +56,7 @@ from wspx.lab.evaluate import SuiteModel
 from wspx.lab.grep import Environment, GrepResult, Hit, grep
 from wspx.lab.index import ModelIndex, build_index
 from wspx.lab.ir.model_ir import ModelIR, Target
-from wspx.lab.media import Media, is_media
+from wspx.lab.media import Media, canary_inputs, is_media
 from wspx.lab.ops import OpContext
 from wspx.lab.patch import TensorDelta, materialize
 from wspx.lab.probe import Probe
@@ -936,7 +936,34 @@ class Lab:
                     for r in degenerate_reasons(out, eos=eos)
                     if r not in before and r not in reasons
                 )
-        return SmokeMetrics(kl, self._base_canary["ppl"], perplexity(logits, ids, mask), reasons)
+        return SmokeMetrics(
+            kl, self._base_canary["ppl"], perplexity(logits, ids, mask), reasons, self._image_kl()
+        )
+
+    def _image_kl(self) -> float | None:
+        """KL vs base on the image canary: the text canary never runs the vision tower."""
+        if self.text.media is None:
+            return None
+        assert self._base_canary is not None
+        if "image_inputs" not in self._base_canary:
+            inputs = canary_inputs(self.text.media.processor, self.device)
+            self._base_canary["image_inputs"] = inputs
+            if inputs is not None:
+                with torch.no_grad(), self.at_base():
+                    self._base_canary["image_logits"] = self._image_logits(inputs).cpu()
+        inputs = self._base_canary["image_inputs"]
+        if inputs is None:
+            return None
+        with torch.no_grad():
+            logits = self._image_logits(inputs)
+        base = self._base_canary["image_logits"].to(logits.device)
+        return token_kl(base, logits, inputs.get("attention_mask"))
+
+    def _image_logits(self, inputs: dict[str, Any]) -> torch.Tensor:
+        extra = {k: v for k, v in inputs.items() if k not in ("input_ids", "attention_mask")}
+        ids = inputs["input_ids"]
+        mask = inputs.get("attention_mask", torch.ones_like(ids))
+        return analysis.forward(self.model, self.ir, ids, mask, extra)
 
     # ------------------------------------------------------------------ test
 

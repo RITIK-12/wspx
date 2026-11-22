@@ -373,6 +373,17 @@ def test_info_counts_the_vision_tower_on_image_prompts(lab: Any) -> None:
     assert fc2.kind != "param"
 
 
+def test_check_sees_a_vision_tower_edit(lab: Any) -> None:
+    """Seen live on Inkling-2-Mini: check's canary was text only, so a vision-tower edit
+    showed KL 0.000 and check could not tell it from no edit."""
+    assert lab._smoke().image_kl == 0.0  # at base nothing moves
+    lab.edit.scale("model.visual.blocks.0.mlp.linear_fc2.weight", factor=0.0)
+    report = lab.check()
+    assert report.stats["canary_kl"] == pytest.approx(0.0, abs=1e-6)  # text never sees it
+    assert report.stats["canary_image_kl"] > 1e-6
+    assert "image canary KL" in report.summary()
+
+
 def test_an_ir_from_an_older_capture_is_rebuilt(tmp_path: Path) -> None:
     import json
 

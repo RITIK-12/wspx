@@ -426,6 +426,8 @@ class SmokeMetrics:
     ppl_base: float | None = None
     ppl_new: float | None = None
     degenerate: list[str] = field(default_factory=list)
+    image_kl: float | None = None
+    """Mean per-token KL(base ‖ edited) on the image canary (vision-language models)."""
 
 
 def token_kl(
@@ -484,6 +486,20 @@ def smoke_report(metrics: SmokeMetrics, cfg: CheckSection) -> Report:
                 ],
             )
         )
+    if metrics.image_kl is not None:
+        report.stats["canary_image_kl"] = metrics.image_kl
+        if metrics.image_kl > cfg.max_canary_kl:
+            add(
+                diag(
+                    Code.CANARY_KL,
+                    f"image canary KL vs base {metrics.image_kl:.3f} > {cfg.max_canary_kl}",
+                    fixes=[
+                        Fix(title="lower the strength"),
+                        Fix(title="narrow the edit to fewer units or layers"),
+                        Fix(title="trace --vs base on an image prompt to see where it diverges"),
+                    ],
+                )
+            )
     if metrics.ppl_base and metrics.ppl_new:
         rise = metrics.ppl_new / metrics.ppl_base - 1
         report.stats.update({"ppl_base": metrics.ppl_base, "ppl_new": metrics.ppl_new})

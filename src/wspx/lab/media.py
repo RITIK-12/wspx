@@ -301,17 +301,47 @@ def probe_inputs(processor: Any, device: torch.device | str) -> dict[str, Any] |
     ``None`` when there is no image processor or it cannot render one: the capture
     then runs on text alone, as for a language model.
     """
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    return _image_inputs(
+        processor, Image.new("RGB", (PROBE_SIDE, PROBE_SIDE), (127, 127, 127)), device
+    )
+
+
+def canary_inputs(processor: Any, device: torch.device | str) -> dict[str, Any] | None:
+    """The image canary ``check`` compares with the base: a fixed patterned image (four
+    coloured quadrants over a gradient), so edits to the vision tower show in the logits.
+    ``None`` without an image processor."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    side = PROBE_SIDE
+    image = Image.new("RGB", (side, side))
+    colours = [(220, 40, 40), (40, 180, 60), (40, 70, 220), (230, 210, 40)]
+    image.putdata(
+        [
+            tuple(
+                (c + (x + y) * 96 // (2 * side)) % 256
+                for c in colours[2 * (y * 2 // side) + (x * 2 // side)]
+            )
+            for y in range(side)
+            for x in range(side)
+        ]
+    )
+    return _image_inputs(processor, image, device, "Describe the colours and their layout.")
+
+
+def _image_inputs(
+    processor: Any, image: Any, device: torch.device | str, question: str = "What is shown?"
+) -> dict[str, Any] | None:
     if processor is None or getattr(processor, "image_processor", None) is None:
         return None
     try:
-        from PIL import Image
-
-        image = Image.new("RGB", (PROBE_SIDE, PROBE_SIDE), (127, 127, 127))
         messages = [
-            {
-                "role": "user",
-                "content": [{"type": "image"}, {"type": "text", "text": "What is shown?"}],
-            }
+            {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": question}]}
         ]
         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         out = processor(text=[text], images=[image], return_tensors="pt")

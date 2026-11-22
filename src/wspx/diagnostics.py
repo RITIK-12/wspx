@@ -93,6 +93,8 @@ class Report(BaseModel):
             head += f"\nsmoke: canary KL vs base {stats['canary_kl']:.3f}"
             if "ppl_new" in stats:
                 head += f" · perplexity {stats['ppl_base']:.2f} → {stats['ppl_new']:.2f}"
+            if "canary_image_kl" in stats:
+                head += f" · image canary KL {stats['canary_image_kl']:.3f}"
         if not self.diagnostics:
             return head
         return head + "\n" + "\n".join(d.render() for d in self.diagnostics)
