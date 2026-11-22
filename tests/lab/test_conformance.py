@@ -396,3 +396,55 @@ def test_a_looped_transformer_compiles_to_its_physical_layers(inkling: Any) -> N
     assert "24 layers, L0-L23" in info
     # The traced graph's short names named the wrong layers here, so none survive.
     assert all(r.address == ir.key_of(r.param) or r.block is None for r in ir.roles)
+
+
+def test_probes_see_every_pass_of_a_loop(inkling: Any, tmp_path: Any) -> None:
+    """Seen live on Inkling-2-Mini: trace showed 24 rows for 48 layer calls (pass 1 of the
+    loop only), routes for L0-5 only and from the wrong token, activations rejected
+    ``L6@2`` and contrast read ``layer 30`` as out of range with no way to pick a pass."""
+    from wspx.errors import WspxError
+    from wspx.lab.sdk import open_lab
+
+    (tmp_path / "work").mkdir()
+    lab = open_lab(inkling, store=tmp_path / "store", workdir=tmp_path / "work")
+    prompt = [3, 9, 27, 81, 5]
+
+    fwd = lab.trace(prompt, top=2)
+    calls = fwd.data["calls"]
+    assert len(calls) == 48
+    assert calls[:7] == ["L0", "L1", "L2", "L3", "L4", "L5", "L6@1"]
+    assert calls[18:20] == ["L6@2", "L7@2"]
+    assert calls[-7] == "L17@3"
+    assert "48 layer calls" in fwd.summary
+    routes = fwd.data["routes"]
+    assert set(routes) == set(calls)  # every layer call, looped passes included
+    assert all(len(experts) == 2 for experts in routes.values())  # top-2 of 8, last token
+    lines = {line.split()[0]: line for line in fwd.summary.splitlines() if line.startswith("L")}
+    assert "·" in lines["L9@3"]
+    writers = [address for address, _ in fwd.data["writers"]]
+    assert writers
+    assert not any("message_gate" in w for w in writers)
+
+    lab.edit.scale("L8.self_attn.o_proj.linear[:, 3]", factor=0.5)
+    diff = lab.trace(prompt, vs="base")
+    assert diff.data["first_divergence"] == "L8@1"
+    assert "L5:0.000" in diff.summary
+    assert "L8@3:" in diff.summary
+
+    one = lab.activations([prompt], scope="L9@2.self_attn.o_proj.linear", top=3)
+    every = lab.activations([prompt], scope="L9.self_attn.o_proj.linear", top=3)
+    assert "pass 2" in one.result.expression
+    assert "averaged over every pass" in every.result.expression
+    assert [h.score for h in one.result.hits] != [h.score for h in every.result.hits]
+    missing = lab.activations([prompt], scope="L2@2.self_attn.o_proj.linear", top=3)
+    assert missing.result.hits == []
+    assert "no pass 2" in " ".join(missing.result.skipped)
+
+    d = lab.contrast(
+        [prompt, [4, 9, 27, 81, 5]], [[7, 7, 7, 1, 2], [8, 8, 8, 1, 2]], name="loop", layer="L9@3"
+    )
+    assert d.direction.provenance.startswith("contrast.L9@3-")
+    with pytest.raises(WspxError, match="pick its pass with L<n>@<k>"):
+        lab.contrast([prompt], [[7, 7, 7, 1, 2]], name="far", layer=30)
+    with pytest.raises(WspxError, match="pass 4 does not exist"):
+        lab.contrast([prompt], [[7, 7, 7, 1, 2]], name="far", layer="L9@4")

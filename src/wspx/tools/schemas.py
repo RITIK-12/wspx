@@ -89,7 +89,9 @@ class ActivationsArgs(_Args):
         None,
         alias="in",
         description="Matrices whose input features to rank (default: every matrix whose output "
-        "is the model width). Tensors that are not 2-D matrices are listed as skipped.",
+        "is the model width). Tensors that are not 2-D matrices are listed as skipped. A layer "
+        "that runs more than once is averaged over its passes; 'L6@2.self_attn.o_proj.linear' "
+        "ranks its second pass only.",
     )
     top: int = Field(20, ge=1, le=200, description="Hits to return (the full ranking is saved).")
     name: str | None = Field(
@@ -115,8 +117,10 @@ class ContrastArgs(_Args):
         description="An array of prompts without it, or the path of a .jsonl prompt file."
     )
     name: str = Field(description="Direction name; it is saved as dir:<name>.")
-    layer: int | None = Field(
-        None, ge=0, description="Residual stream after this block (default: middle)."
+    layer: int | str | None = Field(
+        None,
+        description="Residual stream after this layer: an index, or L<n>@<k> for the k-th pass "
+        "of a layer that runs more than once (default: the middle layer, first pass).",
     )
     position: Literal["last", "mean"] = "last"
 

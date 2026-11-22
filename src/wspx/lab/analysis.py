@@ -7,6 +7,7 @@ can persist for the UI.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -17,7 +18,7 @@ from wspx.errors import WspxError
 from wspx.lab.index import tensor_stats
 from wspx.lab.ir.model_ir import ModelIR, Target
 from wspx.lab.media import is_media
-from wspx.lab.probe import Probe, writer_units
+from wspx.lab.probe import Probe, layer_calls, pass_suffix, token_calls, writer_units
 from wspx.lab.tensors import select
 from wspx.lab.text import Prompt, Text
 
@@ -159,6 +160,8 @@ class Direction:
     nothing to hold out (in-sample, any two prompts separate perfectly)."""
     held_out: tuple[int, int] | None = None
     """(prompts on their own side when left out, all prompts)."""
+    at: str = ""
+    """Where it was read: ``L12``, or ``L12@3`` for a pass of a looped layer."""
 
     def describe_separation(self) -> str:
         if self.separation is None or self.held_out is None:
@@ -182,28 +185,49 @@ def contrast(
     negative: Sequence[Prompt],
     *,
     name: str,
-    layer: int | None = None,
+    layer: int | str | None = None,
     position: str = "last",
     batch_size: int = 16,
 ) -> Direction:
-    """Difference of means of the residual stream after ``layer`` between two prompt sets."""
+    """Difference of means of the residual stream after ``layer`` between two prompt sets.
+
+    ``layer`` is a layer index or ``L<n>@<k>``, the k-th pass of a layer that runs more than
+    once (default: the middle layer, on its first pass).
+    """
     if not positive or not negative:
         raise WspxError("contrast needs prompts on both sides")
     blocks = ir.num_blocks
     if blocks == 0:
         raise WspxError("contrast needs a residual stream")
-    layer = blocks // 2 if layer is None else layer
-    if not 0 <= layer < blocks:
-        raise WspxError(f"layer {layer} out of range (0-{blocks - 1})")
-    point = f"resid.L{layer}"
+    index, k = resid_layer(ir, blocks // 2 if layer is None else layer)
+    point = f"resid.L{index}" if k == 1 else f"resid.L{index}@{k}"
+    label = f"L{index}@{k}" if ir.runs_of_layer(index) > 1 else f"L{index}"
     pos_acts = _residuals(model, ir, probe, text, positive, point, position, batch_size)
     neg_acts = _residuals(model, ir, probe, text, negative, point, position, batch_size)
     vector = pos_acts.mean(0) - neg_acts.mean(0)
-    provenance = f"contrast.L{layer}-resid.n{len(positive) + len(negative)}"
+    provenance = f"contrast.{label}-resid.n{len(positive) + len(negative)}"
     separation, held_out = _held_out_separation(pos_acts, neg_acts)
     return Direction(
-        name, vector, layer, provenance, len(positive), len(negative), separation, held_out
+        name, vector, index, provenance, len(positive), len(negative), separation, held_out, label
     )
+
+
+def resid_layer(ir: ModelIR, layer: int | str) -> tuple[int, int]:
+    """``(layer index, pass)`` from ``12``, ``"12"``, ``"L12"`` or ``"L12@3"``."""
+    blocks = ir.num_blocks
+    match = re.fullmatch(r"L?(\d+)(?:@(\d+))?", str(layer).strip())
+    if match is None:
+        raise WspxError(f"layer {layer!r}: a layer index, or L<n>@<k> for the k-th pass")
+    index, k = int(match.group(1)), int(match.group(2) or 1)
+    if not 0 <= index < blocks:
+        raise WspxError(
+            f"layer {index} out of range (0-{blocks - 1}); a layer that runs more than once "
+            "is still one layer: pick its pass with L<n>@<k>"
+        )
+    runs = ir.runs_of_layer(index)
+    if not 1 <= k <= runs:
+        raise WspxError(f"L{index} runs {runs} time(s) per forward pass; pass {k} does not exist")
+    return index, k
 
 
 def _held_out_separation(
@@ -376,42 +400,65 @@ def _norm_and_unembed(model: torch.nn.Module, ir: ModelIR) -> tuple[Any, Any]:
 def forward_trace(
     model: torch.nn.Module, ir: ModelIR, probe: Probe, text: Text, prompt: Prompt, *, top: int = 5
 ) -> Trace:
+    """One row per layer call in run order: the residual norm, the logit lens and, on a
+    mixture-of-experts model, the experts routed at the last token. A layer that runs more
+    than once has a row per pass (``L6@2``)."""
     device = next(model.parameters()).device
     batch = text.batch([prompt], device)
     ids, mask = batch
-    resid_points = [f"resid.L{b.index}" for b in ir.semantics.blocks]
-    attn_points = [p for p in probe.points if p.startswith(("attn.", "route."))]
+    calls = layer_calls(ir)
+    route_points: dict[str, str] = {}
+    for label, point in calls:
+        route_point = _route_point(probe, point)
+        if route_point is not None:
+            route_points[label] = route_point
+    attn_points = [p for p in probe.points if p.startswith("attn.")]
+    wanted = [point for _, point in calls] + attn_points + list(route_points.values())
     units = writer_units(ir)
-    with torch.no_grad(), probe.capture(resid_points + attn_points, units=units) as cap:
+    with torch.no_grad(), probe.capture(list(dict.fromkeys(wanted)), units=units) as cap:
         logits = forward(model, ir, ids, mask, batch.extra)
     norm, unembed = _norm_and_unembed(model, ir)
-    lens_ids, lens_p, resid_norm = [], [], []
+    labels: list[str] = []
+    lens_ids: list[list[int]] = []
+    lens_p: list[list[float]] = []
+    resid_norm: list[float] = []
+    experts: list[list[int] | None] = []
     with torch.no_grad():
-        for point in resid_points:
-            h = cap.points[point]
+        for label, point in calls:
+            h = cap.points.get(point)
+            if h is None:
+                continue  # the layer ran fewer times on this prompt than when the IR was built
+            labels.append(label)
             resid_norm.append(float(h[0, -1].float().norm()))
             probs = torch.softmax(unembed(norm(h[:, -1:])).float(), dim=-1)[0, -1]
             topk = torch.topk(probs, k=top)
             lens_ids.append(topk.indices.tolist())
             lens_p.append(topk.values.tolist())
+            route = cap.points.get(route_points[label]) if label in route_points else None
+            experts.append(_last_token_experts(route) if route is not None else None)
         final = torch.softmax(logits[0].float(), dim=-1)
         entropy = (-(final * final.clamp_min(1e-30).log()).sum(-1)).tolist()
         out_ids = final.argmax(-1).tolist()
-    writers = _top_writers(model, ir, cap.units, top=top)
-    routes = {
-        p: [t[1][0, -1].tolist() if len(t) > 1 else t[0][0, -1].tolist()]
-        for p, t in cap.points.items()
-        if p.startswith("route.")
-    }
+    writers = _top_writers(model, ir, cap.unit_calls, tuple(ids.shape), top=top)
+    looped = [label for label in labels if "@" in label]
     lines = [
-        f"forward trace · {ids.shape[1]} tokens · {len(resid_points)} blocks",
-        "block  |h|      logit lens @ last token",
+        f"forward trace · {ids.shape[1]} tokens · {len(labels)} layer calls"
+        + (
+            f" (looped layers have a row per pass, L<n>@<k>; {len(looped)} of the rows)"
+            if looped
+            else ""
+        ),
+        "lens = the final norm and the unembedding applied to each layer call's output",
+        "call    |h|      logit lens @ last token"
+        + ("  ·  experts routed @ last token" if any(e is not None for e in experts) else ""),
     ]
-    for i in range(len(resid_points)):
+    for i, label in enumerate(labels):
         toks = ", ".join(
             f"{text.show(t)} {p:.2f}" for t, p in zip(lens_ids[i], lens_p[i], strict=True)
         )
-        lines.append(f"L{i:<5d} {resid_norm[i]:<8.3g} {toks}")
+        routed_to = experts[i]
+        routed = f"  ·  {' '.join(map(str, routed_to))}" if routed_to is not None else ""
+        lines.append(f"{label:<7s} {resid_norm[i]:<8.3g} {toks}{routed}")
     lines.append(
         "predicted next token at the last 3 positions (H = entropy): "
         + " ".join(
@@ -422,12 +469,9 @@ def forward_trace(
         lines.append(
             "top writer units @ last token: " + ", ".join(f"{a} {s:.2f}" for a, s in writers[:top])
         )
-    if routes:
-        lines.append(
-            "routes @ last token: "
-            + "; ".join(f"{p[6:]} {v[0]}" for p, v in list(routes.items())[:6])
-        )
+    routes = {label: e for label, e in zip(labels, experts, strict=True) if e is not None}
     arrays = {
+        "calls": labels,
         "resid_norm": resid_norm,
         "lens_ids": lens_ids,
         "lens_p": lens_p,
@@ -435,26 +479,49 @@ def forward_trace(
         "output_ids": out_ids,
         "input_ids": ids[0].tolist(),
     }
-    return Trace("forward", "\n".join(lines), arrays, {"writers": writers, "routes": routes})
+    return Trace(
+        "forward", "\n".join(lines), arrays, {"calls": labels, "writers": writers, "routes": routes}
+    )
+
+
+def _route_point(probe: Probe, resid_point: str) -> str | None:
+    """The router point of the same layer call as a ``resid.L<n>[@k]`` point."""
+    name = "route." + resid_point.removeprefix("resid.")
+    return name if name in probe.points else None
+
+
+def _last_token_experts(route: Any) -> list[int] | None:
+    """The experts a router's ``topk`` picked for the last token (its indices output)."""
+    outs = route if isinstance(route, list | tuple) else [route]
+    indices = next((o for o in reversed(outs) if not o.is_floating_point()), None)
+    if indices is None or indices.dim() == 0:
+        return None
+    rows = indices.reshape(-1, indices.shape[-1]) if indices.dim() > 1 else indices.reshape(1, -1)
+    return [int(e) for e in rows[-1].tolist()]
 
 
 def _top_writers(
     model: torch.nn.Module,
     ir: ModelIR,
-    units: dict[str, torch.Tensor],
+    unit_calls: dict[str, list[torch.Tensor]],
+    tokens: tuple[int, ...],
     *,
     top: int,
     position: int = -1,
 ) -> list[tuple[str, float]]:
-    """Units whose contribution ``a_j · ‖w_j‖`` to the residual is largest at ``position``."""
+    """Units whose contribution ``a_j · ‖w_j‖`` to the residual is largest at ``position``,
+    on every call of their module over the prompt (a pass of a looped layer is tagged ``@k``)."""
     scored: list[tuple[str, float]] = []
     params = dict(model.named_parameters())
-    for param, acts in units.items():
+    for param, every in unit_calls.items():
         role = ir.primary_role(param)
+        calls = token_calls(every, tokens)
         if role is None or role.in_dim is None:
             continue
-        a = acts[0, position].float() if acts.dim() == 3 else acts[position].float()
-        scored.extend(_unit_scores(role, a * _unit_norms(params[param], role.in_dim), top))
+        norms = _unit_norms(params[param], role.in_dim)
+        for k, acts in enumerate(calls, start=1):
+            a = acts[0, position].float()
+            scored.extend(_unit_scores(role, a * norms, top, pass_suffix(len(calls), k)))
     scored.sort(key=lambda x: -abs(x[1]))
     return scored[: top * 4]
 
@@ -465,10 +532,12 @@ def _unit_norms(weight: torch.Tensor, in_dim: int) -> torch.Tensor:
     return w.norm(dim=1 - in_dim) if w.dim() == 2 else torch.ones(w.shape[in_dim], device=w.device)
 
 
-def _unit_scores(role: Any, score: torch.Tensor, top: int) -> list[tuple[str, float]]:
+def _unit_scores(
+    role: Any, score: torch.Tensor, top: int, suffix: str = ""
+) -> list[tuple[str, float]]:
     k = min(top, score.numel())
     _, idx = torch.topk(score.abs(), k=k)
-    return [(f"{role.address}[:, {int(i)}]", float(score[int(i)])) for i in idx]
+    return [(f"{role.address}[:, {int(i)}]{suffix}", float(score[int(i)])) for i in idx]
 
 
 def diff_trace(
@@ -485,16 +554,20 @@ def diff_trace(
     device = next(model.parameters()).device
     batch = text.batch([prompt], device)
     ids, mask = batch
-    points = [f"resid.L{b.index}" for b in ir.semantics.blocks]
+    calls = layer_calls(ir)
+    points = [point for _, point in calls]
     units = writer_units(ir)
     with torch.no_grad():
         with probe.capture(points, units=units) as here:
             logits_here = forward(model, ir, ids, mask, batch.extra)
         with switch, probe.capture(points, units=units) as there:
             logits_there = forward(model, ir, ids, mask, batch.extra)
-    divergence = []
-    for p in points:
+    labels, divergence = [], []
+    for label, p in calls:
+        if p not in here.points or p not in there.points:
+            continue
         a, b = here.points[p][0, -1].float(), there.points[p][0, -1].float()
+        labels.append(label)
         divergence.append(float((a - b).norm() / b.norm().clamp_min(1e-30)))
     out_a = logits_here[0].argmax(-1).tolist()
     out_b = logits_there[0].argmax(-1).tolist()
@@ -503,15 +576,20 @@ def diff_trace(
     params = dict(model.named_parameters())
     for param in units:
         role = ir.primary_role(param)
-        if role is None or role.in_dim is None or param not in here.units:
+        shape = tuple(ids.shape)
+        mine = token_calls(here.unit_calls.get(param, []), shape)
+        theirs = token_calls(there.unit_calls.get(param, []), shape)
+        if role is None or role.in_dim is None or not mine or len(mine) != len(theirs):
             continue
-        delta = (here.units[param][0, -1] - there.units[param][0, -1]).float()
-        moved.extend(_unit_scores(role, delta * _unit_norms(params[param], role.in_dim), top))
+        norms = _unit_norms(params[param], role.in_dim)
+        for k, (x, y) in enumerate(zip(mine, theirs, strict=True), start=1):
+            delta = (x[0, -1] - y[0, -1]).float()
+            moved.extend(_unit_scores(role, delta * norms, top, pass_suffix(len(mine), k)))
     moved.sort(key=lambda x: -abs(x[1]))
     first = next((i for i, d in enumerate(divergence) if d > 1e-3), None)
-    lines = ["diff trace · relative residual change at the last token, per block"]
-    lines.append(" ".join(f"L{i}:{d:.3f}" for i, d in enumerate(divergence)))
-    lines.append(f"first divergence: {'L' + str(first) if first is not None else 'none'}")
+    lines = ["diff trace · relative residual change at the last token, per layer call"]
+    lines.append(" ".join(f"{label}:{d:.3f}" for label, d in zip(labels, divergence, strict=True)))
+    lines.append(f"first divergence: {labels[first] if first is not None else 'none'}")
     lines.append(
         f"output tokens changed at {len(changed)} of {len(out_a)} positions"
         + (
@@ -525,8 +603,12 @@ def diff_trace(
     return Trace(
         "diff",
         "\n".join(lines),
-        {"divergence": divergence, "changed": changed},
-        {"moved": moved[: top * 4], "first_divergence": first},
+        {"calls": labels, "divergence": divergence, "changed": changed},
+        {
+            "calls": labels,
+            "moved": moved[: top * 4],
+            "first_divergence": labels[first] if first is not None else None,
+        },
     )
 
 
@@ -563,15 +645,21 @@ def attribution_trace(
         for n, p in model.named_parameters():
             p.requires_grad_(requires[n])
     scored: list[tuple[str, float]] = []
-    for param, acts in fail.units.items():
+    for param, every in fail.unit_calls.items():
         role = ir.primary_role(param)
-        grad = acts.grad
-        if role is None or grad is None or param not in ref.units:
+        shape = tuple(ids_f.shape)
+        kept = [c for c in every if token_calls([c], shape)]  # the originals carry .grad
+        refs = token_calls(ref.unit_calls.get(param, []), tuple(ids_r.shape))
+        if role is None or not kept or len(refs) != len(kept):
             continue
-        a_f = acts.detach()[0, -1].float()
-        a_r = ref.units[param][0, -1].float()
-        score = (a_f - a_r) * grad[0, -1].float()
-        scored.extend(_unit_scores(role, score, max(top, 10)))  # rank over a wide pool
+        for k, (acts, ref_acts) in enumerate(zip(kept, refs, strict=True), start=1):
+            if acts.grad is None:
+                continue
+            (a_f,) = token_calls([acts.detach()], shape)
+            (grad,) = token_calls([acts.grad], shape)
+            score = (a_f[0, -1].float() - ref_acts[0, -1].float()) * grad[0, -1].float()
+            # rank over a wide pool; a pass of a looped layer is tagged @k
+            scored.extend(_unit_scores(role, score, max(top, 10), pass_suffix(len(kept), k)))
     scored.sort(key=lambda x: -abs(x[1]))
     logp_ref = float(torch.log_softmax(ref_logits[0, -1].float(), dim=-1)[tid])
     lines = [

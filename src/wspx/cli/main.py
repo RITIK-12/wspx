@@ -502,7 +502,10 @@ def contrast(
     negative: Annotated[str, typer.Argument(help=".jsonl of prompts without it")],
     name: Annotated[str, typer.Option("--name")],
     session: Session = None,
-    layer: Annotated[int | None, typer.Option("--layer")] = None,
+    layer: Annotated[
+        str | None,
+        typer.Option("--layer", help="a layer index, or L<n>@<k> for the k-th pass of a loop"),
+    ] = None,
     position: Annotated[
         str, typer.Option("--position", help="last token, or the mean over tokens")
     ] = "last",

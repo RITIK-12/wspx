@@ -103,18 +103,68 @@ def _layer_points(
         for k in range(2, runs + 1):
             out[f"resid.L{i}@{k}"] = Point(path, MODULE_OUT, k - 1)
     owner = {p: i for i, p in enumerate(paths)}
+    found: dict[str, dict[int, list[Point]]] = {
+        "attn": defaultdict(list),
+        "route": defaultdict(list),
+    }
     for node in graph.nodes:
         head = node.module[len(prefix) :].split(".", 1)[0] if node.module.startswith(prefix) else ""
         layer = owner.get(prefix + head)
         if layer is None:
             continue
-        i = layer
         op = node.short_op
-        if "scaled_dot_product" in op and f"attn.L{i}" not in out:
-            out[f"attn.L{i}"] = Point(node.module, node.op, occurrence[node.idx], "args")
-        if node.meta.get("forced_routing") and f"route.L{i}" not in out:
-            out[f"route.L{i}"] = Point(node.module, node.op, occurrence[node.idx], "outs")
+        if "scaled_dot_product" in op:
+            found["attn"][layer].append(Point(node.module, node.op, occurrence[node.idx], "args"))
+        if node.meta.get("forced_routing"):
+            found["route"][layer].append(Point(node.module, node.op, occurrence[node.idx], "outs"))
+    for kind, per_layer in found.items():
+        for i, seen in per_layer.items():
+            out[f"{kind}.L{i}"] = seen[0]
+            runs = stack["runs"][i]
+            if runs > 1 and len(seen) % runs == 0:  # the same ops again on every pass
+                per = len(seen) // runs
+                for k in range(2, runs + 1):
+                    out[f"{kind}.L{i}@{k}"] = seen[(k - 1) * per]
     return out
+
+
+def layer_calls(ir: ModelIR) -> list[tuple[str, str]]:
+    """``(label, resid point)`` for every layer call of a forward pass, in run order.
+
+    A layer that runs more than once is labelled ``L6@2`` on its second pass, so a looped
+    model lists each pass where it happens rather than one row per physical layer.
+    """
+    stack = ir.structure.get("stack")
+    if not stack:
+        return [(f"L{b.index}", f"resid.L{b.index}") for b in ir.semantics.blocks]
+    passes: dict[int, int] = defaultdict(int)
+    out = []
+    for start, end in stack["order"]:
+        for i in range(start, end + 1):
+            passes[i] += 1
+            k = passes[i]
+            label = f"L{i}@{k}" if stack["runs"][i] > 1 else f"L{i}"
+            out.append((label, f"resid.L{i}" if k == 1 else f"resid.L{i}@{k}"))
+    return out
+
+
+def token_calls(calls: list[torch.Tensor], tokens: tuple[int, ...]) -> list[torch.Tensor]:
+    """The calls whose input runs over the prompt's own tokens, as ``[batch, seq, features]``
+    (an input flattened to ``[batch·seq, features]`` is reshaped). A module can also run on
+    another stream (image patches), which is not a pass. ``.grad`` stays on the originals."""
+    batch, seq = tokens[0], tokens[1]
+    out = []
+    for c in calls:
+        if c.dim() >= 3 and tuple(c.shape[:2]) == (batch, seq):
+            out.append(c)
+        elif c.dim() == 2 and c.shape[0] == batch * seq:
+            out.append(c.reshape(batch, seq, -1))
+    return out
+
+
+def pass_suffix(calls: int, k: int) -> str:
+    """`` @k`` for the k-th (1-based) of several calls of a module, else nothing."""
+    return f" @{k}" if calls > 1 else ""
 
 
 def _first_tensor(value: Any) -> torch.Tensor | None:
@@ -176,7 +226,10 @@ class Capture:
     points: dict[str, Any] = field(default_factory=dict)
     """Point name → captured tensor(s), first call only unless ``all_calls``."""
     units: dict[str, torch.Tensor] = field(default_factory=dict)
-    """Writer param → input activations of its module (the units)."""
+    """Writer param → input activations of its module (the units) on its first call."""
+    unit_calls: dict[str, list[torch.Tensor]] = field(default_factory=dict)
+    """Writer param → its module's input on every call, in order: one per pass of a layer
+    that runs more than once."""
 
 
 class Probe:
@@ -274,7 +327,9 @@ class Probe:
                 x = args[0]
                 if grad_units and x.requires_grad:
                     x.retain_grad()
-                result.units.setdefault(key, x if grad_units else x.detach())
+                kept = x if grad_units else x.detach()
+                result.units.setdefault(key, kept)
+                result.unit_calls.setdefault(key, []).append(kept)
 
             handles.append(module.register_forward_pre_hook(grab))
         try:

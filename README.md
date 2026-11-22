@@ -70,7 +70,7 @@ wspx vcs commit -m "Project out the loop direction in L15/L19 down_proj"
 | inspect | `show` | Stats, histogram, spectrum and vocabulary of a slice |
 | inspect | `grep` | Ranks weight units by an expression (no forward pass) |
 | probe | `generate` | Samples from the current weights |
-| probe | `trace` | Logit lens and top writers; diff (`--vs`) and attribution traces |
+| probe | `trace` | Logit lens per layer call (each pass of a looped layer), routed experts and top writers; diff (`--vs`) and attribution traces |
 | probe | `activations` | Ranks input features by how strongly they fire on prompts |
 | probe | `contrast` | A direction from two prompt sets, and its top writers |
 | edit | `edit` | Stages `ablate`, `set`, `scale`, `project_out`, `bake_steer`, `rank_one_write` or `transplant` (`source="base"` restores weights) |

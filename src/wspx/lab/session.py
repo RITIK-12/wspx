@@ -447,10 +447,20 @@ class Lab:
         A unit is one input feature: the module's input, which a matrix contracts along its
         recorded input axis. Tensors in the scope that are not such matrices are listed as
         skipped, never dropped silently. Without a scope: every matrix whose output is the
-        model width (what each neuron writes).
+        model width (what each neuron writes). A layer that runs more than once is averaged
+        over every pass, unless the scope names one: ``L6@2.self_attn.o_proj.linear``.
         """
-        from wspx.lab.probe import writer_units
+        from wspx.lab.probe import token_calls, writer_units
 
+        shown = scope
+        only: int | None = None
+        if scope:
+            looped = re.fullmatch(r"(L[\d*,\-]+)@(\d+)(\..+)?", scope.strip())
+            if looped:
+                scope = looped.group(1) + (looped.group(3) or "")
+                only = int(looped.group(2))
+                if only < 1:
+                    raise GrepError(f"{shown}: passes count from 1")
         params = (
             list(dict.fromkeys(t.param for t in self.resolve(scope)))
             if scope
@@ -481,19 +491,27 @@ class Lab:
         started = time.perf_counter()
         size = analysis.MEDIA_BATCH if any(is_media(p) for p in prompts) else 16
         totals: dict[str, torch.Tensor] = {}
-        count = 0.0
+        counts: dict[str, float] = {}
+        ran: dict[str, int] = {}
         for start in range(0, len(prompts), size):
             batch = self.text.batch(prompts[start : start + size], self.device)
             ids, mask = batch
             with torch.no_grad(), self.probe.capture([], units=units) as cap:
                 analysis.forward(self.model, self.ir, ids, mask, batch.extra)
             m = mask.unsqueeze(-1).float()
-            count += float(m.sum())
             for param in units:
-                if param not in cap.units:
-                    continue  # the module did not run on these prompts
-                part = (cap.units[param].float().abs() * m).sum((0, 1))
+                calls = token_calls(cap.unit_calls.get(param, []), tuple(ids.shape))
+                if not calls:
+                    continue  # the module did not run on these prompts' tokens
+                ran[param] = max(ran.get(param, 0), len(calls))
+                if only is not None:
+                    if len(calls) < only:
+                        continue
+                    calls = [calls[only - 1]]
+                part = sum((c.float().abs() * m).sum((0, 1)) for c in calls)
+                assert isinstance(part, torch.Tensor)
                 totals[param] = totals[param] + part if param in totals else part
+                counts[param] = counts.get(param, 0.0) + float(m.sum()) * len(calls)
         scores: list[Hit] = []
         for param in units:
             role = self.ir.primary_role(param)
@@ -502,21 +520,32 @@ class Lab:
             width = self.ir.params[param].shape[role.in_dim]
             key = self.ir.key_of(param)
             if param not in totals:
-                skipped.append(f"{key} (did not run on these prompts)")
+                skipped.append(
+                    f"{key} (runs {ran[param]} time(s) per forward pass; no pass {only})"
+                    if param in ran
+                    else f"{key} (did not run on these prompts)"
+                )
                 continue
             if totals[param].numel() != width:
                 skipped.append(f"{key} (its module's input is not its {width} input features)")
                 continue
-            mean = (totals[param] / count).tolist()
+            mean = (totals[param] / counts[param]).tolist()
             cols = role.in_dim == 1
             scores.extend(
                 Hit(f"{key}[:, {j}]" if cols else f"{key}[{j}]", param, None, j, s)
                 for j, s in enumerate(mean)
             )
         scores.sort(key=lambda h: -h.score)
+        passes = (
+            f", pass {only}"
+            if only is not None
+            else ", averaged over every pass"
+            if any(n > 1 for n in ran.values())
+            else ""
+        )
         return GrepResult(
-            f"mean |activation| on {len(prompts)} prompt(s)",
-            scope or "writers",
+            f"mean |activation| on {len(prompts)} prompt(s){passes}",
+            shown or "writers",
             "col",
             len(scores),
             scores,
@@ -623,7 +652,7 @@ class Lab:
         negative: Sequence[Prompt] | str,
         *,
         name: str,
-        layer: int | None = None,
+        layer: int | str | None = None,
         position: str = "last",
     ) -> DirectionRef:
         if not re.fullmatch(r"[A-Za-z_][\w\-]*", name):
@@ -644,7 +673,7 @@ class Lab:
             HandleKind.DIRECTION,
             f"dir:{name}",
             d.provenance,
-            description=f"difference of means at L{d.layer}, {d.describe_separation()}",
+            description=f"difference of means at {d.at or f'L{d.layer}'}, {d.describe_separation()}",
             size=f"{d.vector.numel()}-d",
             call_id=self.context.get("call_id"),
         )
@@ -1535,7 +1564,10 @@ class Lab:
         ids, mask = self._canary()
         with torch.no_grad(), self.probe.capture([], units=wanted) as cap:
             analysis.forward(self.model, self.ir, ids, mask)
-        return {k: v.reshape(-1, v.shape[-1]).float().cpu() for k, v in cap.units.items()}
+        return {
+            k: torch.cat([v.reshape(-1, v.shape[-1]) for v in calls]).float().cpu()
+            for k, calls in cap.unit_calls.items()
+        }
 
     def _rerun_recorded(self, ours: str | None, theirs: str) -> list[str]:
         names: set[str] = set()

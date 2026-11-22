@@ -246,6 +246,7 @@ class TestProbesAndTraces:
         probe, text = Probe(model, ir), Text(None)
         fwd = analysis.forward_trace(model, ir, probe, text, [1, 2, 3, 4, 5])
         assert len(fwd.arrays["resid_norm"]) == 3
+        assert fwd.arrays["calls"] == ["L0", "L1", "L2"]
         assert "logit lens" in fwd.summary
 
         @contextlib.contextmanager
@@ -261,7 +262,7 @@ class TestProbesAndTraces:
                     w.copy_(saved)
 
         diff = analysis.diff_trace(model, ir, probe, text, [1, 2, 3, 4, 5], switch=zero_block_1())
-        assert diff.data["first_divergence"] == 1
+        assert diff.data["first_divergence"] == "L1"
         attr = analysis.attribution_trace(
             model, ir, probe, text, [1, 2, 3, 4, 5], [1, 2, 3, 4, 6], top=4
         )

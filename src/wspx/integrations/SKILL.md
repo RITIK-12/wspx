@@ -23,9 +23,10 @@ The tools come in groups; each description starts with its group.
    - `grep 'writes(" Wait") > 0.3' --in 'L*.mlp.down_proj'` ranks the units that
      write a token; expert tensors are split per expert.
 3. **[probe] generate / trace / activations / contrast** — these run the model.
-   - `trace` shows the logit lens over each layer's output, top writer units and
-     routes; `--vs` diffs two commits; a reference input gives an attribution
-     "stack trace".
+   - `trace` shows the logit lens over each layer call's output in run order (a
+     looped layer gets a row per pass, `L6@2`), the experts routed on each call,
+     and top writer units; `--vs` diffs two commits; a reference input gives an
+     attribution "stack trace".
    - `activations` ranks the input features of matrices by how strongly they fire
      on prompts.
    - `contrast` builds a direction from two prompt sets and lists its top writers.
@@ -49,7 +50,9 @@ The tools come in groups; each description starts with its group.
 - Every result names the exact key it touched. Short names such as `L9.mlp.down`
   are accepted only where `arch` lists them (checked against the module tree).
 - An edit to a layer that runs several times changes every pass, since the passes
-  share the tensor. Probes address passes as `L6@2`.
+  share the tensor. Probes address a pass as `L6@2`: trace has a row per pass,
+  `activations --in 'L6@2.self_attn.o_proj'` ranks that pass (without `@k` it
+  averages them), and `contrast --layer L6@2` reads it.
 - Handles name results: `@r1:<slug>` (result sets), `dir:<name>` (directions),
   `p_…` (patches), `t_…` (traces), commits and branches. Pass handles instead of
   copying data, e.g. `edit project_out dir:loop L19.mlp.down_proj cols=@r1`.

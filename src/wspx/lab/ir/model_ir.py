@@ -160,6 +160,13 @@ class ModelIR:
             return 1
         return int(stack["runs"][layer]) or 1
 
+    def runs_of_layer(self, index: int) -> int:
+        """How many times layer ``index`` of the stack runs per forward pass."""
+        stack = self.structure.get("stack")
+        if stack is None or not 0 <= index < len(stack["runs"]):
+            return 1
+        return int(stack["runs"][index]) or 1
+
     def roles_of(self, param: str) -> list[Role]:
         return list(self._by_param.get(self.canonical(param), []))
 
@@ -530,7 +537,8 @@ class ModelIR:
             if times > 1:
                 lines.append(
                     f"  {_span(a, b)} run {times} times with the same weights: an edit there "
-                    f"changes every pass; their activations are {_span(a, b)}@1…@{times}"
+                    f"changes every pass. trace shows each pass as L<n>@1…@{times}; "
+                    f"activations and contrast take one pass as L<n>@<k>"
                 )
             elif times == 0:
                 lines.append(f"  {_span(a, b)} did not run in the traced pass")

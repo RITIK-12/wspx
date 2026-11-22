@@ -167,7 +167,7 @@ function TraceObject({ handle }: { handle: any }) {
   return (
     <div className="trace">
       {trace.kind === "forward" && <LogitLens arrays={trace.arrays} />}
-      {trace.kind === "diff" && <Divergence values={trace.arrays.divergence} />}
+      {trace.kind === "diff" && <Divergence values={trace.arrays.divergence} calls={trace.arrays.calls} />}
       {trace.kind === "attribution" && (
         <ol className="ranking">
           {trace.data.ranking.map(([addr, score]: [string, number]) => (
@@ -188,7 +188,7 @@ function LogitLens({ arrays }: { arrays: any }) {
     <table className="lens">
       <thead>
         <tr>
-          <th>block</th>
+          <th>call</th>
           <th>|h|</th>
           <th>top tokens at the last position</th>
         </tr>
@@ -196,7 +196,7 @@ function LogitLens({ arrays }: { arrays: any }) {
       <tbody>
         {arrays.lens_ids.map((ids: number[], i: number) => (
           <tr key={i}>
-            <td>L{i}</td>
+            <td>{arrays.calls?.[i] ?? `L${i}`}</td>
             <td>
               <span className="bar" style={{ width: `${(100 * arrays.resid_norm[i]) / max}%` }} />
             </td>
@@ -214,13 +214,13 @@ function LogitLens({ arrays }: { arrays: any }) {
   );
 }
 
-function Divergence({ values }: { values: number[] }) {
+function Divergence({ values, calls }: { values: number[]; calls?: string[] }) {
   const max = Math.max(...values, 1e-9);
   return (
     <div className="divergence">
       {values.map((v, i) => (
         <div key={i} className="div-row">
-          <span>L{i}</span>
+          <span>{calls?.[i] ?? `L${i}`}</span>
           <span className="bar" style={{ width: `${(100 * v) / max}%` }} />
           <span className="muted small">{v.toFixed(4)}</span>
         </div>
