@@ -95,7 +95,14 @@ HandleLookup = Callable[[Handle, str], list[int]]
 """(handle, parameter) → unit indices along the tensor dim being narrowed."""
 
 
-IR_VERSION = 3
+IR_VERSION = 4
+"""4: roles at every key without a layer stack, and the ``gate`` kind."""
+
+KIND_LEGEND = (
+    ("writer", "output is model-width and reaches the stream"),
+    ("reader", "input is model-width"),
+    ("gate", "model-width output that only passes through sigmoid, tanh or the like"),
+)
 """Bumped when capture changes what an IR records; older cached IRs are rebuilt.
 3: the deterministic structure (layer stack, loops, structural keys, per-tensor facts)."""
 
@@ -491,6 +498,12 @@ class ModelIR:
             lines.append(
                 f"keys: {self.key_of(example)} = {example} · raw names and globs work too · "
                 "slices like [:, 5] or [3] (expert 3)"
+            )
+        kinds = {r.kind for r in self.roles}
+        legend = [(k, text) for k, text in KIND_LEGEND if k in kinds]
+        if legend:
+            lines.append(
+                "kinds (from the traced ops): " + " · ".join(f"{k} = {text}" for k, text in legend)
             )
         aliases = sorted(
             {

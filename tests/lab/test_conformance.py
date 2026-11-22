@@ -316,10 +316,8 @@ def test_all_experts_exercised_with_more_experts_than_slots() -> None:
     assert ir.capture["passes"] >= 3
 
 
-def test_a_looped_transformer_compiles_to_its_physical_layers() -> None:
-    """Inkling-2-Mini (seen live): 24 layers whose middle 12 run three times, attention
-    residuals every 6 layers and a short convolution inside each attention. The traced
-    graph read 96 blocks; the module tree and the call log give 24 layers and the loop."""
+def _tiny_inkling() -> Any:
+    """Inkling-2-Mini's layout at toy width: 24 layers, 6-17 looped three times, 8 experts."""
     local = [i for i in range(24) if i % 6 != 5]
     text = {
         "model_type": "inkling2_loop_text",
@@ -329,8 +327,8 @@ def test_a_looped_transformer_compiles_to_its_physical_layers() -> None:
         "num_hidden_layers": 24,
         "num_attention_heads": 4,
         "num_key_value_heads": 2,
-        "head_dim": 16,
-        "swa_head_dim": 16,
+        "head_dim": 24,  # 4 heads × 24 ≠ width 64, as in the real model (24 × 128 vs 2304)
+        "swa_head_dim": 24,
         "swa_num_attention_heads": 4,
         "swa_num_key_value_heads": 2,
         "d_rel": 4,
@@ -352,7 +350,19 @@ def test_a_looped_transformer_compiles_to_its_physical_layers() -> None:
     }
     config = T.AutoConfig.for_model("inkling2_loop", text_config=text, vision_config=vision)
     torch.manual_seed(0)
-    model = T.AutoModelForImageTextToText.from_config(config).eval()
+    return T.AutoModelForImageTextToText.from_config(config).eval()
+
+
+@pytest.fixture(scope="module")
+def inkling() -> Any:
+    return _tiny_inkling()
+
+
+def test_a_looped_transformer_compiles_to_its_physical_layers(inkling: Any) -> None:
+    """Inkling-2-Mini (seen live): 24 layers whose middle 12 run three times, attention
+    residuals every 6 layers and a short convolution inside each attention. The traced
+    graph read 96 blocks; the module tree and the call log give 24 layers and the loop."""
+    model = inkling
     ir = build_ir(model)
     stack = ir.structure["stack"]
     assert (stack["path"], stack["size"]) == ("model.language_model.layers", 24)
@@ -372,6 +382,15 @@ def test_a_looped_transformer_compiles_to_its_physical_layers() -> None:
     assert router.kind == "router"
     assert ir.structure["final_norm"] == "model.language_model.norm"
     assert ir.semantics.unembed == "lm_head.weight"
+    # Seen live: the loop gates' projections, model-width but fed to tanh, were "writers"
+    # and topped every writer ranking. The op graph shows where their output goes.
+    layer = "model.language_model.layers.9"
+    kind = {n: r.kind for n in ir.params if (r := ir.primary_role(n)) is not None}
+    assert kind[f"{layer}.q_message_gate.forget_gate_proj.weight"] == "gate"
+    assert kind[f"{layer}.mlp_message_gate.message_gate_proj.weight"] == "gate"
+    assert kind[f"{layer}.self_attn.o_proj.linear.weight"] == "writer"
+    assert kind[f"{layer}.self_attn.o_proj.gate_proj.weight"] == "reader"
+    assert "gate = model-width output that only passes through sigmoid" in ir.render_info()
     info = ir.render_info()
     assert "L6-17 run 3 times with the same weights" in info
     assert "24 layers, L0-L23" in info

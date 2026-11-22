@@ -158,16 +158,21 @@ def structural_semantics(
     """Roles from the structure: one per tensor, keyed exactly; the traced graph's short names
     are kept as aliases only if every one of them lands inside the layer it names."""
     stack = structure.get("stack")
+    keys: dict[str, str] = structure["keys"]
+    kinds: dict[str, str] = structure["kinds"]
+    facts: dict[str, dict[str, Any]] = structure["facts"]
+    layer_of: dict[str, int] = structure["layer_of"]
     if stack is None:
+        # Every tensor still answers to its key (what arch and grep print); the traced
+        # graph's names stay as aliases.
+        roles = _key_roles(params, keys, kinds, facts, layer_of, {})
+        seen = {(r.address, r.param) for r in roles}
+        old.roles = roles + [r for r in old.roles if (r.address, r.param) not in seen]
         old.notes.append(
             "no layer stack (module list) in the module tree: layer roles are inferred from "
             "the traced graph"
         )
         return old
-    keys: dict[str, str] = structure["keys"]
-    kinds: dict[str, str] = structure["kinds"]
-    facts: dict[str, dict[str, Any]] = structure["facts"]
-    layer_of: dict[str, int] = structure["layer_of"]
 
     traced_all = [r for r in old.roles if r.block is not None]
     # The traced layers must be the stack's layers, and each name must land in its own layer.
@@ -180,29 +185,7 @@ def structural_semantics(
             if r.split is None and r.expert is None:
                 whole_kind.setdefault(r.param, r.kind)
 
-    roles: list[Role] = []
-    for name, info in params.items():
-        kind = kinds[name]
-        if kind == "matrix" and whole_kind.get(name) in ("writer", "reader"):
-            kind = whole_kind[name]  # square matrices: the traced side, checked against the tree
-        fact = facts.get(name, {})
-        in_dim, out_dim = fact.get("in"), fact.get("out")
-        if kind in ("embed", "pos_embed"):
-            # A lookup table ([rows, width], as nn.Embedding defines it) is gathered, not
-            # contracted, even when a tied head also multiplies by it.
-            in_dim, out_dim = None, (1 if len(info.shape) == 2 else None)
-        roles.append(
-            Role(
-                address=keys[name],
-                param=name,
-                kind=kind,
-                block=layer_of.get(name),
-                module=info.module,
-                in_dim=in_dim,
-                out_dim=out_dim,
-                experts=fact.get("experts"),
-            )
-        )
+    roles = _key_roles(params, keys, kinds, facts, layer_of, whole_kind)
     # ``embed`` and ``unembed`` always resolve, even when the tensor's key is a layer key (a
     # plain sequential's last linear) or both are one tied tensor.
     hidden = structure.get("hidden")
@@ -262,9 +245,10 @@ def structural_semantics(
             )
     elif traced_all:
         notes.append(
-            f"the traced graph found {len(old.blocks)} blocks against {stack['size']} layers "
-            "in the module tree, so its short names (attn.q, mlp.down, …) are not used; "
-            "structural keys only"
+            "short names like attn.q or mlp.down are off: they come from residual adds in the "
+            f"traced ops, which split this model into {len(old.blocks)} pieces, not its "
+            f"{stack['size']} layers. The layer map above comes from the module tree and is "
+            "unaffected; use the keys"
         )
     blocks = [
         Block(i, _child_path(stack, i), list(old.blocks[i].branches) if valid else [], [])
@@ -335,6 +319,41 @@ def _stacks(
     # Prefer what the forward pass ran through; nested lists (experts) hold a subset.
     found.sort(key=lambda s: (-s["called"], -s["total"], len(s["path"]), s["path"]))
     return found
+
+
+def _key_roles(
+    params: dict[str, Any],
+    keys: dict[str, str],
+    kinds: dict[str, str],
+    facts: dict[str, dict[str, Any]],
+    layer_of: dict[str, int],
+    whole_kind: dict[str, str],
+) -> list[Role]:
+    """One role per tensor, addressed by its key."""
+    roles: list[Role] = []
+    for name, info in params.items():
+        kind = kinds[name]
+        if kind == "matrix" and whole_kind.get(name) in ("writer", "reader"):
+            kind = whole_kind[name]  # square matrices: the traced side, checked against the tree
+        fact = facts.get(name, {})
+        in_dim, out_dim = fact.get("in"), fact.get("out")
+        if kind in ("embed", "pos_embed"):
+            # A lookup table ([rows, width], as nn.Embedding defines it) is gathered, not
+            # contracted, even when a tied head also multiplies by it.
+            in_dim, out_dim = None, (1 if len(info.shape) == 2 else None)
+        roles.append(
+            Role(
+                address=keys[name],
+                param=name,
+                kind=kind,
+                block=layer_of.get(name),
+                module=info.module,
+                in_dim=in_dim,
+                out_dim=out_dim,
+                experts=fact.get("experts"),
+            )
+        )
+    return roles
 
 
 def _stack_record(
@@ -412,14 +431,57 @@ def _config_int(model: torch.nn.Module, field: str) -> int | None:
     return int(value) if isinstance(value, int) else None
 
 
+SHAPE_OPS = frozenset(
+    {
+        "view", "_unsafe_view", "reshape", "_reshape_alias", "transpose", "t", "permute",
+        "contiguous", "clone", "_to_copy", "to", "expand", "unsqueeze", "squeeze", "alias",
+        "detach", "slice", "select", "split", "split_with_sizes", "unbind", "flatten",
+        "unflatten", "lift_fresh",
+    }
+)  # fmt: skip
+"""Ops that move or cast a value without changing what it holds."""
+
+SQUASH_OPS = frozenset(
+    {
+        "sigmoid", "tanh", "softplus", "exp", "log_sigmoid_forward", "silu", "gelu", "relu",
+        "softmax", "_softmax", "log_softmax", "_log_softmax", "hardsigmoid", "hardswish",
+        "elu", "mish",
+    }
+)  # fmt: skip
+"""Elementwise functions that squash a value before it is used: a gate's projection ends here."""
+
+
+def _squashed(graph: OpGraph, node: Any) -> bool:
+    """Whether every use of ``node``'s output, past shape-only ops, is a squashing function
+    (the projection makes a gate, such as ``tanh(forget_gate_proj(x))``, not a residual write)."""
+    frontier, seen = list(node.outs), set()
+    while frontier:
+        vid = frontier.pop()
+        if vid in seen:
+            continue
+        seen.add(vid)
+        uses = graph.consumers.get(vid, [])
+        if not uses:
+            return False  # it leaves the graph: an output, so it is written somewhere
+        for idx, _ in uses:
+            op = graph.nodes[idx].short_op
+            if op in SHAPE_OPS:
+                frontier.extend(graph.nodes[idx].outs)
+            elif op not in SQUASH_OPS:
+                return False
+    return bool(seen)
+
+
 def _facts(
     params: dict[str, Any], graphs: dict[str, OpGraph]
 ) -> tuple[dict[str, dict[str, Any]], set[str], list[str]]:
-    """Per tensor: contracted (in) and output (out) axes, expert count; router tensors;
-    tensors read by an embedding lookup, in first-use order."""
+    """Per tensor: contracted (in) and output (out) axes, expert count, whether every
+    contraction feeds only a squashing function (``gate``); router tensors; tensors read by
+    an embedding lookup, in first-use order."""
     facts: dict[str, dict[str, Any]] = {}
     routers: set[str] = set()
     embedding_reads: list[str] = []
+    gated: dict[str, bool] = {}
     for graph in graphs.values():
         for node in graph.nodes:
             routed = node.meta.get("forced_routing")
@@ -436,9 +498,13 @@ def _facts(
                 fact = facts.setdefault(use.name, {"in": None, "out": None, "experts": None})
                 if not gather and fact["in"] is None and use.in_dim is not None:
                     fact["in"], fact["out"] = use.in_dim, use.out_dim
+                if not gather and use.in_dim is not None:
+                    gated[use.name] = gated.get(use.name, True) and _squashed(graph, node)
                 shape = params[use.name].shape
                 if use.rows is not None and len(shape) >= 3:
                     fact["experts"] = shape[0]
+    for name, fact in facts.items():
+        fact["gate"] = gated.get(name, False)
     return facts, routers, embedding_reads
 
 
@@ -497,7 +563,8 @@ def _kind(
     module_class: str,
 ) -> str:
     """What a tensor is, from facts only: which accessor returned it, what read it, its shape
-    against the model width (writer: output is width-long; reader: input is)."""
+    against the model width (writer: output is width-long; reader: input is; gate: output is
+    width-long but only ever passes through a squashing function such as sigmoid or tanh)."""
     if name == embed:
         return "embed"
     if name == unembed:
@@ -517,7 +584,8 @@ def _kind(
     if len(shape) == 2 and fact.get("in") is not None and fact.get("out") is not None:
         width_in, width_out = shape[fact["in"]], shape[fact["out"]]
         if hidden is not None and width_out == hidden and width_in != hidden:
-            return "writer"
+            # width-long output, but only ever squashed into a gate: it scales the stream
+            return "gate" if fact.get("gate") else "writer"
         if hidden is not None and width_in == hidden and width_out != hidden:
             return "reader"
         return "matrix"

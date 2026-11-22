@@ -180,6 +180,34 @@ class TestOtherClasses:
             build_ir(nn.Linear(2, 2))
 
 
+class _Flat(nn.Module):
+    """No module list anywhere: a conv kernel and a free query tensor between two ends."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tok = nn.Embedding(20, 8)
+        self.conv = nn.Conv1d(8, 8, 3, padding=2, groups=8)
+        self.query = nn.Parameter(torch.randn(3, 4, 8))
+        self.head = nn.Linear(8, 20, bias=False)
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        x = self.tok(ids)
+        c = self.conv(x.transpose(1, 2))[..., : ids.shape[1]].transpose(1, 2)
+        gate = torch.einsum("qhd,bsd->bsqh", self.query, x).mean((-1, -2)).unsqueeze(-1)
+        return self.head(x + c * torch.sigmoid(gate))
+
+
+def test_every_key_resolves_without_a_layer_stack() -> None:
+    """The keys arch and grep print must resolve: without a layer stack the roles came from
+    the traced graph alone, so ``conv`` (the key of conv.weight) matched nothing."""
+    torch.manual_seed(0)
+    model = _Flat().eval()
+    ir = build_ir(model, example_inputs=(torch.randint(0, 20, (2, 5)),))
+    assert ir.structure["stack"] is None
+    for name in ir.params:
+        assert [t.param for t in ir.resolve(ir.key_of(name))] == [name]
+
+
 class _LoopBlock(nn.Module):
     """A block whose first residual add in the trace is an inner one (``k + conv(k)``)."""
 

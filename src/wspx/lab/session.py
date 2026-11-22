@@ -348,7 +348,7 @@ class Lab:
             key = self.ir.key_of(t.param)
             name = key if t.address in (key, t.param) else f"{t.address} = {key}"
             facts = []
-            if role is not None and role.in_dim is not None:
+            if role is not None and role.in_dim is not None and role.out_dim is not None:
                 facts.append(f"in {role.in_dim} · out {role.out_dim}")
             if role is not None and role.experts:
                 facts.append(f"{role.experts} experts on dim 0")
