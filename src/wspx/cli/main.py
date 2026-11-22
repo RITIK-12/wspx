@@ -607,7 +607,8 @@ def vcs(
     action: Annotated[
         str,
         typer.Argument(
-            help="status, diff, commit, log, checkout, branch, revert, bisect, blame, merge"
+            help="status, discard, diff, commit, log, checkout, branch, revert, bisect, blame, "
+            "merge"
         ),
     ],
     target: Annotated[str | None, typer.Argument(help="revision, branch, address or suite")] = None,

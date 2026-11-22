@@ -187,6 +187,11 @@ def test_diff_counts_adapters_and_names_patches_that_cancel(lab) -> None:  # typ
     assert commit.ok, commit.summary
     checkout = call(lab, "vcs", {"action": "checkout", "rev": "HEAD"})
     assert "3 patched tensor(s)" in checkout.summary  # 2 that differ + 1 that cancels
+    assert call(lab, "edit", {"op": "scale", "args": {"targets": "L1.mlp.down", "factor": 2}}).ok
+    dropped = call(lab, "vcs", {"action": "discard"})
+    assert dropped.ok, dropped.summary
+    assert dropped.data["discarded"]
+    assert "nothing staged" in call(lab, "vcs", {"action": "status"}).summary
 
 
 def test_large_delta_ranks_are_sketched() -> None:

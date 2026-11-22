@@ -114,6 +114,8 @@ def _vcs(lab: Lab, a: Any) -> ToolResult:
     action = a.action
     if action == "status":
         return lab.status()
+    if action == "discard":
+        return lab.discard()
     if action == "commit":
         if not a.message:
             raise WspxError("vcs commit needs a message")

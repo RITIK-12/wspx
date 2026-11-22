@@ -199,6 +199,7 @@ class TestArgs(_Args):
 class VcsArgs(_Args):
     action: Literal[
         "status",
+        "discard",
         "diff",
         "commit",
         "log",
@@ -331,8 +332,9 @@ TOOLS: dict[str, ToolSpec] = {
         ToolSpec(
             "vcs",
             VcsArgs,
-            "[keep] Version control: status, diff, commit, log, checkout, branch, revert, "
-            "bisect, blame, merge. Commits run check first.",
+            "[keep] Version control: status, discard (drop staged patches), diff, commit, log, "
+            "checkout, branch, revert (undo a commit), bisect, blame, merge. Commits run check "
+            "first.",
             mutates=True,
         ),
         ToolSpec(

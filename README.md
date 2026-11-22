@@ -76,7 +76,7 @@ wspx vcs commit -m "Project out the loop direction in L15/L19 down_proj"
 | edit | `edit` | Stages `ablate`, `set`, `scale`, `project_out`, `bake_steer`, `rank_one_write` or `transplant` (`source="base"` restores weights) |
 | edit | `check` | Static, numeric and smoke diagnostics, each with suggested fixes |
 | keep | `test` | Test suites, paired against another revision |
-| keep | `vcs` | `status`, `diff`, `commit`, `log`, `checkout`, `branch`, `revert`, `bisect`, `blame`, `merge` (strategies include `orthogonalize`) |
+| keep | `vcs` | `status`, `discard`, `diff`, `commit`, `log`, `checkout`, `branch`, `revert`, `bisect`, `blame`, `merge` (strategies include `orthogonalize`) |
 | keep | `export` | Merged safetensors, PEFT adapter, GGUF or a portable bundle |
 | keep | `run` | A Python script in the lab, with the SDK loaded |
 

@@ -98,6 +98,24 @@ class TestWorkflow:
         lab.revert("HEAD")
         assert hashes(lab) == base  # S4: revert restores the base hash
 
+    def test_discard_drops_staged_patches_and_keeps_the_branch(self, lab: Lab) -> None:
+        """Seen live: revert refused staged patches and pointed to a discard that did not
+        exist; the driver fell back on a forced checkout of HEAD."""
+        lab.edit.ablate("L0.mlp.down[:, 3]")
+        lab.commit("Ablate unit 3")
+        committed = hashes(lab)
+        lab.edit.scale("L1.mlp.down[:, 0:4]", factor=0.5)
+        lab.edit.ablate("L2.mlp.down[7]")
+        assert hashes(lab) != committed
+        with pytest.raises(VCSError, match="vcs discard"):
+            lab.revert("HEAD")
+        out = lab.discard()
+        assert out.summary.startswith("discarded 2 staged patch(es)")
+        assert hashes(lab) == committed
+        assert lab.staged == []
+        assert lab.repo.current_branch(lab.session) == "exp"  # still on the branch
+        assert lab.discard().summary == "nothing staged"
+
     def test_history_order_does_not_change_bits(self, tmp_path: Path) -> None:
         """The same deltas staged in either order give bit-identical weights (S4)."""
         lab = open_lab(tiny_llama(), store=tmp_path / "ref", workdir=tmp_path)

@@ -36,8 +36,9 @@ The tools come in groups; each description starts with its group.
    canary (and an image canary on a vision-language model), perplexity and
    degenerate output.
 5. **[keep] test / vcs / export** — `test --vs base` for paired deltas; commits
-   run check first. Use branches for experiments, `vcs diff`, `vcs revert`
-   (exact) and `vcs bisect` when something regresses.
+   run check first. `vcs discard` drops staged patches; `vcs revert` undoes a
+   commit (exactly). Use branches for experiments, `vcs diff` and `vcs bisect`
+   when something regresses.
 
 ## Keys and handles
 

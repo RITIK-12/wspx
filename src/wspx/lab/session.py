@@ -1101,10 +1101,28 @@ class Lab:
         ]
         return ToolResult("\n".join(lines) or "(no commits)", {"commits": [c.oid for c in rows]})
 
+    def discard(self) -> ToolResult:
+        """Drop every staged patch: the working tree goes back to HEAD, on the same branch."""
+        if not self.staged:
+            return ToolResult("nothing staged", {"discarded": []})
+        dropped = [r.handle for r in self.staged]
+        oid = self.repo.head(self.session)
+        self.tree.checkout(TreeState.from_dict(self.repo.tree_of_oid(oid)))
+        if oid:
+            self._verify(self.repo.get_commit(oid))
+        self.staged = []
+        self._save()
+        return ToolResult(
+            f"discarded {len(dropped)} staged patch(es): {', '.join(dropped)} · the working "
+            f"tree is HEAD ({short(oid) if oid else 'base'}) again · hashes verified",
+            {"discarded": dropped, "head": oid},
+        )
+
     def checkout(self, rev: str, *, force: bool = False) -> ToolResult:
         if self.staged and not force:
             raise VCSError(
-                f"{len(self.staged)} staged patch(es) would be lost; commit them or use force"
+                f"{len(self.staged)} staged patch(es) would be lost; commit them, drop them "
+                "with `vcs discard`, or use force"
             )
         branch = (
             rev if rev in self.repo.branches() or self.store.refs.exists(f"heads/{rev}") else None
@@ -1148,7 +1166,10 @@ class Lab:
 
     def revert(self, rev: str = "HEAD") -> ToolResult:
         if self.staged:
-            raise VCSError("commit or discard staged patches before reverting")
+            raise VCSError(
+                "revert undoes a commit; staged patches are not committed yet: drop them with "
+                "`vcs discard`, or commit them first"
+            )
         oid = self.repo.resolve(rev, self.session)
         tree = self.repo.revert_tree(self.session, rev)
         state = TreeState.from_dict(tree)
