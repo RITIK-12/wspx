@@ -56,6 +56,7 @@ export const post = <T = any>(path: string, body: unknown = {}) =>
 // Every kind the trace records; the stream names each event by its kind.
 export const EVENT_KINDS = [
   "session", "start", "turn", "tool_call", "notes", "compaction", "lab", "loop", "command", "error", "hook", "end",
+  "model_io",
 ];
 
 /** "in 6,054 (6,000 cache read, 50 written) → out 90 tokens" */

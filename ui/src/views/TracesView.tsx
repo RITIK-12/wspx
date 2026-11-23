@@ -116,8 +116,9 @@ function OpenModelTrace({ events, model }: { events: any[]; model?: string }) {
         {model} · {generations.length} generation(s), {records.length - generations.length} forward pass(es)
         {omitted ? ` (+${omitted} not kept)` : ""} · prompts {tokens("prompt_tokens").toLocaleString()} tokens → output{" "}
         {tokens("output_tokens").toLocaleString()} tokens ·{" "}
-        <label>
-          <input type="checkbox" checked={all} onChange={(e) => setAll(e.target.checked)} /> show forward passes
+        <label className="toggle">
+          <input type="checkbox" checked={all} onChange={(e) => setAll(e.target.checked)} />
+          show forward passes
         </label>
       </div>
       <ol className="timeline">
