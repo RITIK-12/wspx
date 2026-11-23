@@ -9,6 +9,7 @@
   --accent-soft: #e8ecfb;
   --danger: #c0352b;
   --danger-soft: #fbe9e7;
+  --ok-soft: #e5f3ea;
   --warn: #9a6400;
   --ok: #2f7d4f;
   --attn: #3554d1;
@@ -35,6 +36,7 @@
     --accent-soft: #1e2540;
     --danger: #ff7b70;
     --danger-soft: #3a1d1a;
+    --ok-soft: #17301f;
     --warn: #e6b450;
     --ok: #6cc591;
     --attn: #8aa2ff;
@@ -393,3 +395,34 @@ tr.failed td { color: var(--danger); }
 .lg-add { flex-shrink: 0; width: 16px; height: 16px; border-radius: 50%; border: 1.5px solid var(--accent); color: var(--accent); display: inline-flex; align-items: center; justify-content: center; font-weight: 700; font-size: 12px; line-height: 1; }
 .lg-loop { flex-shrink: 0; width: 16px; color: var(--accent); font-weight: 700; font-size: 11px; }
 @media (max-width: 1100px) { .archx-grid { grid-template-columns: 1fr; } .archx-weights { position: static; max-height: none; } }
+
+/* weight diff, laid out as an IDE shows a git diff */
+.gitdiff { border: 1px solid var(--line); border-radius: 8px; margin-top: 12px; background: var(--panel); overflow: hidden; }
+.gitdiff-head { padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: 13px; }
+.gitdiff-split { display: grid; grid-template-columns: minmax(180px, 280px) 1fr; min-height: 220px; }
+.gitdiff-files { list-style: none; margin: 0; padding: 4px; border-right: 1px solid var(--line); overflow: auto; max-height: 520px; }
+.gitdiff-files li { display: flex; align-items: center; gap: 6px; padding: 5px 8px; border-radius: 5px; cursor: pointer; font-size: 12px; }
+.gitdiff-files li:hover { background: var(--sunk); }
+.gitdiff-files li.on { background: var(--accent-soft); }
+.gitdiff-mark { color: var(--warn); font-family: var(--mono); font-weight: 600; }
+.gitdiff-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gitdiff-stat { color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.gitdiff-body { overflow: auto; max-height: 520px; font-family: var(--mono); font-size: 12px; }
+.gitdiff-file { position: sticky; top: 0; display: flex; flex-wrap: wrap; gap: 10px; padding: 8px 12px; background: var(--sunk); border-bottom: 1px solid var(--line); }
+.gitdiff-hunk { border-bottom: 1px solid var(--line); }
+.gitdiff-at { padding: 4px 12px; color: var(--accent); background: var(--accent-soft); }
+.gitdiff-row { display: grid; grid-template-columns: minmax(96px, max-content) 1fr 1fr; font-variant-numeric: tabular-nums; }
+.gitdiff-row > span { padding: 1px 12px; }
+.gitdiff-row .idx { color: var(--muted); }
+.gitdiff-row .del { background: var(--danger-soft); }
+.gitdiff-row .add { background: var(--ok-soft); border-left: 1px solid var(--line); }
+.gitdiff-row .sign { display: inline-block; width: 14px; }
+.gitdiff-row .del .sign { color: var(--danger); }
+.gitdiff-row .add .sign { color: var(--ok); }
+.gitdiff-cols { color: var(--muted); font-size: 11px; border-bottom: 1px solid var(--line); }
+.gitdiff-cols > span:nth-child(2), .gitdiff-cols > span:nth-child(3) { background: none; }
+.gitdiff-more { padding: 3px 12px; color: var(--muted); font-style: italic; }
+@media (max-width: 720px) {
+  .gitdiff-split { grid-template-columns: 1fr; }
+  .gitdiff-files { border-right: 0; border-bottom: 1px solid var(--line); max-height: 180px; }
+}
