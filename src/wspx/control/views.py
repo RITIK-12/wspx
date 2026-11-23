@@ -23,52 +23,90 @@ def _ir(store: Store, fingerprint: str | None) -> dict[str, Any] | None:
 
 
 def architecture(store: Store, fingerprint: str | None) -> dict[str, Any]:
+    """The compiled map for the UI's diagram: the layer stack and its run order, each layer
+    type's sublayers in run order, every tensor with its key, kind, shape and axes, what sits
+    before and after the stack, and the other modules (a vision tower) where they branch off."""
     ir = _ir(store, fingerprint)
     if ir is None:
         return {"available": False}
     params = ir["params"]
-    sem = ir["semantics"]
-    blocks: dict[int, dict[str, Any]] = {
-        b["index"]: {
-            "index": b["index"],
-            "module": b["module"],
-            "branches": b["branches"],
-            "roles": [],
-        }
-        for b in sem["blocks"]
-    }
-    specials = []
-    for role in sem["roles"]:
-        entry = {
-            "address": role["address"],
-            "param": role["param"],
-            "kind": role["kind"],
-            "shape": params[role["param"]]["shape"],
-            "split": role.get("split"),
-            "experts": role.get("experts"),
-        }
-        if role.get("block") is not None and role["block"] in blocks:
-            blocks[role["block"]]["roles"].append(entry)
-        else:
-            specials.append(entry)
+    st = ir.get("structure") or {}
+    keys, kinds, facts = st.get("keys", {}), st.get("kinds", {}), st.get("facts", {})
+    layer_of = st.get("layer_of", {})
     coverage = ir.get("coverage", {})
+    stack = st.get("stack")
+    tensors = {
+        name: {
+            "key": keys.get(name, name),
+            "kind": kinds.get(name, "param"),
+            "shape": p["shape"],
+            "dtype": p["dtype"],
+            "module": p["module"],
+            "in": facts.get(name, {}).get("in"),
+            "out": facts.get(name, {}).get("out"),
+            "experts": facts.get(name, {}).get("experts"),
+            "layer": layer_of.get(name),
+            "runs": stack["runs"][layer_of[name]] if stack and name in layer_of else 1,
+            "exercised": coverage.get(name, {}).get("exercised", True),
+            "phases": coverage.get(name, {}).get("phases", []),
+        }
+        for name, p in params.items()
+    }
+    ends = {
+        st.get("embed"),
+        st.get("unembed"),
+        *st.get("pos_embed", []),
+        *st.get("stem", []),
+        *st.get("final", []),
+        *st.get("final_norm_params", []),
+    }
+    others: dict[str, list[str]] = {}
+    base = (stack or {}).get("path", "").split(".") if stack else []
+    for name in params:
+        if name in layer_of or name in ends:
+            continue
+        parts = name.split(".")
+        shared = 0
+        while shared < min(len(base), len(parts) - 1) and parts[shared] == base[shared]:
+            shared += 1
+        others.setdefault(".".join(parts[: shared + 1]), []).append(name)
+    nested = {o["path"]: o for o in st.get("others", [])}
     return {
         "available": True,
         "arch": ir["arch"],
         "fingerprint": ir["fingerprint"],
         "params": len(params),
         "numel": sum(_numel(p["shape"]) for p in params.values()),
-        "blocks": [blocks[i] for i in sorted(blocks)],
-        "specials": specials,
-        "tied": sem.get("tied", False),
-        "embed": sem.get("embed"),
-        "unembed": sem.get("unembed"),
-        "unexercised": sorted(k for k, c in coverage.items() if not c.get("exercised")),
-        "unassigned": sem.get("unassigned", []),
-        "head_dims": sem.get("head_dims", {}),
-        "structure": {
-            k: ir.get("structure", {}).get(k) for k in ("hidden", "stack", "final_norm", "config")
-        },
+        "hidden": st.get("hidden"),
+        "tied": st.get("tied", False),
+        "embed": st.get("embed"),
+        "unembed": st.get("unembed"),
+        "pos_embed": st.get("pos_embed", []),
+        "stem": st.get("stem", []),
+        "final": st.get("final", []),
+        "final_norm": st.get("final_norm"),
+        "final_norm_params": st.get("final_norm_params", []),
+        "stack": stack,
+        "others": [
+            {
+                "path": path,
+                "tensors": sorted(names),
+                "numel": sum(_numel(params[n]["shape"]) for n in names),
+                "vision_only": all(tensors[n]["phases"] == ["vision"] for n in names),
+                "stack": next(
+                    (
+                        {"path": s["path"], "size": s["size"]}
+                        for k, s in nested.items()
+                        if k.startswith(path)
+                    ),
+                    None,
+                ),
+            }
+            for path, names in sorted(others.items())
+        ],
+        "tensors": tensors,
+        "unexercised": sorted(n for n, c in coverage.items() if not c.get("exercised")),
+        "config": st.get("config", {}),
     }
 
 

@@ -350,8 +350,14 @@ def test_ui_views_are_served_from_the_store(tmp_path: Path) -> None:
 
         arch = client.get(f"/api/sessions/{sid}/architecture", headers=USER).json()
         assert arch["available"]
-        assert len(arch["blocks"]) == 3
-        assert any(r["address"] == "L0.mlp.down" for r in arch["blocks"][0]["roles"])
+        assert (arch["stack"]["size"], arch["stack"]["runs"]) == (3, [1, 1, 1])
+        (variant,) = arch["stack"]["variants"]
+        names = [b["name"] for b in variant["blocks"]]
+        assert names == ["input_layernorm", "self_attn", "post_attention_layernorm", "mlp"]
+        assert "attends" in variant["blocks"][1]["flags"]
+        down = arch["tensors"]["model.layers.0.mlp.down_proj.weight"]
+        assert (down["key"], down["kind"], down["layer"]) == ("L0.mlp.down_proj", "writer", 0)
+        assert arch["unembed"] == "lm_head.weight"
         history = client.get(f"/api/sessions/{sid}/commits", headers=USER).json()
         assert history["commits"][0]["message"] == "first"
         assert history["commits"][0]["patches"][0]["op"] == "ablate"
