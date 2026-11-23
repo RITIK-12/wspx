@@ -19,6 +19,12 @@ looks up a few names that do not exist while exploring a new model piles up
 
 The first detection of a pattern nudges; if that pattern repeats again, the
 verdict is stop. Resuming is the user's decision.
+
+A step can name the model response it belongs to. Steps that share one are a single
+decision: a model's parallel tool calls each probing a different missing name are one
+look around, not a run of four. So a run counts once per response, and a stop waits
+for a response after the nudge, the first one the model can have read it in. A step
+without a response (an outside caller's tool call) counts on its own.
 """
 
 from __future__ import annotations
@@ -63,8 +69,9 @@ class _SessionState:
         default_factory=lambda: defaultdict(deque)
     )
     turn: int = 0
-    nudged: dict[tuple[str, str], int] = field(default_factory=dict)
-    run: dict[str, tuple[str, int]] = field(default_factory=dict)
+    calls: int = 0
+    nudged: dict[tuple[str, str], tuple[int, tuple[str, int]]] = field(default_factory=dict)
+    run: dict[str, tuple[str, int, tuple[str, int]]] = field(default_factory=dict)
 
 
 _MESSAGES = {
@@ -86,13 +93,20 @@ class LoopDetector:
         self._sessions: dict[str, _SessionState] = defaultdict(_SessionState)
         self._lock = threading.Lock()
 
-    def turn(self, session: str) -> None:
-        """Advance the session's turn counter (one model response)."""
+    def turn(self, session: str) -> int:
+        """Advance the session's turn counter (one model response); the new turn."""
         with self._lock:
-            self._sessions[session].turn += 1
+            state = self._sessions[session]
+            state.turn += 1
+            return state.turn
 
-    def observe(self, session: str, kind: Kind, key: Any, *, label: str = "") -> Verdict | None:
-        """Record one step; ``key=None`` means the step showed no such signal."""
+    def observe(
+        self, session: str, kind: Kind, key: Any, *, label: str = "", step: int | None = None
+    ) -> Verdict | None:
+        """Record one step; ``key=None`` means the step showed no such signal.
+
+        ``step`` is the model response the step came from, when there is one.
+        """
         if not self.enabled:
             return None
         if key is None:
@@ -103,10 +117,15 @@ class LoopDetector:
         digest = key if isinstance(key, str) and len(key) == 16 else fingerprint(key)
         with self._lock:
             state = self._sessions[session]
+            state.calls += 1
+            at = ("response", step) if step is not None else ("call", state.calls)
             if kind in CONSECUTIVE:
-                last, count = state.run.get(kind, ("", 0))
-                count = count + 1 if last == digest else 1
-                state.run[kind] = (digest, count)
+                last, count, last_at = state.run.get(kind, ("", 0, ("", 0)))
+                if last != digest:
+                    count = 1
+                elif last_at != at:  # the same response's other calls are the same decision
+                    count += 1
+                state.run[kind] = (digest, count, at)
                 evidence = tuple([label or digest] * count)
             else:
                 events = state.events[kind]
@@ -118,7 +137,8 @@ class LoopDetector:
                 evidence = tuple(e[2] or e[1] for e in same)
             marker = (kind, digest)
             if marker in state.nudged:
-                if count > state.nudged[marker]:
+                nudged_count, nudged_at = state.nudged[marker]
+                if count > nudged_count and at != nudged_at:
                     return Verdict(
                         "stop",
                         kind,
@@ -129,7 +149,7 @@ class LoopDetector:
                     )
                 return None
             if count >= self.threshold:
-                state.nudged[marker] = count
+                state.nudged[marker] = (count, at)
                 text = _MESSAGES[kind].format(label=label or kind, n=count)
                 return Verdict("nudge", kind, digest, count, evidence, text)
         return None

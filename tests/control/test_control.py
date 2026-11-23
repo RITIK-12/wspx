@@ -418,7 +418,9 @@ def test_each_tool_call_is_counted_once_for_loop_detection(tmp_path: Path) -> No
     seen: list[tuple[str, str]] = []
 
     class Gateway:
-        def observe(self, sid: str, kind: str, key: Any, label: str = "") -> None:
+        def observe(
+            self, sid: str, kind: str, key: Any, label: str = "", step: int | None = None
+        ) -> None:
             seen.append((kind, label))
 
     client, manager = make(tmp_path)
@@ -442,8 +444,10 @@ def test_lookups_that_miss_between_ones_that_match_are_not_a_loop(tmp_path: Path
     actions: list[str] = []
 
     class Gateway:
-        def observe(self, sid: str, kind: str, key: Any, label: str = "") -> Any:
-            verdict = detector.observe(sid, kind, key, label=label)
+        def observe(
+            self, sid: str, kind: str, key: Any, label: str = "", step: int | None = None
+        ) -> Any:
+            verdict = detector.observe(sid, kind, key, label=label, step=step)
             if verdict is None:
                 return None
             actions.append(verdict.action)
@@ -470,6 +474,54 @@ def test_lookups_that_miss_between_ones_that_match_are_not_a_loop(tmp_path: Path
         for _ in range(3):
             assert "E105" in manager.tool(sid, "edit", no_op, source="driver")["summary"]
         assert actions == ["nudge", "nudge"]
+
+
+def test_parallel_misses_in_one_response_are_one_step(tmp_path: Path) -> None:
+    """Seen live on Inkling: one response probed six names that do not exist, in parallel,
+    and the fourth E101 stopped the session before the model could read the nudge. A
+    response's calls are one decision: a run counts once per response, and a stop waits
+    for a response after the nudge."""
+    from wspx.loops import LoopDetector
+
+    detector = LoopDetector(threshold=3)
+    actions: list[str] = []
+
+    class Gateway:
+        def observe(
+            self, sid: str, kind: str, key: Any, label: str = "", step: int | None = None
+        ) -> Any:
+            verdict = detector.observe(sid, kind, key, label=label, step=step)
+            if verdict is None:
+                return None
+            actions.append(verdict.action)
+            return verdict.to_dict()
+
+        def pause(self, sid: str, reason: str) -> None:
+            pass
+
+    client, manager = make(tmp_path)
+    with client:
+        sid = client.post("/api/sessions", json={"model": "tiny"}, headers=USER).json()["id"]
+        wait(lambda: sid in manager.labs)
+        manager.gateway = Gateway()  # type: ignore[assignment]
+        missing = [{"scope": f"no.such.weights{i}*"} for i in range(6)]
+
+        def respond(turn: int, calls: list[dict[str, Any]]) -> list[str]:
+            return [
+                manager.tool(sid, "arch", args, source="driver", turn=turn)["summary"]
+                for args in calls
+            ]
+
+        respond(15, missing)
+        assert actions == []  # six misses in one response: one step
+        respond(16, missing[:2])
+        respond(17, missing[:2])
+        assert actions == ["nudge"]  # three responses running
+        respond(17, missing[2:])
+        assert actions == ["nudge"]  # the rest of that response is no stop: unread
+        summaries = respond(18, missing[:1])
+        assert actions == ["nudge", "stop"]  # read the nudge, and missed again
+        assert "stopped" in summaries[0]
 
 
 def test_lab_failures_are_results_not_crashes() -> None:

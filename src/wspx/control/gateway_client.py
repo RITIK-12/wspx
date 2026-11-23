@@ -76,10 +76,12 @@ class GatewayAdmin:
     def price(self, model: str, inp: float, out: float) -> None:
         self._req("POST", "/admin/prices", json={"model": model, "input": inp, "output": out})
 
-    def observe(self, session: str, kind: str, key: Any, label: str = "") -> dict[str, Any] | None:
+    def observe(
+        self, session: str, kind: str, key: Any, label: str = "", step: int | None = None
+    ) -> dict[str, Any] | None:
         verdict: dict[str, Any] | None = self._req(
             "POST",
             "/admin/observe",
-            json={"session": session, "kind": kind, "key": key, "label": label},
+            json={"session": session, "kind": kind, "key": key, "label": label, "step": step},
         )["verdict"]
         return verdict

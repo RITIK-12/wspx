@@ -415,6 +415,34 @@ class TestLoopDetector:
             assert v is not None
             assert (v.action, v.count) == ("nudge", 3)
 
+    def test_a_response_is_one_step(self) -> None:
+        d = LoopDetector(threshold=3, window=10)
+        for step in (1, 2):
+            for _ in range(5):  # parallel calls of one response
+                assert d.observe("s", "outcome", "E101", step=step) is None
+        v = d.observe("s", "outcome", "E101", step=3)
+        assert v is not None
+        assert (v.action, v.count) == ("nudge", 3)
+        assert d.observe("s", "outcome", "E101", step=3) is None  # same response: unread
+        v = d.observe("s", "outcome", "E101", step=4)
+        assert v is not None
+        assert v.action == "stop"
+
+    def test_identical_calls_stop_only_after_the_nudge_was_read(self) -> None:
+        d = LoopDetector(threshold=3, window=10)
+        key = {"tool": "grep", "args": {"q": "x"}}
+        step = d.turn("s")
+        assert d.observe("s", "call", key, step=step) is None
+        assert d.observe("s", "call", key, step=step) is None
+        v = d.observe("s", "call", key, step=step)
+        assert v is not None
+        assert v.action == "nudge"
+        assert d.observe("s", "call", key, step=step) is None
+        step = d.turn("s")
+        v = d.observe("s", "call", key, step=step)
+        assert v is not None
+        assert v.action == "stop"
+
     def test_window(self) -> None:
         d = LoopDetector(threshold=3, window=4)
         for i in range(12):

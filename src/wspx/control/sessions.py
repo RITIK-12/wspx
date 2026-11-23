@@ -413,7 +413,7 @@ class SessionManager:
             )
         result["summary"] = (result.get("summary") or "") + (f"\n{note}" if note else "")
         result["call_id"] = call_id
-        result["summary"] += self._observe(sid, name, args, result, source)
+        result["summary"] += self._observe(sid, name, args, result, source, turn)
         self.trace.tool_call(
             sid, call_id, name, args, result, turn=turn, latency=latency, source=source
         )
@@ -467,7 +467,13 @@ class SessionManager:
         }
 
     def _observe(
-        self, sid: str, name: str, args: dict[str, Any], result: dict[str, Any], source: str
+        self,
+        sid: str,
+        name: str,
+        args: dict[str, Any],
+        result: dict[str, Any],
+        source: str,
+        turn: int | None = None,
     ) -> str:
         """Repetition across tool calls also counts as a loop (the gateway decides).
 
@@ -483,7 +489,9 @@ class SessionManager:
             if TOOLS[name].mutates and result.get("ok", True):
                 self._epoch[sid] += 1
             verdicts = (
-                [] if source == "driver" else [self.gateway.observe(sid, "call", key, label=name)]
+                []
+                if source == "driver"
+                else [self.gateway.observe(sid, "call", key, label=name, step=turn)]
             )
             codes = sorted(set(_CODE_RE.findall(result.get("summary") or "")))
             # One outcome per call: a no-op edit's E105 and its "no-op edit" reported apart
@@ -491,7 +499,10 @@ class SessionManager:
             outcome = "no-op edit" if "E105" in codes else ",".join(codes)
             if outcome:
                 self._outcome_run.add(sid)
-                verdicts.append(self.gateway.observe(sid, "outcome", outcome, label=outcome))
+                # the turn makes one response's parallel calls one step, not a run
+                verdicts.append(
+                    self.gateway.observe(sid, "outcome", outcome, label=outcome, step=turn)
+                )
             elif sid in self._outcome_run:
                 # a clean call ends the run: one request when a run ends, not one per call
                 self._outcome_run.discard(sid)

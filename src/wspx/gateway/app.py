@@ -325,10 +325,12 @@ def create_app(config: GatewayConfig) -> Starlette:
     def watch(session: str, obs: Observed, status: int, err: str | None) -> list[str]:
         """Feed one response to the loop detector; record nudges and stops."""
         verdicts = []
-        loops.turn(session)
+        step = loops.turn(session)
         if err:
             verdicts.append(
-                loops.observe(session, "error", f"{status}:{err}", label=f"HTTP {status}")
+                loops.observe(
+                    session, "error", f"{status}:{err}", label=f"HTTP {status}", step=step
+                )
             )
         else:
             for name, args in obs.tool_calls:
@@ -336,13 +338,17 @@ def create_app(config: GatewayConfig) -> Starlette:
                 state = epochs.get(session, 0)
                 verdicts.append(
                     loops.observe(
-                        session, "call", {"tool": name, "args": args, "state": state}, label=name
+                        session,
+                        "call",
+                        {"tool": name, "args": args, "state": state},
+                        label=name,
+                        step=step,
                     )
                 )
                 if name in STATE_CHANGING:
                     epochs[session] = state + 1
             if obs.text.strip():
-                verdicts.append(loops.observe(session, "output", obs.text))
+                verdicts.append(loops.observe(session, "output", obs.text, step=step))
             empty = not obs.tool_calls and not obs.text.strip()
             verdicts.append(
                 loops.observe(session, "empty", "empty" if empty else None, label="empty turn")
@@ -452,7 +458,13 @@ def create_app(config: GatewayConfig) -> Starlette:
         """The control plane reports tool calls and outcomes; repetition there also counts."""
         data = await request.json()
         session = data["session"]
-        verdict = loops.observe(session, data["kind"], data["key"], label=data.get("label", ""))
+        verdict = loops.observe(
+            session,
+            data["kind"],
+            data["key"],
+            label=data.get("label", ""),
+            step=data.get("step"),
+        )
         if verdict is None:
             return {"verdict": None}
         ledger.loop_event(session, verdict.to_dict())
