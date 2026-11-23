@@ -72,7 +72,11 @@ export function formatTokens(u: any): string {
 
 export function stream(session: string, since: number, onEvent: (e: TimelineEvent) => void): () => void {
   const source = new EventSource(`/api/sessions/${session}/stream?since=${since}&token=${encodeURIComponent(token)}`);
-  const handler = (msg: MessageEvent) => onEvent(JSON.parse(msg.data));
+  // EventSource fires its own `error` (no data) when the connection drops and while it
+  // reconnects; only events the server sent carry data.
+  const handler = (msg: MessageEvent) => {
+    if (typeof msg.data === "string") onEvent(JSON.parse(msg.data));
+  };
   for (const kind of EVENT_KINDS) {
     source.addEventListener(kind, handler as EventListener);
   }
