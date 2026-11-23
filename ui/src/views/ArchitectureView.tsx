@@ -1,12 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type Dispatch, type KeyboardEvent, type ReactNode, type SetStateAction } from "react";
 import { api, toolCall, type Session } from "../api";
 
-// The compiled map as a diagram, read top to bottom like the classic transformer figure:
-// tokens → embedding → the layer stack (a loop drawn around layers that run more than once)
-// → final norm → unembedding. Pick a layer to see its sublayers in the order they run, on the
-// residual stream; pick a weight to see its shape, axes and kind, and load its values (a
-// magnitude map, histogram and spectrum) from the lab. Everything comes from the module tree
-// and the traced ops, so it is the model as it ran, not a template.
+// The compiled map as a block diagram, drawn like the classic transformer figure: boxes joined
+// by arrows from the input tokens to the output probabilities, the layer stack in a frame
+// marked N×, each sublayer on the residual stream with a skip arrow into ⊕ where its output is
+// added back, loops marked where layers run more than once, and a vision tower feeding in from
+// the side. The adds, the order and the loops are read off the traced op graph, not assumed.
+// Click a box to open it into its weights; click a weight to see its shape, axes and kind, and
+// load its values from the lab.
 
 type Arch = any;
 
@@ -16,7 +17,7 @@ export function ArchitectureView({ session }: { session: Session }) {
   const [arch, setArch] = useState<Arch>(null);
   const [layer, setLayer] = useState(0);
   const [tensor, setTensor] = useState<string | null>(null);
-  const [view, setView] = useState<"diagram" | "3d">("diagram");
+  const [open, setOpen] = useState<Set<string>>(() => new Set());
 
   useEffect(() => {
     api(`/api/sessions/${session.id}/architecture`).then(setArch).catch((e) => setArch({ error: String(e) }));
@@ -32,25 +33,58 @@ export function ArchitectureView({ session }: { session: Session }) {
     setTensor(param);
     const l = arch.tensors[param]?.layer;
     if (l != null) setLayer(l);
+    const box = index.boxOf(param);
+    if (box) setOpen((o) => new Set(o).add(box));
   };
+  const toggle = (id: string) =>
+    setOpen((o) => {
+      const n = new Set(o);
+      if (n.has(id)) n.delete(id);
+      else n.add(id);
+      return n;
+    });
+  const vi = index.variantOf[layer] ?? 0;
+  const layerBoxes = arch.stack ? index.blocksOf(vi).map((b: any) => `L${vi}:${b.name}`) : [];
+  const extra = arch.others.filter((o: any) => !o.vision_only);
 
   return (
     <div className="archx">
       <Summary arch={arch} onFind={pick} index={index} />
       <div className="archx-grid">
-        <section className="archx-flow">
-          <ModelFlow arch={arch} index={index} layer={layer} onLayer={setLayer} tensor={tensor} onTensor={pick} view={view} onView={setView} />
-        </section>
-        <section className="archx-layer">
-          {arch.stack ? (
-            <LayerDetail arch={arch} index={index} layer={layer} onLayer={setLayer} tensor={tensor} onTensor={pick} />
-          ) : (
-            <p className="muted">No layer stack (module list) in this model: its tensors are listed on the left.</p>
+        <section className="archx-diagram">
+          <div className="archx-tools">
+            <span className="muted small">Click a box to open its weights{arch.stack ? " · pick a layer on the strip, or ↑ ↓" : ""}</span>
+            <span className="spacer" />
+            {layerBoxes.length > 0 && (
+              <button onClick={() => setOpen((o) => new Set([...o, ...layerBoxes]))}>Open this layer</button>
+            )}
+            <button onClick={() => setOpen(new Set())} disabled={open.size === 0}>
+              Close all
+            </button>
+          </div>
+          <Diagram arch={arch} index={index} layer={layer} onLayer={setLayer} open={open} onToggle={toggle} tensor={tensor} onTensor={pick} />
+          {extra.length > 0 && (
+            <div className="archx-extra">
+              <div className="muted small">Outside the stack, not on the path above</div>
+              {extra.map((o: any) => (
+                <div key={o.path} className="small">
+                  <code>{o.path}</code> <span className="muted">· {o.tensors.length} weight{o.tensors.length === 1 ? "" : "s"} · {human(o.numel)}</span>
+                  <div className="archx-chips">
+                    {o.tensors.slice(0, 12).map((n: string) => (
+                      <button key={n} className={`wchip ${n === tensor ? "active" : ""}`} onClick={() => pick(n)} title={n}>
+                        {arch.tensors[n].key} <span className="muted">{arch.tensors[n].shape.join("×")}</span>
+                      </button>
+                    ))}
+                    {o.tensors.length > 12 && <span className="muted small">+{o.tensors.length - 12} more · use Find</span>}
+                  </div>
+                </div>
+              ))}
+            </div>
           )}
         </section>
-        <section className="archx-weights">
+        <aside className="archx-weights">
           <WeightPanel arch={arch} session={session} param={tensor} />
-        </section>
+        </aside>
       </div>
     </div>
   );
@@ -61,15 +95,54 @@ export function ArchitectureView({ session }: { session: Session }) {
 interface Index {
   byKey: Map<string, string>;
   variantOf: number[];
-  layerParams: (i: number, inner: string) => string | undefined;
+  layerParam: (i: number, inner: string) => string | undefined;
+  blocksOf: (vi: number) => any[];
+  boxOf: (param: string) => string | null;
 }
 
 function buildIndex(arch: Arch): Index {
   const byKey = new Map<string, string>();
   for (const [param, t] of Object.entries<any>(arch.tensors)) byKey.set(t.key, param);
   const variantOf: number[] = [];
-  (arch.stack?.variants ?? []).forEach((v: any, vi: number) => v.layers.forEach((l: number) => (variantOf[l] = vi)));
-  return { byKey, variantOf, layerParams: (i, inner) => byKey.get(inner ? `L${i}.${inner}` : `L${i}`) };
+  const variants = arch.stack?.variants ?? [];
+  variants.forEach((v: any, vi: number) => v.layers.forEach((l: number) => (variantOf[l] = vi)));
+  const layerParam = (i: number, inner: string) => byKey.get(inner ? `L${i}.${inner}` : `L${i}`);
+  const blocks = variants.map((v: any) => v.blocks ?? groupTensors(v, (inner) => layerParam(v.layers[0], inner), arch));
+  const blocksOf = (vi: number) => blocks[vi] ?? [];
+  const boxOf = (param: string): string | null => {
+    const t = arch.tensors[param];
+    if (!t) return null;
+    if (t.layer != null && arch.stack) {
+      const vi = variantOf[t.layer];
+      const head = `L${t.layer}`;
+      const inner = t.key === head ? "" : t.key.startsWith(`${head}.`) ? t.key.slice(head.length + 1) : null;
+      const b = blocksOf(vi).find((b: any) => b.tensors.includes(inner));
+      return b ? `L${vi}:${b.name}` : null;
+    }
+    if (param === arch.embed || arch.stem.includes(param)) return "embed";
+    if (arch.pos_embed.includes(param)) return "pos";
+    if (arch.final_norm_params.includes(param)) return "final_norm";
+    if (param === arch.unembed) return "unembed";
+    if (arch.final.includes(param)) return "after";
+    const o = arch.others.find((o: any) => o.tensors.includes(param));
+    if (o) return `o:${o.path}`;
+    return "body";
+  };
+  return { byKey, variantOf, layerParam, blocksOf, boxOf };
+}
+
+/** Sublayers for a map compiled before they were recorded: grouped by top-level module. */
+function groupTensors(variant: any, param: (inner: string) => string | undefined, arch: Arch): any[] {
+  const out = new Map<string, any>();
+  for (const inner of variant.tensors as string[]) {
+    const name = inner.split(".")[0] || "(own)";
+    const b = out.get(name) ?? { name, tensors: [], flags: [], writes: false, reads: false, numel: 0, ran: true };
+    b.tensors.push(inner);
+    const p = param(inner);
+    if (p) b.numel += numel(arch.tensors[p].shape);
+    out.set(name, b);
+  }
+  return [...out.values()];
 }
 
 function letter(i: number): string {
@@ -85,20 +158,6 @@ function human(n: number): string {
 
 function numel(shape: number[]): number {
   return shape.reduce((a, b) => a * b, 1);
-}
-
-function spans(layers: number[]): string {
-  const out: string[] = [];
-  let start = layers[0];
-  let prev = layers[0];
-  for (const l of [...layers.slice(1), Infinity]) {
-    if (l !== prev + 1) {
-      out.push(start === prev ? `L${start}` : `L${start}-${prev}`);
-      start = l;
-    }
-    prev = l;
-  }
-  return out.join(", ");
 }
 
 // --------------------------------------------------------------------------- summary
@@ -150,220 +209,16 @@ function Summary({ arch, index, onFind }: { arch: Arch; index: Index; onFind: (p
   );
 }
 
-// --------------------------------------------------------------------------- the model, top to bottom
+// --------------------------------------------------------------------------- the diagram
 
-function ModelFlow(props: {
-  arch: Arch;
-  index: Index;
-  layer: number;
-  onLayer: (l: number) => void;
-  tensor: string | null;
-  onTensor: (p: string) => void;
-  view: "diagram" | "3d";
-  onView: (v: "diagram" | "3d") => void;
-}) {
-  const { arch, index, layer, onLayer, tensor, onTensor, view, onView } = props;
-  const t = arch.tensors;
-  const before = [arch.embed, ...arch.pos_embed, ...arch.stem].filter(Boolean);
-  const after = [...arch.final_norm_params, ...arch.final.filter((n: string) => !arch.final_norm_params.includes(n))];
-  const vision = arch.others.filter((o: any) => o.vision_only);
-  const extra = arch.others.filter((o: any) => !o.vision_only);
-  const chips = (names: string[]) => (
-    <div className="flow-chips">
-      {names.map((n) => (
-        <button key={n} className={`wchip ${n === tensor ? "active" : ""}`} onClick={() => onTensor(n)} title={n}>
-          {t[n].key} <span className="muted">{t[n].shape.join("×")}</span>
-        </button>
-      ))}
-    </div>
-  );
-  return (
-    <div className="flow">
-      <div className="flow-io">input tokens</div>
-      <Arrow />
-      {vision.map((o: any) => (
-        <div key={o.path} className="flow-side">
-          <div className="fbox c-other">
-            <div className="fbox-title">Vision tower</div>
-            <div className="muted small">
-              {o.path} · {o.tensors.length} tensors · {human(o.numel)}
-              {o.stack && <> · its own stack of {o.stack.size} layers</>}
-            </div>
-            <details>
-              <summary className="small">tensors</summary>
-              {chips(o.tensors.slice(0, 60))}
-              {o.tensors.length > 60 && <div className="muted small">… {o.tensors.length - 60} more (use Find)</div>}
-            </details>
-          </div>
-          <div className="flow-join muted small">↘ image tokens join the sequence</div>
-        </div>
-      ))}
-      {before.length > 0 && (
-        <div className="fbox c-embed">
-          <div className="fbox-title">Embedding</div>
-          {chips(before)}
-        </div>
-      )}
-      <Arrow />
-      {arch.stack ? (
-        <div className="fstack">
-          <div className="fstack-head">
-            <div>
-              <div className="fbox-title">Layer stack</div>
-              <div className="muted small">
-                {arch.stack.path} · {arch.stack.size} layers
-              </div>
-            </div>
-            <span className="spacer" />
-            <div className="seg">
-              <button className={view === "diagram" ? "on" : ""} onClick={() => onView("diagram")}>
-                2D
-              </button>
-              <button className={view === "3d" ? "on" : ""} onClick={() => onView("3d")}>
-                3D
-              </button>
-            </div>
-          </div>
-          {view === "diagram" ? (
-            <StackDiagram arch={arch} index={index} layer={layer} onLayer={onLayer} />
-          ) : (
-            <Stack3D arch={arch} index={index} layer={layer} onLayer={onLayer} />
-          )}
-          <div className="variants">
-            {arch.stack.variants.map((v: any, vi: number) => (
-              <button key={vi} className="variant" onClick={() => onLayer(v.layers[0])} title={v.class}>
-                <span className="swatch" style={{ background: VARIANT_COLORS[vi % VARIANT_COLORS.length] }}>
-                  {letter(vi)}
-                </span>
-                <span>
-                  {spans(v.layers)} <span className="muted">· {v.class} · {v.tensors.length} tensors</span>
-                </span>
-              </button>
-            ))}
-          </div>
-        </div>
-      ) : (
-        <div className="fbox c-other">{chips(Object.keys(t).filter((n) => !before.includes(n) && !after.includes(n)))}</div>
-      )}
-      <Arrow />
-      {arch.final_norm_params.length > 0 && (
-        <div className="fbox c-norm">
-          <div className="fbox-title">Final norm</div>
-          {chips(arch.final_norm_params)}
-        </div>
-      )}
-      {after.filter((n) => !arch.final_norm_params.includes(n)).length > 0 && (
-        <>
-          <div className="fbox c-other">
-            <div className="fbox-title">After the stack</div>
-            {chips(after.filter((n) => !arch.final_norm_params.includes(n)))}
-          </div>
-        </>
-      )}
-      {arch.unembed && (
-        <>
-          <Arrow />
-          <div className="fbox c-linear">
-            <div className="fbox-title">Unembedding{arch.tied ? " (tied to the embedding)" : ""}</div>
-            {chips([arch.unembed])}
-          </div>
-          <Arrow />
-          <div className="fbox c-out">
-            <div className="fbox-title">Next-token probabilities</div>
-            <div className="muted small">softmax over {t[arch.unembed].shape[0].toLocaleString()} tokens</div>
-          </div>
-        </>
-      )}
-      {extra.length > 0 && (
-        <div className="flow-extra">
-          <div className="muted small">Outside the stack</div>
-          {extra.map((o: any) => (
-            <div key={o.path} className="fbox c-other slim">
-              <div className="small">
-                <code>{o.path}</code> · {o.tensors.length} tensor{o.tensors.length === 1 ? "" : "s"}
-              </div>
-              {o.tensors.length <= 8 && chips(o.tensors)}
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-function Arrow() {
-  return <div className="flow-arrow" aria-hidden />;
-}
-
-function StackDiagram({ arch, index, layer, onLayer }: { arch: Arch; index: Index; layer: number; onLayer: (l: number) => void }) {
-  return (
-    <div className="segments">
-      {arch.stack.segments.map(([a, b, times]: number[]) => {
-        const layers = Array.from({ length: b - a + 1 }, (_, k) => a + k);
-        return (
-          <div key={a} className={`segment ${times > 1 ? "looped" : ""}`}>
-            {times > 1 && (
-              <div className="loop-tag" title={`L${a}-${b} run ${times} times per forward pass, with the same weights`}>
-                ↻ ×{times}
-              </div>
-            )}
-            <div className="layer-chips">
-              {layers.map((l) => (
-                <button
-                  key={l}
-                  className={`lchip ${l === layer ? "active" : ""}`}
-                  style={{ ["--v" as any]: VARIANT_COLORS[index.variantOf[l] % VARIANT_COLORS.length] }}
-                  onClick={() => onLayer(l)}
-                  title={`L${l} · type ${letter(index.variantOf[l])}`}
-                >
-                  L{l}
-                </button>
-              ))}
-            </div>
-          </div>
-        );
-      })}
-      <div className="muted small">
-        run order: {arch.stack.order.map((r: number[]) => (r[0] === r[1] ? `L${r[0]}` : `L${r[0]}-${r[1]}`)).join(" → ")}
-      </div>
-    </div>
-  );
-}
-
-function Stack3D({ arch, index, layer, onLayer }: { arch: Arch; index: Index; layer: number; onLayer: (l: number) => void }) {
-  const size = arch.stack.size;
-  const gap = Math.max(5, Math.min(16, 320 / size));
-  const looped = arch.stack.segments.filter((g: number[]) => g[2] > 1);
-  return (
-    <div className="stack3d" style={{ height: size * gap * 0.9 + 190 }}>
-      <div className="muted small stack3d-note">
-        L0 at the bottom · colour = layer type
-        {looped.map((g: number[]) => ` · glowing: L${g[0]}-${g[1]} run ×${g[2]}`).join("")}
-      </div>
-      <div className="stack3d-scene">
-        {Array.from({ length: size }, (_, l) => {
-          const loop = looped.find((g: number[]) => l >= g[0] && l <= g[1]);
-          return (
-            <button
-              key={l}
-              className={`slab ${l === layer ? "active" : ""} ${loop ? "looped" : ""}`}
-              style={{
-                ["--v" as any]: VARIANT_COLORS[index.variantOf[l] % VARIANT_COLORS.length],
-                transform: `translateZ(${l * gap}px)`,
-              }}
-              onClick={() => onLayer(l)}
-              title={`L${l} · type ${letter(index.variantOf[l])}${loop ? ` · runs ×${loop[2]}` : ""}`}
-            >
-              <span>L{l}</span>
-            </button>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-// --------------------------------------------------------------------------- one layer
+const BW = 300; // main column box width
+const LANE = 30; // skip-arrow lane, left of the column
+const GAP = 22; // arrow between boxes
+const HEAD = 44; // a closed box
+const CHIP_H = 20;
+const CW = 6.6; // a monospace character at 11px
+const SIDE_W = 200; // the vision column
+const CAP = 40; // weights shown in one box before "use Find"
 
 const FLAG_LABEL: Record<string, string> = {
   attends: "attention",
@@ -373,106 +228,543 @@ const FLAG_LABEL: Record<string, string> = {
   norms: "norm",
 };
 
-function blockColor(b: any): string {
-  if (b.flags.includes("routes")) return "c-ffn";
-  if (b.flags.includes("attends") && !b.flags.includes("norms")) return "c-attn";
-  if (b.flags.includes("gates")) return "c-gate";
-  if (b.flags.includes("convolves")) return "c-conv";
-  if (b.flags.includes("norms")) return "c-norm";
-  if (b.writes) return "c-ffn";
-  return "c-other";
+function blockTone(b: any): string {
+  if (b.flags.includes("routes")) return "ffn";
+  if (b.flags.includes("attends") && !b.flags.includes("norms")) return "attn";
+  if (b.flags.includes("gates")) return "gate";
+  if (b.flags.includes("convolves")) return "conv";
+  if (b.flags.includes("norms")) return "norm";
+  if (b.writes) return "ffn";
+  return "other";
 }
 
-function LayerDetail(props: {
+function blockSub(b: any): string {
+  const words = b.flags.map((f: string) => FLAG_LABEL[f] ?? f);
+  if (!words.length && b.writes) words.push("writes the stream");
+  return [...words, human(b.numel), b.ran ? null : "did not run when traced"].filter(Boolean).join(" · ");
+}
+
+function fit(text: string, chars: number, fromLeft = false): string {
+  if (text.length <= chars) return text;
+  return fromLeft ? `…${text.slice(text.length - chars + 1)}` : `${text.slice(0, chars - 1)}…`;
+}
+
+function activate(fn: () => void) {
+  return (e: KeyboardEvent) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      fn();
+    }
+  };
+}
+
+interface Item {
+  param: string;
+  label: string;
+}
+
+interface BoxSpec {
+  id: string;
+  x: number;
+  y: number;
+  w: number;
+  title: string;
+  sub: string;
+  tone: string;
+  items: Item[];
+  more?: number;
+  dashed?: boolean;
+}
+
+function chipRows(items: Item[], arch: Arch, width: number) {
+  const chips: (Item & { x: number; y: number; w: number; shape: string })[] = [];
+  let x = 0;
+  let y = 0;
+  for (const it of items) {
+    const shape = arch.tensors[it.param].shape.join("×");
+    const room = Math.floor((width - 16) / CW) - shape.length - 1;
+    const label = fit(it.label, Math.max(4, room), true);
+    const w = Math.min(width, 14 + (label.length + 1 + shape.length) * CW);
+    if (x > 0 && x + w > width) {
+      x = 0;
+      y += CHIP_H + 5;
+    }
+    chips.push({ ...it, label, shape, x, y, w });
+    x += w + 5;
+  }
+  return { chips, h: items.length ? y + CHIP_H : 0 };
+}
+
+/** At most CAP items, keeping the selected one in view. */
+function capped(items: Item[], selected: string | null): { items: Item[]; more: number } {
+  if (items.length <= CAP) return { items, more: 0 };
+  const head = items.slice(0, CAP);
+  const sel = items.find((i) => i.param === selected);
+  if (sel && !head.includes(sel)) head[CAP - 1] = sel;
+  return { items: head, more: items.length - CAP };
+}
+
+function Diagram(props: {
   arch: Arch;
   index: Index;
   layer: number;
-  onLayer: (l: number) => void;
+  onLayer: Dispatch<SetStateAction<number>>;
+  open: Set<string>;
+  onToggle: (id: string) => void;
   tensor: string | null;
   onTensor: (p: string) => void;
 }) {
-  const { arch, index, layer, onLayer, tensor, onTensor } = props;
-  const vi = index.variantOf[layer] ?? 0;
-  const variant = arch.stack.variants[vi];
-  const runs = arch.stack.runs[layer];
-  const total = (variant.blocks ?? []).reduce((n: number, b: any) => n + b.numel, 0);
+  const { arch, index, layer, onLayer, open, onToggle, tensor, onTensor } = props;
+  const ref = useRef<SVGSVGElement>(null);
+  useEffect(() => {
+    ref.current?.querySelector(".bd-chip.on")?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [tensor]);
+
+  const T = arch.tensors;
+  const stack = arch.stack;
+  const vision = arch.others
+    .filter((o: any) => o.vision_only)
+    .sort((a: any, b: any) => Number(!!b.stack) - Number(!!a.stack) || b.numel - a.numel);
+  const loops: number[][] = stack ? stack.segments.filter((g: number[]) => g[2] > 1) : [];
+  const hidden = arch.hidden;
+
+  // Columns: [vision | N×] [frame: lane, boxes, layer strip, loops] [position embedding]
+  const leftZone = Math.max(vision.length ? SIDE_W + 40 : 12, stack ? 76 : 12);
+  const frameX = leftZone;
+  const laneX = frameX + 18;
+  const colX = laneX + LANE;
+  const cx = colX + BW / 2;
+  const stripX = colX + BW + 18;
+  const frameR = stripX + 26 + (loops.length ? 44 : 14);
+  const posW = 160;
+  const posX = colX + BW + 36;
+
+  const frames: ReactNode[] = [];
+  const wires: ReactNode[] = [];
+  const nodes: ReactNode[] = [];
+  let n = 0;
+  const key = () => `k${n++}`;
+
+  const wire = (x1: number, y1: number, x2: number, y2: number, arrow = false) =>
+    wires.push(<line key={key()} className="bd-wire" x1={x1} y1={y1} x2={x2} y2={y2} markerEnd={arrow ? "url(#bd-arrow)" : undefined} />);
+  const route = (d: string, cls: string, arrow: boolean) =>
+    wires.push(<path key={key()} className={cls} d={d} markerEnd={arrow ? `url(#${cls === "bd-skip" ? "bd-arrow-skip" : "bd-arrow"})` : undefined} />);
+  const text = (x: number, y: number, s: string, cls = "bd-note", anchor: "start" | "middle" | "end" = "start") =>
+    nodes.push(
+      <text key={key()} className={cls} x={x} y={y} textAnchor={anchor}>
+        {s}
+      </text>,
+    );
+  const pill = (x: number, y: number, label: string) => {
+    const w = Math.max(96, label.length * 6.6 + 28);
+    nodes.push(
+      <g key={key()} className="bd-pill">
+        <rect x={x - w / 2} y={y} width={w} height={24} rx={12} />
+        <text x={x} y={y + 16} textAnchor="middle">
+          {label}
+        </text>
+      </g>,
+    );
+    return 24;
+  };
+  const plus = (x: number, y: number, what: string) =>
+    nodes.push(
+      <g key={key()} className="bd-add" transform={`translate(${x} ${y})`}>
+        <circle r={10} />
+        <path d="M-5 0H5M0-5V5" />
+        <title>{what}</title>
+      </g>,
+    );
+
+  const box = (s: BoxSpec): number => {
+    const can = s.items.length > 0;
+    const isOpen = can && open.has(s.id);
+    const { chips, h: ch } = isOpen ? chipRows(s.items, arch, s.w - 20) : { chips: [], h: 0 };
+    const moreH = isOpen && s.more ? 18 : 0;
+    const h = HEAD + (isOpen ? ch + 10 + moreH : 0);
+    const sel = tensor != null && s.items.some((i) => i.param === tensor);
+    const count = s.items.length + (s.more ?? 0);
+    const caret = can ? `${count} weight${count === 1 ? "" : "s"} ${isOpen ? "▾" : "▸"}` : "";
+    const room = (s.w - 26 - caret.length * 6.2) / 7.4;
+    const toggle = () => can && onToggle(s.id);
+    nodes.push(
+      <g key={s.id} className={`bd-box t-${s.tone}${s.dashed ? " dashed" : ""}${sel ? " sel" : ""}`}>
+        <rect className="bd-rect" x={s.x} y={s.y} width={s.w} height={h} rx={8} />
+        <g
+          className={`bd-head${can ? "" : " fixed"}`}
+          role={can ? "button" : undefined}
+          tabIndex={can ? 0 : undefined}
+          aria-expanded={can ? isOpen : undefined}
+          aria-label={`${s.title}: ${s.sub}`}
+          onClick={toggle}
+          onKeyDown={activate(toggle)}
+        >
+          <rect className="bd-hit" x={s.x} y={s.y} width={s.w} height={HEAD} rx={8} />
+          <text className="bd-title" x={s.x + 12} y={s.y + 19}>
+            {fit(s.title, Math.floor(room))}
+          </text>
+          <text className="bd-sub" x={s.x + 12} y={s.y + 35}>
+            {fit(s.sub, Math.floor((s.w - 24) / 6))}
+          </text>
+          {can && (
+            <text className="bd-caret" x={s.x + s.w - 12} y={s.y + 19} textAnchor="end">
+              {caret}
+            </text>
+          )}
+          <title>{`${s.title} · ${s.sub}`}</title>
+        </g>
+        {chips.map((c) => {
+          const t = T[c.param];
+          const choose = () => onTensor(c.param);
+          return (
+            <g
+              key={c.param}
+              className={`bd-chip k-${t.kind}${c.param === tensor ? " on" : ""}${t.exercised ? "" : " cold"}`}
+              role="button"
+              tabIndex={0}
+              aria-pressed={c.param === tensor}
+              aria-label={`${t.key}, ${t.shape.join(" by ")}`}
+              transform={`translate(${s.x + 10 + c.x} ${s.y + HEAD + c.y})`}
+              onClick={choose}
+              onKeyDown={activate(choose)}
+            >
+              <rect className="bd-chip-bg" width={c.w} height={CHIP_H} rx={4} />
+              <rect className="bd-kind" width={3} height={CHIP_H} rx={1.5} />
+              <text x={8} y={14}>
+                {c.label} <tspan className="bd-shape">{c.shape}</tspan>
+              </text>
+              <title>{`${t.key} · ${t.kind} · ${t.shape.join("×")}${t.exercised ? "" : " · never read when traced"}`}</title>
+            </g>
+          );
+        })}
+        {moreH > 0 && (
+          <text className="bd-note" x={s.x + 12} y={s.y + HEAD + ch + 20}>
+            +{s.more} more · use Find
+          </text>
+        )}
+      </g>,
+    );
+    return h;
+  };
+  const items = (params: string[], label: (p: string) => string) => capped(params.map((param) => ({ param, label: label(param) })), tensor);
+
+  // ---- inputs
+  let y = 10;
+  y += pill(cx, y, "input tokens");
+  let vy = 10;
+  const vx = 8 + SIDE_W / 2;
+  if (vision.length) {
+    vy += pill(vx, vy, "images · video");
+    for (const o of vision) {
+      wire(vx, vy, vx, vy + GAP, true);
+      vy += GAP;
+      const it = items(o.tensors, (p) => p.slice(o.path.length + 1).replace(/\.weight$/, ""));
+      vy += box({
+        id: `o:${o.path}`,
+        x: 8,
+        y: vy,
+        w: SIDE_W,
+        title: o.path.split(".").pop(),
+        sub: [o.stack ? `${o.stack.size} layers` : null, human(o.numel), "ran on images"].filter(Boolean).join(" · "),
+        tone: "vision",
+        ...it,
+      });
+    }
+  }
+  const embedParams = [arch.embed, ...arch.stem].filter(Boolean);
+  if (embedParams.length) {
+    wire(cx, y, cx, y + GAP, true);
+    y += GAP;
+    const shape = arch.embed ? T[arch.embed].shape : null;
+    y += box({
+      id: "embed",
+      x: colX,
+      y,
+      w: BW,
+      title: "Embedding",
+      sub: shape?.length === 2 ? `${shape[0].toLocaleString()} tokens × width ${shape[1].toLocaleString()}` : `${embedParams.length} weights`,
+      tone: "embed",
+      ...items(embedParams, (p) => T[p].key),
+    });
+  }
+  if (arch.pos_embed.length) {
+    const ay = y + GAP + 10;
+    wire(cx, y, cx, ay - 10, true);
+    plus(cx, ay, "add: token embedding plus position embedding");
+    const ph = box({
+      id: "pos",
+      x: posX,
+      y: ay - HEAD / 2,
+      w: posW,
+      title: "Position embedding",
+      sub: T[arch.pos_embed[0]].shape.join(" × "),
+      tone: "embed",
+      ...items(arch.pos_embed, (p) => T[p].key),
+    });
+    wire(posX, ay, cx + 10, ay, true);
+    const below = Math.max(ay + 10, ay - HEAD / 2 + ph + 6);
+    wire(cx, ay + 10, cx, below);
+    y = below;
+  }
+  if (vision.length) {
+    const jy = Math.max(y + GAP + 8, vy + 26);
+    wire(cx, y, cx, jy - 8, true);
+    nodes.push(
+      <g key={key()} className="bd-join" transform={`translate(${cx} ${jy}) rotate(45)`}>
+        <rect x={-6} y={-6} width={12} height={12} />
+        <title>image tokens join the sequence</title>
+      </g>,
+    );
+    route(`M ${vx} ${vy} V ${jy} H ${cx - 10}`, "bd-wire", true);
+    text(cx - 16, jy - 6, "image tokens", "bd-note", "end");
+    y = jy + 8;
+  }
+
+  // ---- the layer stack
+  if (stack) {
+    const vi = index.variantOf[layer] ?? 0;
+    const variant = stack.variants[vi];
+    const blocks = index.blocksOf(vi);
+    const runs = stack.runs[layer] ?? 1;
+    const total = blocks.reduce((s: number, b: any) => s + b.numel, 0);
+    const top = y + GAP;
+    const by = top + 54;
+    if (hidden) text(cx + 8, y + GAP / 2 + 8, `width ${hidden.toLocaleString()}`);
+    wire(cx, y, cx, by);
+
+    const known = blocks.some((b: any) => "adds" in b);
+    const adds = (b: any) => (known ? b.adds : b.writes);
+    const groups: any[][] = [];
+    let cur: any[] = [];
+    for (const b of blocks) {
+      cur.push(b);
+      if (adds(b)) {
+        groups.push(cur);
+        cur = [];
+      }
+    }
+    const spec = (b: any, at: number, dashed = false): BoxSpec => {
+      const params = b.tensors
+        .map((inner: string) => ({ inner, param: index.layerParam(layer, inner) }))
+        .filter((p: any) => p.param);
+      const labelOf = new Map(params.map((p: any) => [p.param, p.inner]));
+      const label = (p: string) => {
+        const inner = labelOf.get(p) as string;
+        if (!inner || inner === b.name) return "weight";
+        return inner.startsWith(`${b.name}.`) ? inner.slice(b.name.length + 1) : inner;
+      };
+      return {
+        id: `L${vi}:${b.name}`,
+        x: colX,
+        y: at,
+        w: BW,
+        title: b.name,
+        sub: blockSub(b),
+        tone: blockTone(b),
+        dashed: dashed || !b.ran,
+        ...items(
+          params.map((p: any) => p.param),
+          label,
+        ),
+      };
+    };
+
+    let iy = by;
+    for (const g of groups) {
+      const branch = iy + 6;
+      wire(cx, iy, cx, branch);
+      nodes.push(<circle key={key()} className="bd-dot" cx={cx} cy={branch} r={3} />);
+      let gy = branch;
+      for (const b of g) {
+        wire(cx, gy, cx, gy + GAP, true);
+        gy += GAP;
+        gy += box(spec(b, gy));
+      }
+      const ay = gy + GAP;
+      wire(cx, gy, cx, ay - 10, true);
+      plus(cx, ay, `add: the residual stream plus ${g[g.length - 1].name}'s output (traced)`);
+      route(`M ${cx} ${branch} H ${laneX} V ${ay} H ${cx - 10}`, "bd-skip", true);
+      iy = ay + 10;
+    }
+    if (cur.length && groups.length) {
+      // Sublayers after the last add: their output is not added to the stream, which goes past.
+      const ty = iy + 30;
+      text(colX, ty - 8, "also in this layer · output not added to the stream");
+      let gy = ty;
+      for (const b of cur) gy += box(spec(b, gy, true)) + 8;
+      route(`M ${cx} ${iy} V ${iy + 10} H ${laneX} V ${gy + 4} H ${cx} V ${gy + 12}`, "bd-wire", false);
+      iy = gy + 12;
+    } else {
+      for (const b of cur) {
+        wire(cx, iy, cx, iy + GAP, true);
+        iy += GAP;
+        iy += box(spec(b, iy));
+      }
+    }
+
+    // The layer strip: every layer, coloured by type, the one drawn here marked; loops beside it.
+    const size = stack.size;
+    const cell = Math.max(7, Math.min(16, (iy - by) / size));
+    const bottom = Math.max(iy + 16, by + cell * size + 14);
+    wire(cx, iy, cx, bottom);
+    frames.push(<rect key="frame" className="bd-frame" x={frameX} y={top} width={frameR - frameX} height={bottom - top} rx={14} />);
+    const headRoom = Math.floor((cx - 14 - frameX - 14) / 6.2);
+    text(frameX + 14, top + 23, `L${layer}`, "bd-ltitle");
+    text(frameX + 14 + `L${layer}`.length * 9.5 + 6, top + 23, `of ${size}`);
+    text(frameX + 14, top + 40, fit(variant.class, headRoom));
+    text(cx + 12, top + 23, `${human(total)} params`);
+    text(
+      cx + 12,
+      top + 40,
+      runs > 1 ? `runs ×${runs} per pass` : stack.variants.length > 1 ? `type ${letter(vi)} of ${stack.variants.length}` : `${blocks.length} sublayers`,
+    );
+    const mid = (top + bottom) / 2;
+    text(frameX - 12, mid + 2, `${size}×`, "bd-n", "end");
+    text(frameX - 12, mid + 20, stack.variants.length > 1 ? `${stack.variants.length} types` : "layers", "bd-note", "end");
+
+    const step = (d: number) => onLayer((l) => Math.max(0, Math.min(size - 1, l + d)));
+    const keys = (e: KeyboardEvent) => {
+      const moves: Record<string, () => void> = {
+        ArrowUp: () => step(-1),
+        ArrowLeft: () => step(-1),
+        ArrowDown: () => step(1),
+        ArrowRight: () => step(1),
+        PageUp: () => step(-5),
+        PageDown: () => step(5),
+        Home: () => onLayer(0),
+        End: () => onLayer(size - 1),
+      };
+      if (moves[e.key]) {
+        e.preventDefault();
+        moves[e.key]();
+      }
+    };
+    const gap = cell >= 9 ? 2 : 1;
+    nodes.push(
+      <g
+        key="strip"
+        className="bd-strip"
+        role="slider"
+        tabIndex={0}
+        aria-label="Layer"
+        aria-orientation="vertical"
+        aria-valuemin={0}
+        aria-valuemax={size - 1}
+        aria-valuenow={layer}
+        aria-valuetext={`L${layer}`}
+        onKeyDown={keys}
+      >
+        <text className="bd-note" x={stripX + 13} y={by - 8} textAnchor="middle">
+          layers
+        </text>
+        {Array.from({ length: size }, (_, l) => {
+          const v = index.variantOf[l] ?? 0;
+          const r = stack.runs[l] ?? 1;
+          return (
+            <rect
+              key={l}
+              className={`bd-cell${l === layer ? " on" : ""}`}
+              x={stripX}
+              y={by + l * cell}
+              width={26}
+              height={cell - gap}
+              rx={Math.min(3, cell / 3)}
+              style={{ ["--v" as any]: VARIANT_COLORS[v % VARIANT_COLORS.length] }}
+              onClick={() => onLayer(l)}
+            >
+              <title>{`L${l} · ${stack.variants[v].class}${stack.variants.length > 1 ? ` (type ${letter(v)})` : ""}${r > 1 ? ` · runs ×${r}` : ""}`}</title>
+            </rect>
+          );
+        })}
+        {cell >= 12 &&
+          Array.from({ length: size }, (_, l) => (
+            <text key={`t${l}`} className={`bd-cell-label${l === layer ? " on" : ""}`} x={stripX + 13} y={by + l * cell + cell / 2 + 2.5} textAnchor="middle">
+              {l}
+            </text>
+          ))}
+        <path className="bd-pointer" d={`M ${stripX - 3} ${by + layer * cell + (cell - gap) / 2} l -7 -5 v 10 z`} />
+        {loops.map(([a, b, times]) => {
+          const x = stripX + 32;
+          const y0 = by + a * cell + 1;
+          const y1 = by + (b + 1) * cell - gap - 1;
+          return (
+            <g key={`loop${a}`}>
+              <path className="bd-loop" d={`M ${x} ${y1} h 6 V ${y0} h -6`} markerEnd="url(#bd-arrow-skip)" />
+              <text className="bd-loop-label" x={x + 10} y={(y0 + y1) / 2 + 4}>
+                ↻{times}
+              </text>
+              <title>{`L${a}-L${b} run ${times} times per forward pass, with the same weights`}</title>
+            </g>
+          );
+        })}
+      </g>,
+    );
+    y = bottom;
+  } else {
+    const ends = new Set([...embedParams, ...arch.pos_embed, ...arch.final, ...arch.final_norm_params, arch.unembed]);
+    const inOthers = new Set(arch.others.flatMap((o: any) => o.tensors));
+    const body = Object.keys(T).filter((p) => !ends.has(p) && !inOthers.has(p));
+    if (body.length) {
+      wire(cx, y, cx, y + GAP, true);
+      y += GAP;
+      y += box({ id: "body", x: colX, y, w: BW, title: "Model", sub: `no layer stack found · ${body.length} weights`, tone: "other", ...items(body, (p) => T[p].key) });
+    }
+  }
+
+  // ---- outputs
+  const after = arch.final.filter((p: string) => !arch.final_norm_params.includes(p));
+  const next = (spec: Omit<BoxSpec, "x" | "y" | "w">) => {
+    wire(cx, y, cx, y + GAP, true);
+    y += GAP;
+    y += box({ ...spec, x: colX, y, w: BW });
+  };
+  if (arch.final_norm_params.length)
+    next({ id: "final_norm", title: "Final norm", sub: arch.final_norm ? `norm · ${arch.final_norm}` : "norm", tone: "norm", ...items(arch.final_norm_params, (p) => T[p].key) });
+  if (after.length) next({ id: "after", title: "After the stack", sub: `${after.length} weight${after.length === 1 ? "" : "s"}`, tone: "other", ...items(after, (p) => T[p].key) });
+  if (arch.unembed) {
+    const [V, d] = T[arch.unembed].shape;
+    next({
+      id: "unembed",
+      title: "Unembedding",
+      sub: `linear · width ${Number(d).toLocaleString()} → ${Number(V).toLocaleString()} tokens${arch.tied ? " · tied to the embedding" : ""}`,
+      tone: "linear",
+      ...items([arch.unembed], (p) => T[p].key),
+    });
+    next({ id: "softmax", title: "Softmax", sub: "over the vocabulary", tone: "out", items: [] });
+    wire(cx, y, cx, y + GAP, true);
+    y += GAP;
+    y += pill(cx, y, "next-token probabilities");
+  } else {
+    wire(cx, y, cx, y + GAP, true);
+    y += GAP;
+    y += pill(cx, y, "output");
+  }
+
+  const W = Math.max(frameR + 12, arch.pos_embed.length ? posX + posW + 12 : 0, colX + BW + 24);
+  const H = Math.max(y, vy) + 12;
   return (
-    <div className="layer-detail">
-      <div className="layer-head">
-        <div className="layer-title">
-          <span className="swatch" style={{ background: VARIANT_COLORS[vi % VARIANT_COLORS.length] }}>
-            {letter(vi)}
-          </span>
-          <div>
-            <strong>L{layer}</strong> <span className="muted">· {variant.class}</span>
-            <div className="muted small">
-              {human(total)} params · {variant.tensors.length} tensors
-              {runs > 1 && <> · runs {runs}× per forward pass (passes L{layer}@1…@{runs})</>}
-            </div>
-          </div>
-        </div>
-        <div className="layer-nav">
-          <button disabled={layer === 0} onClick={() => onLayer(layer - 1)} aria-label="Previous layer">
-            ‹
-          </button>
-          <button disabled={layer === arch.stack.size - 1} onClick={() => onLayer(layer + 1)} aria-label="Next layer">
-            ›
-          </button>
-        </div>
-      </div>
-      <div className="rail-legend muted small">
-        Sublayers in the order the model runs them, on the residual stream. → reads the stream · ⊕ adds back to it
-      </div>
-      <ol className="rail">
-        {(variant.blocks ?? []).map((b: any) => (
-          <li key={b.name} className="rail-row">
-            <div className={`rail-mark ${b.writes ? "writes" : ""} ${b.reads ? "reads" : ""}`} aria-hidden>
-              {b.writes ? "⊕" : b.reads ? "→" : ""}
-            </div>
-            <div className={`fbox ${blockColor(b)} block-card`}>
-              <div className="block-head">
-                <span className="fbox-title">{b.name}</span>
-                <span className="muted small">
-                  {b.flags.map((f: string) => FLAG_LABEL[f] ?? f).join(" · ")}
-                  {b.flags.length > 0 && " · "}
-                  {human(b.numel)}
-                  {!b.ran && " · did not run when traced"}
-                </span>
-              </div>
-              <div className="flow-chips">
-                {b.tensors.map((inner: string) => {
-                  const param = index.layerParams(layer, inner);
-                  if (!param) return null;
-                  const tt = arch.tensors[param];
-                  return (
-                    <button
-                      key={inner}
-                      className={`wchip k-${tt.kind} ${param === tensor ? "active" : ""}`}
-                      onClick={() => onTensor(param)}
-                      title={`${tt.key} · ${tt.kind}`}
-                    >
-                      {inner.startsWith(`${b.name}.`) ? inner.slice(b.name.length + 1) : inner || b.name}{" "}
-                      <span className="muted">{tt.shape.join("×")}</span>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          </li>
-        ))}
-      </ol>
-      {variant.layers.length > 1 && (
-        <div className="muted small same-type">
-          Same type:{" "}
-          {variant.layers
-            .filter((l: number) => l !== layer)
-            .map((l: number) => (
-              <button key={l} className="link" onClick={() => onLayer(l)}>
-                L{l}
-              </button>
-            ))}
-        </div>
-      )}
+    <div className="archx-canvas">
+      <svg
+        ref={ref}
+        className="bd"
+        viewBox={`0 0 ${W} ${H}`}
+        width={W}
+        style={{ minWidth: Math.min(W, 440) }}
+        role="group"
+        aria-label={`Block diagram of ${arch.arch}`}
+      >
+        <defs>
+          <marker id="bd-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path className="bd-mark-wire" d="M0,0 L10,5 L0,10 z" />
+          </marker>
+          <marker id="bd-arrow-skip" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path className="bd-mark-skip" d="M0,0 L10,5 L0,10 z" />
+          </marker>
+        </defs>
+        {frames}
+        {wires}
+        {nodes}
+      </svg>
     </div>
   );
 }
@@ -494,13 +786,42 @@ const KIND_TEXT: Record<string, string> = {
   matrix: "a matrix (neither side is model-width)",
 };
 
+const LEGEND: [string, string][] = [
+  ["attn", "attention"],
+  ["ffn", "writes the stream: feed-forward, experts"],
+  ["norm", "norm"],
+  ["conv", "convolution"],
+  ["gate", "gate"],
+  ["embed", "embedding"],
+  ["linear", "unembedding"],
+  ["vision", "ran only on images"],
+];
+
 function WeightPanel({ arch, session, param }: { arch: Arch; session: Session; param: string | null }) {
   const [shown, setShown] = useState<{ param: string; data?: any; error?: string; busy?: boolean } | null>(null);
   useEffect(() => setShown(null), [param]);
   if (!param) {
     return (
       <div className="weights">
-        <p className="muted">Select a weight (a chip in the diagram, or Find) to see its shape, axes and values.</p>
+        <p className="muted small">Open a box, then pick a weight to see its shape, axes and kind, and load its values.</p>
+        <ul className="legend">
+          {LEGEND.map(([tone, label]) => (
+            <li key={tone}>
+              <span className={`lg t-${tone}`} />
+              {label}
+            </li>
+          ))}
+          <li>
+            <span className="lg-add">+</span>added back to the residual stream, as the traced ops show
+          </li>
+          <li>
+            <span className="lg dashed" />
+            did not run when traced, or not added back
+          </li>
+          <li>
+            <span className="lg-loop">↻3</span>these layers run 3 times per pass, same weights
+          </li>
+        </ul>
       </div>
     );
   }
@@ -528,7 +849,6 @@ function WeightPanel({ arch, session, param }: { arch: Arch; session: Session; p
         <code className="wkey">{t.key}</code>
         <div className="muted small">{param}</div>
       </div>
-      <Block3D shape={t.shape} experts={t.experts} />
       <dl className="wfacts">
         <dt>kind</dt>
         <dd>
@@ -568,41 +888,6 @@ function WeightPanel({ arch, session, param }: { arch: Arch; session: Session; p
       )}
       {shown?.error && <div className="error small">{shown.error}</div>}
     </div>
-  );
-}
-
-function Block3D({ shape, experts }: { shape: number[]; experts?: number | null }) {
-  // A box drawn to the tensor's proportions (log scale), as weight blocks in 3D LLM diagrams.
-  const dims = shape.length >= 3 ? shape.slice(-2) : shape.length === 2 ? shape : [1, shape[0] ?? 1];
-  const depthN = shape.length >= 3 ? shape.slice(0, -2).reduce((a, b) => a * b, 1) : 1;
-  const s = (n: number) => 10 + 26 * Math.log10(Math.max(1, n));
-  const w = s(dims[1]);
-  const h = s(dims[0]);
-  const d = depthN > 1 ? Math.min(60, 6 + 14 * Math.log10(depthN)) : 6;
-  const dx = d * 0.8;
-  const dy = d * 0.5;
-  const W = w + dx + 70;
-  const H = h + dy + 34;
-  const x0 = 8;
-  const y0 = dy + 8;
-  return (
-    <svg className="block3d" viewBox={`0 0 ${W} ${H}`} width={W} height={H} role="img" aria-label={`a ${shape.join(" by ")} tensor`}>
-      <polygon className="face top" points={`${x0},${y0} ${x0 + dx},${y0 - dy} ${x0 + w + dx},${y0 - dy} ${x0 + w},${y0}`} />
-      <polygon className="face side" points={`${x0 + w},${y0} ${x0 + w + dx},${y0 - dy} ${x0 + w + dx},${y0 + h - dy} ${x0 + w},${y0 + h}`} />
-      <rect className="face front" x={x0} y={y0} width={w} height={h} />
-      <text x={x0 + w / 2} y={y0 + h + 14} textAnchor="middle">
-        {dims[1].toLocaleString()}
-      </text>
-      <text x={x0 + w + dx + 6} y={y0 + h / 2} dominantBaseline="middle">
-        {dims[0].toLocaleString()}
-      </text>
-      {depthN > 1 && (
-        <text x={x0 + w + dx + 6} y={y0 - dy + 2} dominantBaseline="hanging">
-          ×{depthN.toLocaleString()}
-          {experts ? " experts" : ""}
-        </text>
-      )}
-    </svg>
   );
 }
 
@@ -653,7 +938,7 @@ function WeightValues({ data }: { data: any }) {
       {data.vocab?.length > 0 && (
         <div className="small">
           <span className="muted">{data.vocab_label}</span>
-          <div className="flow-chips">
+          <div className="archx-chips">
             {data.vocab.map(([tok, score]: [string, number], i: number) => (
               <span key={i} className="wchip">
                 {tok} <span className="muted">{score.toFixed(2)}</span>
