@@ -34,6 +34,21 @@ MISSED_HEARTBEATS = 3
 RECENT_CALL_S = 120.0
 STORE_SERVED = frozenset({"arch"})
 _CODE_RE = re.compile(r"\b([EW]\d{3})\b")
+_DIAG_RE = re.compile(r"^\s*([EW]\d{3}\b.*)$", re.MULTILINE)
+
+
+def outcome_of(summary: str) -> tuple[str, str]:
+    """A tool result's outcome for the loop detector, and its label. One outcome per call: a
+    no-op edit's E105 and its "no-op edit" reported apart alternated, so successive no-op
+    edits never added up to a run. Otherwise the same result is the same diagnostics, not
+    the same codes. Seen live: a W203 at 67% (refused), the fixed edit's W203 at 15%, and
+    check repeating that one counted as one result three times running."""
+    codes = sorted(set(_CODE_RE.findall(summary)))
+    if "E105" in codes:
+        return "no-op edit", "no-op edit"
+    label = ",".join(codes)
+    lines = sorted({line.strip() for line in _DIAG_RE.findall(summary)})
+    return (" | ".join(lines) or label), label
 
 
 class SessionManager:
@@ -493,15 +508,12 @@ class SessionManager:
                 if source == "driver"
                 else [self.gateway.observe(sid, "call", key, label=name, step=turn)]
             )
-            codes = sorted(set(_CODE_RE.findall(result.get("summary") or "")))
-            # One outcome per call: a no-op edit's E105 and its "no-op edit" reported apart
-            # alternated, so successive no-op edits never added up to a run.
-            outcome = "no-op edit" if "E105" in codes else ",".join(codes)
+            outcome, label = outcome_of(result.get("summary") or "")
             if outcome:
                 self._outcome_run.add(sid)
                 # the turn makes one response's parallel calls one step, not a run
                 verdicts.append(
-                    self.gateway.observe(sid, "outcome", outcome, label=outcome, step=turn)
+                    self.gateway.observe(sid, "outcome", outcome, label=label, step=turn)
                 )
             elif sid in self._outcome_run:
                 # a clean call ends the run: one request when a run ends, not one per call

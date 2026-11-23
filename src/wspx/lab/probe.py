@@ -329,16 +329,15 @@ def _eager_experts(model: torch.nn.Module) -> Iterator[None]:
 def expert_writers(ir: ModelIR) -> list[str]:
     """3-D expert tensors that write the residual stream: each expert's matrix has a
     width-long output and a narrower input (the down projection), as a 2-D writer does."""
-    hidden = ir.structure.get("hidden")
-    out = []
-    for role in ir.roles:
-        if role.kind != "expert" or role.expert is not None or role.split is not None:
-            continue
-        shape = ir.params[role.param].shape
-        if hidden is None or role.in_dim is None or role.out_dim is None or len(shape) != 3:
-            continue
-        if shape[role.out_dim] == hidden and shape[role.in_dim] != hidden:
-            out.append(role.param)
+    out = [
+        role.param
+        for role in ir.roles
+        if role.kind == "expert"
+        and role.expert is None
+        and role.split is None
+        and len(ir.params[role.param].shape) == 3
+        and ir.expert_writes_stream(role.param)
+    ]
     return list(dict.fromkeys(out))
 
 

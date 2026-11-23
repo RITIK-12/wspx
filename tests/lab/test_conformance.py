@@ -528,16 +528,16 @@ def test_what_a_driver_found_on_inkling_at_dev13(
     best = experts.result.hits[0]
     assert re.fullmatch(r"L9\.mlp\.experts\.down_proj\[\d, :, \d+\]", best.address)
     assert best.expert is not None
-    assert "routed to it" in experts.result.expression
+    assert "a token was routed to" in experts.result.expression
     # Seen live (dev14): a ranking that keeps 4,096 of 78,336 read "4,096 of 78,336 matched"
     from wspx.lab import session as session_module
 
     monkeypatch.setattr(session_module, "EXPERT_UNITS_KEPT", 10)
     capped = lab.activations([prompt], scope="L9.mlp.experts.down_proj", top=5).summary
     assert re.search(r"top 5 of [\d,]+ cols ranked by mean \|activation\|", capped)
-    assert "(10 kept)" in capped
+    assert "(the result set keeps the best 10)" in capped
     assert "matched" not in capped
-    assert "each expert's mean is over the tokens routed to it" in capped
+    assert "only experts a token was routed to count" in capped
 
     monkeypatch.setattr(analysis, "LENS_KL", 0.0)
     traced = lab.trace(prompt, top=2)
@@ -649,3 +649,96 @@ def test_expert_writes_add_up_to_the_experts_output(inkling: Any, tmp_path: Any)
     assert moved[f"L9.mlp.experts.down_proj[{e}, :, {j}] @1"] == pytest.approx(write / 3, rel=1e-4)
     shown = lab.trace([3, 9, 27, 81, 5], vs="base", top=5).summary
     assert "most-moved units (what each writes at the last token" in shown
+
+
+def test_what_fable_found_on_inkling_at_0_1_0(inkling: Any, tmp_path: Any) -> None:
+    """Seen live (Fable on Inkling, 0.1.0): project_out on an expert tensor read the stream as
+    its 1152-wide input, whole tensor or one expert; cols=@rN of expert hits would have taken
+    column j of every expert; bake_steer's hint named L11.mlp.down; the diff trace did not
+    name the edited unit; contrast's count hid which writers it ranked; show grid printed
+    nothing."""
+    from wspx.lab.sdk import open_lab
+    from wspx.tools.dispatch import call
+
+    (tmp_path / "work").mkdir()
+    lab = open_lab(inkling, store=tmp_path / "store", workdir=tmp_path / "work")
+    down = "model.language_model.layers.10.mlp.experts.down_proj"
+    assert lab.ir.expert_writes_stream(down)
+    assert not lab.ir.expert_writes_stream(
+        "model.language_model.layers.10.mlp.experts.gate_up_proj"
+    )
+    d = lab.contrast([[3, 9, 27], [5, 7, 11]], [[81, 5, 7], [2, 4, 6]], name="d", layer=11)
+    assert "ranked over: " in d.summary
+    assert "L*.mlp.experts.down_proj (24 tensors" in d.summary
+    ranked = d.writers.result  # type: ignore[union-attr]
+    assert ranked.is_ranking
+    assert len(ranked.hits) == min(4096, ranked.candidates)
+
+    w = lab.model.get_parameter(down)
+    v = lab.direction("dir:d")
+    v = (v / v.norm()).to(w.device)
+    before = w.detach().float().clone()
+    one = call(
+        lab,
+        "edit",
+        {
+            "op": "project_out",
+            "args": {
+                "direction": "dir:d",
+                "targets": "L10.mlp.experts.down_proj[2]",
+                "strength": 1.0,
+            },
+        },
+    )
+    assert one.ok, one.summary
+    after = w.detach().float()
+    assert (v @ after[2]).abs().max() < 1e-4  # expert 2 no longer writes along d
+    assert torch.equal(after[3], before[3])  # the others are untouched
+    call(lab, "vcs", {"action": "discard"})
+
+    every = call(
+        lab,
+        "edit",
+        {
+            "op": "project_out",
+            "args": {"direction": "dir:d", "targets": "L10.mlp.experts.down_proj", "strength": 1.0},
+        },
+    )
+    assert every.ok, every.summary
+    assert (v @ w.detach().float()).abs().max() < 1e-4  # every expert
+    call(lab, "vcs", {"action": "discard"})
+
+    hits = lab.grep("abs(cos(dir:d))", scope="L10.mlp.experts.down_proj", top=3)
+    picked = {(h.expert, h.unit) for h in hits.result.hits[:3]}
+    narrowed = call(
+        lab,
+        "edit",
+        {
+            "op": "project_out",
+            "args": {
+                "direction": "dir:d",
+                "targets": "L10.mlp.experts.down_proj",
+                "cols": hits.handle,
+                "strength": 1.0,
+            },
+        },
+    )
+    assert narrowed.ok, narrowed.summary
+    changed = (w.detach().float() != before).any(dim=1).nonzero().tolist()  # (expert, col)
+    assert {tuple(x) for x in changed} == picked  # those experts' columns, nothing else
+
+    shown = lab.trace([3, 9, 27, 81, 5], vs="base", top=5).summary
+    assert "edited units (their weights differ)" in shown
+    edited = next(line for line in shown.splitlines() if line.startswith("edited units"))
+    assert "L10.mlp.experts.down_proj[" in edited
+    call(lab, "vcs", {"action": "discard"})
+
+    refused = call(
+        lab, "edit", {"op": "bake_steer", "args": {"direction": "dir:d", "scale": 0.5, "at": 11}}
+    )
+    assert not refused.ok
+    assert "L11.mlp.down " not in refused.summary
+    assert "L11.self_attn.o_proj.linear" in refused.summary
+
+    grid = lab.show("L11.mlp.experts.down_proj[3]", grid=8)
+    assert "map: " in str(grid)

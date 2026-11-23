@@ -109,6 +109,12 @@ def render_show(info: dict[str, Any]) -> str:
         lines.append(
             f"  values ({len(info['values'])} of {info['values_total']}): {info['values']}"
         )
+    if "map" in info:  # seen live: grid=8 printed nothing, so it read as ignored
+        m = info["map"]
+        lines.append(
+            f"  map: {m['rows']}×{m['cols']} blocks of RMS magnitude over its "
+            f"{m['of'][0]}×{m['of'][1]} values, in the structured result (the UI draws it)"
+        )
     return "\n".join(lines)
 
 
@@ -722,15 +728,20 @@ def _top_expert_writers(
 
 def _write_norms(
     model: torch.nn.Module, ir: ModelIR, units: list[str], routed: ExpertWrites
-) -> dict[Any, torch.Tensor]:
+) -> dict[Any, Any]:
     """‖w_j‖ of every writer unit under the weights loaded now: 2-D writers by tensor, and
     each expert routed in ``routed`` by ``(tensor, expert)``."""
     params = dict(model.named_parameters())
-    norms: dict[Any, torch.Tensor] = {}
+    norms: dict[Any, Any] = {}
+    sums: dict[str, torch.Tensor] = {}
     for param in units:
         role = ir.primary_role(param)
         if role is not None and role.in_dim is not None:
             norms[param] = _unit_norms(params[param], role.in_dim)
+            w = params[param].detach().float()
+            # with the norms, a unit's column sum tells an edited unit from an unedited one
+            sums[param] = w.sum(dim=1 - role.in_dim) if w.dim() == 2 else norms[param]
+    norms["sums"] = sums
     for param, calls in routed.calls.items():
         for e in {e for experts in calls for e in experts}:
             norms[(param, e)] = _expert_norms(params[param], ir, param, e)
@@ -741,10 +752,11 @@ def _moved_expert_units(
     ir: ModelIR,
     here: ExpertWrites,
     there: ExpertWrites,
-    norms_here: dict[Any, torch.Tensor],
-    norms_there: dict[Any, torch.Tensor],
+    norms_here: dict[Any, Any],
+    norms_there: dict[Any, Any],
     *,
     top: int,
+    edited: list[tuple[str, float]] | None = None,
 ) -> list[tuple[str, float]]:
     """How much each expert unit's write at the last token moved between two weight states
     (each side's input, routing weight and weights); an expert routed on one side only
@@ -772,6 +784,11 @@ def _moved_expert_units(
                 n = min(top, delta.numel())
                 for j in torch.topk(delta.abs(), k=n).indices.tolist():
                     moved.append((_expert_unit(ir, param, e, j) + suffix, float(delta[j])))
+                a_norms, b_norms = norms_here.get((param, e)), norms_there.get((param, e))
+                if edited is not None and a_norms is not None and b_norms is not None:
+                    differs = a_norms.to(delta.device) != b_norms.to(delta.device)
+                    for j in torch.nonzero(differs).reshape(-1)[:top].tolist():
+                        edited.append((_expert_unit(ir, param, e, j) + suffix, float(delta[j])))
     moved.sort(key=lambda x: -abs(x[1]))
     return moved[: top * 4]
 
@@ -830,6 +847,11 @@ def diff_trace(
     out_b = logits_there[0].argmax(-1).tolist()
     changed = [i for i, (x, y) in enumerate(zip(out_a, out_b, strict=True)) if x != y]
     moved: list[tuple[str, float]] = []
+    # Seen live: an edited unit whose input barely moved was left out of "most-moved", so
+    # the diff did not name what was edited. Units whose own weights differ get a line.
+    edited: list[tuple[str, float]] = []
+    sums_here: dict[str, torch.Tensor] = norms_here.get("sums", {})
+    sums_there: dict[str, torch.Tensor] = norms_there.get("sums", {})
     for param in units:
         role = ir.primary_role(param)
         shape = tuple(ids.shape)
@@ -838,11 +860,17 @@ def diff_trace(
         if role is None or role.in_dim is None or not mine or len(mine) != len(theirs):
             continue
         n_here, n_there = norms_here[param], norms_there[param]
+        differs = (sums_here[param] != sums_there[param]) | (n_here != n_there)
         for k, (x, y) in enumerate(zip(mine, theirs, strict=True), start=1):
             delta = x[0, -1].float() * n_here - y[0, -1].float() * n_there
-            moved.extend(_unit_scores(role, delta, top, pass_suffix(ir, param, len(mine), k)))
+            suffix = pass_suffix(ir, param, len(mine), k)
+            moved.extend(_unit_scores(role, delta, top, suffix))
+            for j in torch.nonzero(differs).reshape(-1)[:top].tolist():
+                edited.append((f"{role.address}[:, {j}]{suffix}", float(delta[j])))
     moved.extend(
-        _moved_expert_units(ir, routed_here, routed_there, norms_here, norms_there, top=top)
+        _moved_expert_units(
+            ir, routed_here, routed_there, norms_here, norms_there, top=top, edited=edited
+        )
     )
     moved.sort(key=lambda x: -abs(x[1]))
     # Seen live: 0.0012 and 0.0008 both printed 0.001, and only one counted as diverging.
@@ -863,6 +891,12 @@ def diff_trace(
             else ""
         )
     )
+    if edited:
+        edited.sort(key=lambda x: -abs(x[1]))
+        lines.append(
+            "edited units (their weights differ), by how much what they write moved: "
+            + ", ".join(f"{a} {s:+.3g}" for a, s in edited[:top])
+        )
     if moved:
         lines.append(
             "most-moved units (what each writes at the last token; units downstream of an "
@@ -875,6 +909,7 @@ def diff_trace(
         {
             "calls": labels,
             "moved": moved[: top * 4],
+            "edited": edited[: top * 4],
             "first_divergence": labels[first] if first is not None else None,
         },
     )

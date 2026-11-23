@@ -454,3 +454,64 @@ def _tool_ok(lab, tool: str, **args: object) -> str:  # type: ignore[no-untyped-
     result = call(lab, tool, args)
     assert result.ok, result.summary
     return result.summary
+
+
+def test_what_fable_found_at_0_1_0(lab) -> None:  # type: ignore[no-untyped-def]
+    """Seen live (Fable on Inkling, 0.1.0): blame left out reverts and merges; diff took
+    11-32 s on two changed columns and showed them as a 257-column slice; there was no way
+    to delete a branch; a refused W203 did not say why a warning blocked."""
+    _vcs(lab, "branch", name="work")
+    call(lab, "edit", {"op": "scale", "args": {"targets": "L0.mlp.down", "factor": 0.9}})
+    _vcs(lab, "commit", message="L0")
+    call(lab, "edit", {"op": "scale", "args": {"targets": "L1.mlp.down[:, 3]", "factor": 0.5}})
+    call(lab, "edit", {"op": "scale", "args": {"targets": "L1.mlp.down[:, 9]", "factor": 0.5}})
+    _vcs(lab, "commit", message="two columns")
+
+    shown = call(lab, "vcs", {"action": "diff", "a": "HEAD~1", "b": "HEAD"})
+    assert "[:, 3:10] (only 2 cols: 3, 9)" in shown.summary
+    row = shown.data["tensors"][0]
+    assert row["rank"] == 2
+    assert [h["where"] for h in row["hunks"]] == [
+        "L1.mlp.down_proj[:, 3]",
+        "L1.mlp.down_proj[:, 9]",
+    ]
+    first = row["hunks"][0]["values"][0]
+    assert first["new"] == pytest.approx(first["old"] * 0.5, rel=1e-2)
+
+    _vcs(lab, "revert", rev="HEAD")
+    blamed = _vcs(lab, "blame", address="L1.mlp.down")
+    assert blamed.splitlines()[0] == "L1.mlp.down: unedited at HEAD (back to base); its history:"
+    assert "(revert): Revert" in blamed
+    assert "two columns" in blamed
+
+    refused = call(lab, "vcs", {"action": "branch", "name": "work", "delete": True})
+    assert not refused.ok
+    assert "checked out here" in refused.summary
+    _vcs(lab, "checkout", rev="base")
+    tip = lab.repo.resolve("work")
+    gone = _vcs(lab, "branch", name="work", delete=True)
+    assert gone.startswith(f"deleted branch work (it was at {lab.repo.get_commit(tip).short})")
+    assert "work" not in lab.repo.branches()
+    assert lab.repo.get_commit(tip).message.startswith("Revert")  # the commits stay
+    assert not call(lab, "vcs", {"action": "branch", "name": "work", "delete": True}).ok
+
+
+def test_a_refused_w203_says_why_a_warning_blocks(tmp_path: Path) -> None:
+    lab = open_lab(tiny_llama().to(torch.bfloat16), store=tmp_path / "s", workdir=tmp_path)
+    small = {"direction": torch.ones(48).tolist(), "targets": "L1.mlp.down", "strength": 1e-4}
+    blocked = call(lab, "edit", {"op": "project_out", "args": small})
+    assert not blocked.ok, blocked.summary
+    assert "W203" in blocked.summary
+    assert "or more the edit is refused, not just warned about" in blocked.summary
+
+
+def test_a_branch_another_session_has_checked_out_is_not_deleted(tmp_path: Path) -> None:
+    store = tmp_path / "s"
+    one = open_lab(tiny_llama(), store=store, workdir=tmp_path, session="one", branch="shared")
+    two = open_lab(tiny_llama(), store=store, workdir=tmp_path, session="two", branch="mine")
+    assert one.repo.current_branch(one.session) == "shared"
+    call(one, "edit", {"op": "scale", "args": {"targets": "L0.mlp.down", "factor": 0.9}})
+    _vcs(one, "commit", message="on shared")
+    refused = call(two, "vcs", {"action": "branch", "name": "shared", "delete": True})
+    assert not refused.ok
+    assert f"checked out by session {one.session}" in refused.summary

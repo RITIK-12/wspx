@@ -89,12 +89,7 @@ def static_check(ir: ModelIR, plan: EditPlan) -> Report:
                     Code.OP_INVALID_FOR_ROLE,
                     f"{plan.op} needs a matrix, {name} is {len(info.shape)}-D",
                     target=target,
-                    fixes=[
-                        Fix(
-                            title="target a projection weight such as L*.mlp.down",
-                            action={"address": "L*.mlp.down"},
-                        )
-                    ],
+                    fixes=[Fix(title="target a projection matrix: `arch L<n>` lists each layer's")],
                 )
             )
         if plan.op == "project_out" and kinds & {"norm", "final_norm", "bias"}:
@@ -381,9 +376,14 @@ def _subulp(
         )
     )
     name = str(old.dtype).removeprefix("torch.")
+    refused = (
+        f" (at {cfg.subulp_error_at:.0%} or more the edit is refused, not just warned about)"
+        if severity is Severity.ERROR
+        else ""
+    )
     return diag(
         Code.SUB_ULP,
-        f"{lost:.0%} of delta magnitude below {name} resolution",
+        f"{lost:.0%} of delta magnitude below {name} resolution{refused}",
         target=target,
         severity=severity,
         detail=[

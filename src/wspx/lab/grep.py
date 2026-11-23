@@ -18,6 +18,7 @@ expression when it is a plain value).
 
 from __future__ import annotations
 
+import functools
 import math
 import re
 from collections.abc import Callable, Iterator
@@ -298,6 +299,15 @@ class UnitBatch:
     addresses: list[str] = field(default_factory=list)
     globals: list[int] = field(default_factory=list)
     """Unit index along the tensor dim, for result-set handles."""
+    labeler: Callable[[int], str] | None = None
+    """Builds one unit's address from its global index, when ``addresses`` is left empty
+    (millions of expert columns: building every label cost seconds a ranking never used)."""
+
+    def address(self, i: int) -> str:
+        if self.addresses:
+            return self.addresses[i]
+        assert self.labeler is not None
+        return self.labeler(self.globals[i])
 
 
 @dataclass
@@ -428,7 +438,6 @@ def _units(
     size = weight.shape[unit_dim]
     sel = index[unit_dim]
     globals_ = list(range(*sel.indices(size))) if isinstance(sel, slice) else list(sel)  # type: ignore[arg-type]
-    addresses = [_label(key, index, unit_dim, u) for u in globals_]
     yield UnitBatch(
         target,
         expert,
@@ -436,9 +445,13 @@ def _units(
         globals_,
         axis,
         whole=block if block.dim() <= 2 else vectors,  # rank of a kernel: of its unit matrix
-        addresses=addresses,
         globals=globals_,
+        labeler=functools.partial(_unit_label, key, index, unit_dim),
     )
+
+
+def _unit_label(key: str, index: tuple[Any, ...], unit_dim: int, unit: int) -> str:
+    return _label(key, index, unit_dim, unit)
 
 
 def _label(key: str, index: tuple[Any, ...], unit_dim: int | None, unit: int) -> str:
@@ -750,8 +763,12 @@ def grep(
     targets: list[Target],
     *,
     axis: str | None = None,
+    keep: int | None = None,
 ) -> GrepResult:
-    """Evaluate ``expression`` over every unit of ``targets``."""
+    """Evaluate ``expression`` over every unit of ``targets``. ``keep`` caps a ranking (an
+    expression with no threshold) at its best units: every unit is still scored and counted,
+    but only those are kept (seen live: 3.6 million expert columns made a contrast's writer
+    ranking build, sort and store millions of rows to show five)."""
     import time
 
     tree = parse(expression)
@@ -798,26 +815,46 @@ def grep(
     scores: list[Hit] = []
     hits: list[Hit] = []
     used_axis: str | None = None
+    capped = keep is not None and not boolean
+    candidates = 0
     for batch in batches():
         used_axis = used_axis or batch.axis
         ev = _Eval(env, batch)
         score = _flat(ev.eval(key), batch)
-        keep = (
+        candidates += score.numel()
+        if capped:
+            assert keep is not None
+            best = torch.topk(
+                torch.nan_to_num(score.detach().float(), nan=float("-inf")),
+                min(keep, score.numel()),
+            ).indices.tolist()
+            best_scores = score.detach()[best].cpu().tolist()
+            del ev, score
+            for i, s in zip(best, best_scores, strict=True):
+                hit = Hit(
+                    batch.address(i),
+                    batch.target.param,
+                    batch.expert,
+                    batch.globals[i],
+                    float("nan") if math.isnan(s) else s,
+                )
+                scores.append(hit)
+                hits.append(hit)
+            continue
+        matched = (
             _flat(ev.eval(tree), batch) != 0
             if boolean
             else torch.ones_like(score, dtype=torch.bool)
         )
         score_l = score.detach().cpu().tolist()
-        keep_l = keep.detach().cpu().tolist()
-        del ev, score, keep
-        for address, unit, s, k in zip(
-            batch.addresses, batch.globals, score_l, keep_l, strict=True
-        ):
+        keep_l = matched.detach().cpu().tolist()
+        del ev, score, matched
+        for i, (s, k) in enumerate(zip(score_l, keep_l, strict=True)):
             hit = Hit(
-                address,
+                batch.address(i),
                 batch.target.param,
                 batch.expert,
-                unit,
+                batch.globals[i],
                 float("nan") if math.isnan(s) else s,
             )
             scores.append(hit)
@@ -832,16 +869,20 @@ def grep(
     order = lambda h: (math.isnan(h.score), -h.score if not math.isnan(h.score) else 0.0)  # noqa: E731
     scores.sort(key=order)
     hits.sort(key=order)
+    if capped:
+        assert keep is not None
+        del scores[keep:], hits[keep:]
     return GrepResult(
         expression,
         ", ".join(sorted({t.address for t in targets})),
         used_axis,
-        len(scores),
+        candidates,
         hits,
         scores,
         time.perf_counter() - started,
         skipped,
         thresholds,
+        ranking=True if capped else None,
     )
 
 

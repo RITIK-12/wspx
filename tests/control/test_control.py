@@ -646,3 +646,20 @@ def test_snapshots_are_unpacked_once_and_the_oldest_are_dropped(tmp_path: Path) 
         cache.file(loader(f"s{i}"), f"sha256:s{i}", "prompts/a.png")
     kept = [p for p in (tmp_path / "cache").iterdir() if (p / ".unpacked").exists()]
     assert len(kept) == media.KEEP
+
+
+def test_the_same_result_is_the_same_diagnostics_not_the_same_codes() -> None:
+    """Seen live (Fable on Inkling, 0.1.0): a W203 at 67% (refused), the fixed edit's W203 at
+    15%, and check repeating that one read as "the same result 3 times running"."""
+    from wspx.control.sessions import outcome_of
+
+    refused = "edit blocked by 1 error(s):\nW203 L11.o: 67% of delta magnitude below bfloat16"
+    staged = "staged p_1:project-out\nW203 L11.o: 15% of delta magnitude below bfloat16"
+    checked = (
+        "check ok: 0 error(s), 1 warning(s)\nW203 L11.o: 15% of delta magnitude below bfloat16"
+    )
+    assert outcome_of(refused)[0] != outcome_of(staged)[0]
+    assert outcome_of(staged)[0] == outcome_of(checked)[0]
+    assert outcome_of(staged)[1] == "W203"
+    assert outcome_of("E105 nothing changed") == ("no-op edit", "no-op edit")
+    assert outcome_of("all good") == ("", "")

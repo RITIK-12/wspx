@@ -208,7 +208,7 @@ def build_index(
                 v = batch.vectors
                 entry["expert"].extend([-1 if batch.expert is None else batch.expert] * v.shape[0])
                 entry["unit"].extend(batch.globals)
-                entry["address"].extend(batch.addresses)
+                entry["address"].extend(batch.address(i) for i in range(v.shape[0]))
                 entry["norm"].extend(v.norm(dim=1).tolist())
                 entry["absmax"].extend(v.abs().amax(dim=1).tolist())
                 ids, scores = _vocab_top(env, role.kind, v) if vocab else (None, None)

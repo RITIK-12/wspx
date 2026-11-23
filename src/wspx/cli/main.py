@@ -633,9 +633,14 @@ def vcs(
     bad: Annotated[str | None, typer.Option(help="bisect: a revision that fails.")] = None,
     count: Annotated[int | None, typer.Option("-n", help="log: how many commits.")] = None,
     force: Annotated[bool, typer.Option("--force")] = False,
+    delete: Annotated[
+        bool, typer.Option("--delete", help="branch: delete the named branch.")
+    ] = False,
 ) -> None:
     """Version control of weight edits."""
     args: dict[str, Any] = {"action": action, "message": message, "force": force}
+    if delete:
+        args["delete"] = True
     key = {
         "checkout": "rev",
         "revert": "rev",
@@ -649,7 +654,7 @@ def vcs(
     if key and target:
         args[key] = target
     if other:
-        args["b"] = other
+        args["rev" if action == "branch" else "b"] = other  # branch NAME REV starts it at REV
     if strategy:
         pairs = [s.partition("=") for s in strategy]
         if any(not address or not sep or not how for address, sep, how in pairs):

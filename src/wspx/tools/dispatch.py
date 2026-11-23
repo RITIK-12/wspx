@@ -125,7 +125,7 @@ def _vcs(lab: Lab, a: Any) -> ToolResult:
     if action == "checkout":
         return lab.checkout(_need(a.rev, "rev"), force=a.force)
     if action == "branch":
-        return lab.branch(a.name, at=a.rev or "HEAD")
+        return lab.branch(a.name, at=a.rev or "HEAD", delete=a.delete)
     if action == "revert":
         return lab.revert(a.rev or "HEAD")
     if action == "diff":

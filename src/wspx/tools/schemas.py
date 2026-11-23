@@ -240,6 +240,11 @@ class VcsArgs(_Args):
         description="For merge: address → sum | rebase | orthogonalize | ties | pick:ours | pick:theirs.",
     )
     force: bool = False
+    delete: bool = Field(
+        False,
+        description="For branch: delete the branch named by name (its commits stay, by id); "
+        "a branch a session has checked out is refused.",
+    )
     n: int = Field(20, ge=1, le=500)
 
 

@@ -213,6 +213,20 @@ class ModelIR:
         """Tensors read only on an image prompt: a vision-language model's vision tower."""
         return sorted(name for name, cov in self.coverage.items() if cov.phases == ["vision"])
 
+    def expert_writes_stream(self, param: str) -> bool:
+        """Whether an expert tensor writes the residual stream: each expert's matrix has a
+        width-long output and a narrower input (a down projection), as a 2-D writer does.
+        Seen live: this was read off the short name (``….down``), which Inkling's
+        ``experts.down_proj`` key is not, so project_out took the stream for its input."""
+        role = self.primary_role(param)
+        if role is None or role.kind != "expert":
+            return False
+        hidden = self.structure.get("hidden")
+        shape = self.params[self.canonical(param)].shape
+        if hidden is None or role.in_dim is None or role.out_dim is None:
+            return role.address.rsplit(".", 1)[-1] == "down"
+        return bool(shape[role.out_dim] == hidden and shape[role.in_dim] != hidden)
+
     def is_tied(self, param: str) -> bool:
         kinds = {r.kind for r in self.roles_of(param)}
         return bool(

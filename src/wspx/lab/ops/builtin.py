@@ -77,8 +77,24 @@ def _residual_side(ctx: OpContext, target: Target) -> str:
     if role.kind in ("reader", "router", "unembed"):
         return "in"
     if role.kind == "expert":
-        return "out" if role.address.rsplit(".", 1)[-1] == "down" else "in"
+        return "out" if ctx.ir.expert_writes_stream(target.param) else "in"
     return "out"
+
+
+def _per_expert(ctx: OpContext, targets: list[Target]) -> list[Target]:
+    """A 3-D expert tensor as one matrix per expert: rank-1 ops act on one matrix at a time."""
+    out: list[Target] = []
+    for target in targets:
+        role = target.role or ctx.ir.primary_role(target.param)
+        index = _index(ctx, target)
+        if role is None or role.experts is None or not isinstance(index[0], slice):
+            out.append(target)
+            continue
+        n = ctx.ir.params[target.param].shape[0]
+        key = ctx.ir.key_of(target.param)
+        for e in range(*index[0].indices(n)):
+            out.append(Target(target.param, (e, *index[1:]), f"{key}[{e}]", target.role))
+    return out
 
 
 # --------------------------------------------------------------------------- primitives
@@ -168,7 +184,7 @@ def project_out(
     d = ctx.direction(direction)
     d = d / d.norm()
     out = []
-    for target in ctx.targets(targets):
+    for target in _per_expert(ctx, ctx.targets(targets)):
         shape = ctx.ir.params[target.param].shape
         in_dim, out_dim = _layout(ctx, target)
         side = _residual_side(ctx, target)
@@ -204,14 +220,7 @@ def bake_steer(ctx: OpContext, direction: Any, *, scale: float, at: int | str) -
     at = _block(at)
     d = ctx.direction(direction)
     d = d / d.norm()
-    biases = [
-        r
-        for r in ctx.ir.roles
-        if r.block == at
-        and r.kind == "bias"
-        and r.split is None
-        and r.address.endswith((".o.bias", ".down.bias", ".out.bias"))
-    ]
+    biases = [r for r in _writer_biases(ctx) if r.block == at]
     if biases:
         role = biases[-1]
         shape = ctx.ir.params[role.param].shape
@@ -234,14 +243,7 @@ def bake_steer(ctx: OpContext, direction: Any, *, scale: float, at: int | str) -
                 embed, tuple(shape), ctx.base_hash(embed), ones, scale * d, op="bake_steer", at=at
             )
         ]
-    with_bias = sorted(
-        {
-            r.block
-            for r in ctx.ir.roles
-            if r.kind == "bias" and r.block is not None and r.split is None
-            if r.address.endswith((".o.bias", ".down.bias", ".out.bias"))
-        }
-    )
+    with_bias = sorted({r.block for r in _writer_biases(ctx) if r.block is not None})
     where = (
         f"blocks with one: {', '.join(f'L{b}' for b in with_bias)}"
         if with_bias
@@ -251,7 +253,7 @@ def bake_steer(ctx: OpContext, direction: Any, *, scale: float, at: int | str) -
     hint = (
         ". Without a bias, no weight adds a constant vector at every token; these edits move "
         f"the residual along {name} instead. Amplify it where it is already written: grep "
-        f"'cos({name}) > 0.1' in L{at}.mlp.down (or a range of blocks), then project_out "
+        f"'cos({name}) > 0.1' in {_writer_keys(ctx, at)} (or a range of blocks), then project_out "
         f"{name} on those units with strength below 0 (-1 doubles their component). Or "
         "rank_one_write one writer so that an input it sees writes more of it"
     )
@@ -462,3 +464,37 @@ BUILTIN: dict[str, Callable[..., list[TensorDelta]]] = {
     "transplant": transplant,
     "orthogonalize": orthogonalize,
 }
+
+
+def _writer_biases(ctx: OpContext) -> list[Any]:
+    """Biases of the stream's writers: a bias whose module also holds a writer weight.
+    Seen live: they were found by short name (``….o.bias``), which a key (``….o_proj.bias``)
+    is not."""
+    writers = {
+        (r.block, ctx.ir.params[r.param].module)
+        for r in ctx.ir.roles
+        if r.kind == "writer" and r.split is None
+    }
+    return [
+        r
+        for r in ctx.ir.roles
+        if r.kind == "bias"
+        and r.split is None
+        and (
+            (r.block, ctx.ir.params[r.param].module) in writers
+            or r.address.endswith((".o.bias", ".down.bias", ".out.bias"))
+        )
+    ]
+
+
+def _writer_keys(ctx: OpContext, at: int) -> str:
+    """Block ``at``'s writers by key, for a hint (seen live: it named ``L11.mlp.down``, a short
+    name Inkling does not have)."""
+    from wspx.lab.probe import expert_writers
+
+    params = {r.param for r in ctx.ir.roles if r.kind == "writer" and r.block == at}
+    params |= {
+        p for p in expert_writers(ctx.ir) if ctx.ir.structure.get("layer_of", {}).get(p) == at
+    }
+    keys = sorted(ctx.ir.key_of(p) for p in params)
+    return ", ".join(keys[:4]) if keys else f"L{at}"

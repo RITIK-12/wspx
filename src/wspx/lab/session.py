@@ -401,6 +401,7 @@ class Lab:
         axis: str | None = None,
         top: int = DEFAULT_TOP,
         name: str | None = None,
+        keep: int | None = None,
     ) -> GrepHits:
         """Rank weight units by an expression: arithmetic on the weights, no forward pass."""
         if not expression:
@@ -410,7 +411,7 @@ class Lab:
         env = Environment(
             self.ir, dict(self.params), token_id=self._token_or_id, direction=self.direction
         )
-        result = grep(env, expression, self.resolve(scope), axis=axis)
+        result = grep(env, expression, self.resolve(scope), axis=axis, keep=keep)
         return self._register_hits(result, ("grep", _scope_label(scope)), name, top)
 
     def activations(
@@ -614,7 +615,11 @@ class Lab:
             if any(n > 1 for n in [*ran.values(), *expert_ran.values()])
             else ""
         )
-        routed_note = "; each expert's mean is over the tokens routed to it" if experts else ""
+        routed_note = (
+            "; only experts a token was routed to count, each by its mean over those tokens"
+            if experts
+            else ""
+        )
         return GrepResult(
             f"mean |activation| on {len(prompts)} prompt(s){passes}{routed_note}",
             shown or "writers",
@@ -762,7 +767,11 @@ class Lab:
         ranking = f"abs(cos(dir:{name}))"
         try:
             writers: GrepHits | str = self.grep(
-                ranking, scope=_writer_scope(self.ir), top=5, name=f"{name}-writers"
+                ranking,
+                scope=_writer_scope(self.ir),
+                top=5,
+                name=f"{name}-writers",
+                keep=EXPERT_UNITS_KEPT,
             )
         except (RuntimeError, GrepError) as exc:  # the direction is kept either way
             if torch.cuda.is_available():
@@ -910,11 +919,33 @@ class Lab:
         narrowed: list[Target] = []
         for spec in specs:
             for t in self.resolve(spec) if isinstance(spec, str) else [spec]:
+                index = list(normalize_index(t.index, len(self.ir.params[t.param].shape)))
+                axis_dim = _unit_dim(self.ir, t)
+                role = t.role or self.ir.primary_role(t.param)
+                if role is not None and role.experts is not None and len(index) == 3:
+                    # Seen live: an expert's hit is (expert, unit); the units alone would have
+                    # picked column j of every expert. One target per expert hit instead.
+                    n = self.ir.params[t.param].shape[0]
+                    allowed = (
+                        set(range(*index[0].indices(n)))
+                        if isinstance(index[0], slice)
+                        else {index[0]}
+                        if isinstance(index[0], int)
+                        else set(index[0])
+                    )
+                    by_expert: dict[int, list[int]] = {}
+                    for h in hits:
+                        if h.param == t.param and h.expert is not None and h.expert in allowed:
+                            by_expert.setdefault(h.expert, []).append(h.unit)
+                    tensor_key = self.ir.key_of(t.param)
+                    for e, picked in sorted(by_expert.items()):
+                        one = list(index)
+                        one[0], one[axis_dim] = e, picked
+                        narrowed.append(Target(t.param, tuple(one), f"{tensor_key}[{e}]", t.role))
+                    continue
                 units = results.indices(hits, t.param)
                 if not units:
                     continue
-                index = list(normalize_index(t.index, len(self.ir.params[t.param].shape)))
-                axis_dim = _unit_dim(self.ir, t)
                 index[axis_dim] = units
                 narrowed.append(Target(t.param, tuple(index), t.address, t.role))
         if not narrowed:
@@ -1279,8 +1310,15 @@ class Lab:
         )
 
     def branch(
-        self, name: str | None = None, *, at: str = "HEAD", switch: bool = True
+        self,
+        name: str | None = None,
+        *,
+        at: str = "HEAD",
+        switch: bool = True,
+        delete: bool = False,
     ) -> ToolResult:
+        if delete:
+            return self._delete_branch(name)
         if name is None:
             current = self.repo.current_branch(self.session)
             lines = [
@@ -1309,6 +1347,36 @@ class Lab:
         return ToolResult(
             f"branch {name} at {short(oid) if oid else 'base'}" + (" (switched)" if switch else ""),
             {"head": oid},
+        )
+
+    def _delete_branch(self, name: str | None) -> ToolResult:
+        """Delete a branch name. Its commits stay in the store, reachable by id; a branch
+        some session has checked out, or a protected one, is refused."""
+        if not name:
+            raise VCSError("branch delete needs the branch's name")
+        ref = f"heads/{name}"
+        if not self.store.refs.exists(ref):
+            raise VCSError(f"no branch {name!r}")
+        oid = self.store.refs.read(ref)
+        if oid and name not in self.repo.branches():
+            raise VCSError(f"{name} is a branch of another model; delete it from a session on it")
+        if name in self.config.policy.protected_branches:
+            raise VCSError(f"{name} is protected; it cannot be deleted")
+        if self.repo.current_branch(self.session) == name:
+            raise VCSError(
+                f"{name} is checked out here; check out another branch or a commit first"
+            )
+        for head in self.store.refs.list("sessions/"):
+            if head.endswith("/HEAD") and self.store.refs.symbolic_target(head) == ref:
+                raise VCSError(
+                    f"{name} is checked out by session {head.split('/')[1]}; it can be deleted "
+                    "once that session moves off it"
+                )
+        self.repo.delete_branch(name)
+        return ToolResult(
+            f"deleted branch {name} (it was at {short(oid) if oid else 'base'}); its commits "
+            "stay in the store, by id",
+            {"deleted": name, "head": oid},
         )
 
     def revert(self, rev: str = "HEAD") -> ToolResult:
@@ -1366,11 +1434,12 @@ class Lab:
             if not bool(nz.any()):
                 cancelled.append(name)
                 continue
-            rank, rank_text = _delta_rank(delta)
+            rank, rank_text = _delta_rank(delta, nz, self.device)
             rows.append(
                 {
                     "tensor": name,
                     "address": _display(self.ir, name),
+                    "hunks": _hunks(self.ir.key_of(name), wa, wb, nz),
                     "precision": "adapter"
                     if sa.adapter.get(name) != sb.adapter.get(name)
                     and sa.merged.get(name) == sb.merged.get(name)
@@ -1380,7 +1449,7 @@ class Lab:
                     "rank": rank,
                     "rank_text": rank_text,
                     "touched": int(nz.sum()),
-                    "slices": _bbox(nz),
+                    "slices": _where(nz),
                 }
             )
         blocks = {
@@ -1477,8 +1546,33 @@ class Lab:
                     return True
                 return all(a & b for a, b in zip(dims, boxes, strict=True))
 
-            for c in self.repo.blame(self.repo.head(self.session), t.param, touches):
-                lines.append(f"{c.short} {t.address}: {c.message.splitlines()[0]}")
+            # Seen live: blame listed only commits with patches, so after a revert it still
+            # credited the reverted commit, and merges never showed. A commit that changed the
+            # tensor's tree entry without a patch on it (a revert, a merge) is listed too.
+            head = self.repo.head(self.session)
+            found = []
+            for c in self.repo.walk(head):
+                record_hit = any(
+                    any(
+                        d["tensor"] == t.param and touches(d) for d in self.repo.get_patch(p).deltas
+                    )
+                    for p in c.patches
+                )
+                if record_hit:
+                    found.append((c, ""))
+                    continue
+                if c.patches:
+                    continue
+                mine = _tree_entry(self.repo.tree_of_oid(c.oid), t.param)
+                parent = _tree_entry(
+                    self.repo.tree_of_oid(c.parents[0] if c.parents else None), t.param
+                )
+                if mine != parent:
+                    found.append((c, " (merge)" if c.merge else " (revert)"))
+            if found and _tree_entry(self.repo.tree_of_oid(head), t.param) == ((), (), False):
+                lines.append(f"{t.address}: unedited at HEAD (back to base); its history:")
+            for c, kind in found:
+                lines.append(f"{c.short} {t.address}{kind}: {c.message.splitlines()[0]}")
         return ToolResult("\n".join(lines) or f"no commit touched {address}", {"lines": lines})
 
     def bisect(self, suite: str, *, good: str = "base", bad: str = "HEAD") -> ToolResult:
@@ -1955,8 +2049,8 @@ class GrepHits:
         r = self.result
         if r.is_ranking:  # no threshold: every unit "matches"
             head = f"top {len(self.hits)} of {r.candidates:,} {r.units} ranked by {r.expression}"
-            if len(r.hits) < r.candidates:
-                head += f" ({len(r.hits):,} kept)"
+            if len(r.hits) < r.candidates:  # seen live: "(4,096 kept)" read as unexplained
+                head += f" (the result set keeps the best {len(r.hits):,})"
         else:
             head = f"{len(r.hits):,} of {r.candidates:,} {r.units} matched" + (
                 f", showing the top {len(self.hits)} (raise --top or narrow)"
@@ -2004,9 +2098,11 @@ class DirectionRef:
     @property
     def summary(self) -> str:
         d = self.direction
+        ranked = "" if isinstance(self.writers, str) else _ranked_over(self.lab.ir, self.writers)
         return (
             f"{self.handle} · ‖v‖ {float(d.vector.norm()):.3g} · {d.describe_separation()}"
             f"\ntop writers:\n{self.writers if isinstance(self.writers, str) else self.writers.summary}"
+            + ranked
         )
 
     def __str__(self) -> str:
@@ -2105,10 +2201,19 @@ def _merge_sets(
 _RANK_SKETCH = 128
 
 
-def _delta_rank(delta: torch.Tensor) -> tuple[int | None, str]:
-    """A change's rank. Big matrices are sketched: exact (almost surely) below the sketch size."""
+def _delta_rank(
+    delta: torch.Tensor, nz: torch.Tensor | None = None, device: torch.device | None = None
+) -> tuple[int | None, str]:
+    """A change's rank. Big matrices are sketched: exact (almost surely) below the sketch size.
+    Only the rows and columns that changed take part, on the lab's device. Seen live: a full
+    SVD of a 2304×3072 tensor, on the CPU, made one diff take 11-32 s for two changed columns."""
     if delta.dim() != 2:
         return None, "n/a"
+    if nz is not None:
+        rows, cols = nz.any(dim=1), nz.any(dim=0)
+        delta = delta[rows][:, cols]
+    if device is not None:
+        delta = delta.to(device)
     if delta.numel() <= 1 << 24:
         rank = int(torch.linalg.matrix_rank(delta))
         return rank, str(rank)
@@ -2160,9 +2265,75 @@ def _unit_dim(ir: ModelIR, target: Target) -> int:
     if role is None or role.in_dim is None or role.out_dim is None:
         return len(ir.params[target.param].shape) - 1
     writes = role.kind in ("writer", "embed", "pos_embed", "stem") or (
-        role.kind == "expert" and role.address.endswith(".down")
+        role.kind == "expert" and ir.expert_writes_stream(target.param)
     )
     return role.in_dim if writes else role.out_dim
+
+
+def _where(mask: torch.Tensor) -> str:
+    """Where a change is: the bounding slice, and the changed indices along a dim where only
+    a few of those it spans changed. Seen live: "[:, 1544:1801]" for two changed columns."""
+    box = _bbox(mask)
+    if mask.dim() == 0 or not mask.any():
+        return box
+    notes = []
+    for d in range(mask.dim()):
+        other = tuple(i for i in range(mask.dim()) if i != d)
+        hit = mask.any(dim=other) if other else mask
+        idx = torch.nonzero(hit).reshape(-1).tolist()
+        span = idx[-1] - idx[0] + 1
+        if len(idx) < span and len(idx) <= 8:
+            name = (
+                {0: "row", 1: "col"}.get(d, f"dim-{d} index")
+                if mask.dim() == 2
+                else ("expert" if d == 0 and mask.dim() == 3 else f"dim-{d} index")
+            )
+            notes.append(f"{len(idx)} {name}s: {', '.join(map(str, idx))}")
+    return box + (f" (only {'; '.join(notes)})" if notes else "")
+
+
+HUNKS = 8
+"""Hunks a diff keeps per tensor, and changed values per hunk, for the UI's diff view."""
+
+
+def _hunks(key: str, a: torch.Tensor, b: torch.Tensor, nz: torch.Tensor) -> list[dict[str, Any]]:
+    """A tensor's change as git shows a file's: hunks, each a slice of the tensor with its
+    values before (``old``) and after (``new``). The elements of a hunk run along the dim with
+    the most changed indices (a column for a column edit); the other dims fix the hunk. Only
+    the first few hunks and values are kept, without listing every changed element."""
+    if nz.dim() == 0 or not nz.any():
+        return []
+    dims = nz.dim()
+    counts = [
+        int(nz.any(dim=tuple(i for i in range(dims) if i != d)).sum()) if dims > 1 else 1
+        for d in range(dims)
+    ]
+    along = max(range(dims), key=lambda d: counts[d])
+    fixed = [d for d in range(dims) if d != along]
+    moved = nz.movedim(along, -1)  # [*fixed, along]
+    if fixed:
+        groups = torch.nonzero(moved.any(dim=-1))  # [G, len(fixed)], row-major
+        total = int(groups.shape[0])
+        picks = [tuple(g) for g in groups[:HUNKS].tolist()]
+    else:
+        total, picks = 1, [()]
+    out: list[dict[str, Any]] = []
+    for at_fixed in picks:
+        elems = torch.nonzero(moved[at_fixed]).reshape(-1)
+        it = iter(at_fixed)
+        where = [":" if d == along else str(next(it)) for d in range(dims)]
+        values = []
+        for e in elems[:HUNKS].tolist():
+            index = list(at_fixed)
+            index.insert(along, e)
+            at = tuple(index)
+            values.append({"at": list(at), "old": float(a[at]), "new": float(b[at])})
+        out.append(
+            {"where": f"{key}[{', '.join(where)}]", "changed": int(elems.numel()), "values": values}
+        )
+    if total > len(out):
+        out[-1]["more"] = total - len(out)
+    return out
 
 
 def _bbox(mask: torch.Tensor) -> str:
@@ -2211,3 +2382,39 @@ def _split_scopes(text: str) -> list[str]:
         buf.append(ch)
     parts.append("".join(buf).strip())
     return [p for p in parts if p]
+
+
+def _tree_entry(tree: dict[str, Any], param: str) -> tuple[Any, ...]:
+    """What a tree holds for one tensor: its merged and adapter patches, and promotion."""
+    return (
+        tuple(tree.get("merged", {}).get(param, ())),
+        tuple(tree.get("adapter", {}).get(param, ())),
+        param in tree.get("promote", ()),
+    )
+
+
+def _ranked_over(ir: ModelIR, hits: GrepHits) -> str:
+    """Which writers a contrast ranked, by key pattern and how many units each gave. Seen
+    live: 3,616,768 columns, of which 4,096 came from a vision writer nobody named."""
+    from collections import Counter
+
+    patterns: Counter[str] = Counter()
+    sizes: dict[str, int] = {}
+    layer_of = ir.structure.get("layer_of", {})
+    for target in hits.lab.resolve(hits.result.scope):
+        key = ir.key_of(target.param)
+        pattern = ".".join(["L*", *key.split(".")[1:]]) if target.param in layer_of else key
+        patterns[pattern] += 1
+        role = target.role or ir.primary_role(target.param)
+        shape = ir.params[target.param].shape
+        units = shape[role.in_dim] if role is not None and role.in_dim is not None else 0
+        if role is not None and role.experts is not None and len(shape) == 3:
+            units *= shape[0]
+        sizes[pattern] = sizes.get(pattern, 0) + int(units)
+    if not patterns:
+        return ""
+    parts = [
+        f"{p} ({n} tensor{'s' if n > 1 else ''}, {sizes[p]:,} units)"
+        for p, n in sorted(patterns.items(), key=lambda kv: -sizes[kv[0]])
+    ]
+    return "\nranked over: " + ", ".join(parts)
