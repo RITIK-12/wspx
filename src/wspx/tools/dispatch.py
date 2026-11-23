@@ -63,7 +63,7 @@ def _run(lab: Lab, name: str, a: Any) -> ToolResult:
             hits.summary, {"handle": hits.handle, "hits": [h.__dict__ for h in hits]}, [hits.handle]
         )
     if name == "show":
-        return lab.show(a.address, values=a.values)
+        return lab.show(a.address, values=a.values, grid=a.grid)
     if name == "contrast":
         d = lab.contrast(
             prompt_arg(a.positive),

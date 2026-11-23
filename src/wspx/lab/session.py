@@ -610,7 +610,9 @@ class Lab:
 
     # ------------------------------------------------------------------ show / generate
 
-    def show(self, address: str, *, values: int | None = None) -> ToolResult:
+    def show(
+        self, address: str, *, values: int | None = None, grid: int | None = None
+    ) -> ToolResult:
         targets = self.resolve(address)
         scale = None
         if self.ir.semantics.final_norm:
@@ -618,7 +620,13 @@ class Lab:
             scale = w.detach().float() if w.dim() == 1 else None
         infos = [
             analysis.show(
-                self.ir, dict(self.params), t, text=self.text, values=values, final_scale=scale
+                self.ir,
+                dict(self.params),
+                t,
+                text=self.text,
+                values=values,
+                final_scale=scale,
+                grid=grid,
             )
             for t in targets[:4]
         ]

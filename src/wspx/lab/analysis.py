@@ -39,12 +39,16 @@ def show(
     text: Text | None = None,
     values: int | None = None,
     final_scale: torch.Tensor | None = None,
+    grid: int | None = None,
 ) -> dict[str, Any]:
-    """Summaries before values: stats, a text histogram, the spectrum, vocab tokens, capped raw values."""
+    """Summaries before values: stats, a text histogram, the spectrum, vocab tokens, capped raw
+    values, and (``grid``) a pooled magnitude map of the tensor for a viewer."""
     weight = params[target.param].detach()
     view = select(weight, target.index)
     stats = tensor_stats(view)
     out: dict[str, Any] = {"address": target.address, "param": target.param, "stats": stats}
+    if grid:
+        out["map"] = magnitude_map(view, grid)
     role = target.role or ir.primary_role(target.param)
     if view.dim() == 1 and text is not None and role is not None and "norm" not in role.kind:
         tokens = _vocab_of_vector(ir, params, view.float(), role.kind, final_scale)
@@ -88,6 +92,31 @@ def render_show(info: dict[str, Any]) -> str:
             f"  values ({len(info['values'])} of {info['values_total']}): {info['values']}"
         )
     return "\n".join(lines)
+
+
+def magnitude_map(view: torch.Tensor, cells: int = 48) -> dict[str, Any]:
+    """The tensor as at most ``cells`` × ``cells`` blocks of root-mean-square magnitude,
+    keeping its aspect ratio: what a heatmap of the weights shows, at any size. A vector is
+    one row; more than two dimensions fold into (first, rest)."""
+    x = view.detach().float()
+    x = x.reshape(1, -1) if x.dim() <= 1 else x.reshape(x.shape[0], -1)
+    rows, cols = x.shape
+    scale = cells / max(rows, cols)
+    out_r = max(1, min(rows, round(rows * scale))) if rows > 1 else 1
+    out_c = max(1, min(cols, round(cols * scale)))
+    if x.dim() == 2 and rows == 1:
+        out_c = min(cols, cells * 4)  # a vector reads better as a long strip
+    pooled = torch.nn.functional.adaptive_avg_pool2d((x * x)[None, None], (out_r, out_c))[
+        0, 0
+    ].sqrt()
+    finite = pooled[torch.isfinite(pooled)]
+    return {
+        "rows": out_r,
+        "cols": out_c,
+        "of": [int(rows), int(cols)],
+        "cells": [[round(float(v), 6) for v in row] for row in pooled.cpu().tolist()],
+        "max": float(finite.max()) if finite.numel() else 0.0,
+    }
 
 
 def _vocab_of_vector(

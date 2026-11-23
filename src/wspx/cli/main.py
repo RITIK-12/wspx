@@ -491,9 +491,13 @@ def show(
     address: Annotated[str, typer.Argument()],
     session: Session = None,
     values: Annotated[int | None, typer.Option("--values")] = None,
+    grid: Annotated[
+        int | None,
+        typer.Option("--grid", help="also compute a pooled magnitude map (in the JSON result)"),
+    ] = None,
 ) -> None:
     """Summarise a slice of weights."""
-    _tool(session, "show", {"address": address, "values": values})
+    _tool(session, "show", {"address": address, "values": values, "grid": grid})
 
 
 @app.command()

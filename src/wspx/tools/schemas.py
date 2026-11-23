@@ -106,6 +106,13 @@ class ShowArgs(_Args):
     values: int | None = Field(
         None, ge=0, le=2048, description="Also return up to this many raw values."
     )
+    grid: int | None = Field(
+        None,
+        ge=4,
+        le=96,
+        description="For viewers: also return a pooled magnitude map at most this many cells "
+        "a side, in the structured result only.",
+    )
 
 
 class ContrastArgs(_Args):

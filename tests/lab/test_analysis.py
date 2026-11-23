@@ -175,6 +175,19 @@ class TestIndexAndShow:
         assert len(again.tensors[name].spectrum) == 16
         assert len(again.unit_tokens(name, 7)) == 10
 
+    def test_a_weight_map_keeps_the_aspect_and_the_magnitude(self) -> None:
+        w = torch.zeros(300, 100)
+        w[:150] = 2.0  # the top half is loud
+        m = analysis.magnitude_map(w, 30)
+        assert (m["rows"], m["cols"], m["of"]) == (30, 10, [300, 100])
+        assert m["cells"][0][0] == pytest.approx(2.0)
+        assert m["cells"][-1][-1] == pytest.approx(0.0)
+        assert m["max"] == pytest.approx(2.0)
+        strip = analysis.magnitude_map(torch.ones(500), 30)
+        assert (strip["rows"], strip["cols"]) == (1, 120)
+        kernel = analysis.magnitude_map(torch.ones(64, 1, 4), 16)
+        assert (kernel["rows"], kernel["of"]) == (16, [64, 4])
+
     def test_show(self, llama: tuple) -> None:  # type: ignore[type-arg]
         model, ir = llama
         info = analysis.show(
