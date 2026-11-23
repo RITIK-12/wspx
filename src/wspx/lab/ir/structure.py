@@ -367,6 +367,7 @@ def _blocks(
                 info.module[len(inside) :] if info.module != path else "", []
             ).append(name)
     never = len(graph.nodes)
+    added = _added_back(graph, inside)
 
     def when(names: list[str]) -> int:
         return min((first.get(n, never) for n in names), default=never)
@@ -405,11 +406,42 @@ def _blocks(
                 "tensors": [strip_weight(n[len(inside) :]) for n in names],
                 "flags": flags,
                 "writes": bool(group_kinds & {"writer", "expert"}),
+                "adds": head in added,
                 "reads": bool(group_kinds & {"reader", "router", "expert"}),
                 "numel": sum(_numel(params[n].shape) for n in names),
                 "ran": when(names) < never,
             }
         )
+    return out
+
+
+def _added_back(graph: OpGraph, inside: str) -> set[str]:
+    """The layer's top-level submodules whose output is added to something outside them
+    (past shape-only ops): a residual add, read off the data flow."""
+
+    def head(module: str) -> str | None:
+        return module[len(inside) :].split(".", 1)[0] if module.startswith(inside) else None
+
+    out: set[str] = set()
+    for node in graph.nodes:
+        mine = head(node.module)
+        if mine is None or mine in out:
+            continue
+        frontier, seen = list(node.outs), set()
+        while frontier and mine not in out:
+            vid = frontier.pop()
+            if vid in seen:
+                continue
+            seen.add(vid)
+            for idx, _ in graph.consumers.get(vid, []):
+                user = graph.nodes[idx]
+                if head(user.module) == mine:
+                    continue  # still inside the block
+                if user.short_op in SHAPE_OPS:
+                    frontier.extend(user.outs)
+                elif user.short_op in ("add", "add_"):
+                    out.add(mine)
+                    break
     return out
 
 

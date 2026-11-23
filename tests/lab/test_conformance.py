@@ -245,7 +245,17 @@ VISION: dict[str, tuple[Callable[[], Any], list[str]]] = {
 }
 
 
-def _check(model: Any, expected: list[str], *, lm: bool) -> None:
+RESIDUAL_ADDS = {
+    "llama": ["self_attn", "mlp"],
+    "gpt2": ["attn", "mlp"],
+    "falcon": ["self_attention", "mlp"],  # parallel: both branches add to one stream
+    "gemma3": ["post_attention_layernorm", "post_feedforward_layernorm"],
+    "mamba": ["mixer"],
+}
+"""Sublayers whose output a layer adds back to its stream, as the op graph shows it."""
+
+
+def _check(model: Any, expected: list[str], *, lm: bool, arch: str = "") -> None:
     torch.manual_seed(0)
     ir = build_ir(model.eval())
     assert ir.unexercised == [], ir.render_info()
@@ -274,6 +284,11 @@ def _check(model: Any, expected: list[str], *, lm: bool) -> None:
     for address in expected:
         assert ir.resolve(address)
     if lm:
+        for variant in stack["variants"]:
+            adds = [b["name"] for b in variant["blocks"] if b["adds"]]
+            assert adds, variant["blocks"]
+            if arch in RESIDUAL_ADDS:
+                assert adds == RESIDUAL_ADDS[arch]
         text = model.config.get_text_config()
         assert stack["size"] == text.num_hidden_layers
         assert stack["runs"] == [1] * stack["size"]
@@ -288,7 +303,7 @@ def _check(model: Any, expected: list[str], *, lm: bool) -> None:
 @pytest.mark.parametrize("arch", sorted(LLMS))
 def test_language_models(arch: str) -> None:
     factory, expected = LLMS[arch]
-    _check(factory(), expected, lm=True)
+    _check(factory(), expected, lm=True, arch=arch)
 
 
 @pytest.mark.parametrize("arch", sorted(VISION))
@@ -404,6 +419,13 @@ def test_a_looped_transformer_compiles_to_its_physical_layers(inkling: Any) -> N
     assert blocks["mlp"]["writes"]
     assert blocks["q_message_gate"]["flags"] == ["gates"]
     assert blocks["input_layernorm"]["flags"] == ["norms"]
+    # Residual adds, from the data flow: each mixer and the short convolution after it.
+    assert [b["name"] for b in looped["blocks"] if b["adds"]] == [
+        "self_attn",
+        "post_attention_convolution",
+        "mlp",
+        "post_mlp_convolution",
+    ]
     assert sum(len(b["tensors"]) for b in looped["blocks"]) == len(looped["tensors"])
     info = ir.render_info()
     assert "L6-17 run 3 times with the same weights" in info
