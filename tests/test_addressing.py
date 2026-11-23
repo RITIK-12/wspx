@@ -45,6 +45,15 @@ class TestShortAddresses:
         assert parse_address("L12.moe.e5.up").path == ("moe", "e5", "up")
         assert parse_address("L0.lstm.ih.forget").path == ("lstm", "ih", "forget")
 
+    def test_a_pass_suffix_on_weights_says_to_drop_it(self) -> None:
+        # Seen live on a looped model: show L6@2.self_attn.o_proj.linear.
+        with pytest.raises(AddressError, match=r"same weights.*as L6\.self_attn\.o_proj\.linear$"):
+            parse_address("L6@2.self_attn.o_proj.linear")
+
+    def test_a_glob_class_is_not_a_slice(self) -> None:
+        with pytest.raises(AddressError, match=r"glob with \* and \? only"):
+            parse_address("model.vision_tower.[!l]*")
+
     def test_reversed_range_rejected(self) -> None:
         with pytest.raises(AddressError, match="reversed"):
             parse_address("L12-8.mlp.down")

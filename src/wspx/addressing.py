@@ -31,6 +31,7 @@ SPECIAL_SCOPES = ("embed", "unembed", "final_norm")
 
 _LAYERS_RE = re.compile(r"^L(\*|(\d+)(?:-(\d+))?)$")
 _ROLE_PART_RE = re.compile(r"^[A-Za-z0-9_*?]+$")
+_PASS_RE = re.compile(r"^L(\d+)@(\d+)$")
 _RAW_RE = re.compile(r"^[A-Za-z0-9_*?/:-]+(?:\.[A-Za-z0-9_*?/:-]+)*$")
 _INT_RE = re.compile(r"^-?\d+$")
 _AXIS_RE = re.compile(r"^[A-Za-z_]\w*$")
@@ -201,6 +202,15 @@ def parse_address(text: str) -> Address:
     if scope_text in SPECIAL_SCOPES:
         return Address(ScopeKind.SPECIAL, None, (scope_text,), None, slice_items)
 
+    passed = _PASS_RE.match(head)
+    if passed:
+        # Seen live: show L6@2.self_attn.o_proj.linear. Every pass runs the same weights.
+        rest_text = f".{rest}" if rest else ""
+        raise AddressError(
+            f"{text!r}: @{passed.group(2)} names a pass of a looped layer, for trace, "
+            f"activations and contrast; every pass runs the same weights, so address them "
+            f"as L{passed.group(1)}{rest_text}"
+        )
     if not _RAW_RE.match(scope_text):
         raise AddressError(f"{text!r}: not a short address, special scope or parameter name")
     return Address(ScopeKind.RAW, None, (), scope_text, slice_items)
@@ -223,7 +233,10 @@ def _split_slice(text: str) -> tuple[str, tuple[SliceItem, ...] | None]:
             raise AddressError(f"{text!r}: unbalanced ']'")
         return text, None
     if not text.endswith("]"):
-        raise AddressError(f"{text!r}: slice must close with ']' at the end of the address")
+        raise AddressError(
+            f"{text!r}: '[' starts a slice, which must close with ']' at the end of the "
+            "address; scopes glob with * and ? only"
+        )
     body = text[open_at + 1 : -1]
     return text[:open_at], tuple(_parse_slice_item(item, text) for item in _split_items(body, text))
 
