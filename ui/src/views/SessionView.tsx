@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { formatTokens, post, stream, type Session, type TimelineEvent } from "../api";
 import { Markdown } from "../markdown";
+import { MediaStrip, mediaParts } from "../media";
 
 // The session as a conversation: your messages on the right (the task, and anything you send
 // while it runs); on the left, the leader's replies with their thinking folded away and the
@@ -87,7 +88,7 @@ export function SessionView({ session, onChange }: { session: Session; onChange:
 
       <div className="chat-log" ref={log}>
         {items.map((item) => (
-          <ChatItem key={item.key} item={item} />
+          <ChatItem key={item.key} item={item} session={session.id} />
         ))}
         {running && <div className="chat-working muted small">working…</div>}
       </div>
@@ -225,7 +226,7 @@ function conversation(events: TimelineEvent[], session: Session): Item[] {
 
 // --------------------------------------------------------------------------- view
 
-function ChatItem({ item }: { item: Item }) {
+function ChatItem({ item, session }: { item: Item; session: string }) {
   if (item.type === "user") {
     return (
       <div className="msg-row user">
@@ -281,7 +282,7 @@ function ChatItem({ item }: { item: Item }) {
       </div>
     );
   }
-  return <OpenModel io={item.io} model={item.model} />;
+  return <OpenModel io={item.io} model={item.model} session={session} />;
 }
 
 function Tools({ tools }: { tools: ToolUse[] }) {
@@ -307,7 +308,7 @@ function Tools({ tools }: { tools: ToolUse[] }) {
   );
 }
 
-function OpenModel({ io, model }: { io: any; model: string }) {
+function OpenModel({ io, model, session }: { io: any; model: string; session: string }) {
   const records: any[] = io.records ?? [];
   const made = records.filter((r) => r.kind === "generate");
   const read = records.length - made.length;
@@ -337,7 +338,7 @@ function OpenModel({ io, model }: { io: any; model: string }) {
           </span>
         </div>
         {first.map((r, i) => (
-          <Answer key={i} r={r} />
+          <Answer key={i} r={r} session={session} />
         ))}
         {rest.length > 0 && (
           <details className="more">
@@ -345,7 +346,7 @@ function OpenModel({ io, model }: { io: any; model: string }) {
               {rest.length} more answer{rest.length === 1 ? "" : "s"}
             </summary>
             {rest.map((r, i) => (
-              <Answer key={i} r={r} />
+              <Answer key={i} r={r} session={session} />
             ))}
           </details>
         )}
@@ -354,9 +355,10 @@ function OpenModel({ io, model }: { io: any; model: string }) {
   );
 }
 
-function Answer({ r }: { r: any }) {
+function Answer({ r, session }: { r: any; session: string }) {
   const system = (r.messages ?? []).find((m: any) => m.role === "system");
   const user = [...(r.messages ?? [])].reverse().find((m: any) => m.role === "user");
+  const asked = user ? contentText(user.content, false) : "";
   return (
     <div className="answer">
       <div className="answer-meta muted small">
@@ -364,12 +366,14 @@ function Answer({ r }: { r: any }) {
         {r.seconds != null && <> · {r.seconds.toFixed(2)} s</>}
         {r.split && <span className="badge warn">{r.split}: visible to you only</span>}
       </div>
-      {(system || user) && (
+      {(system || asked || r.item) && (
         <div className="asked small">
+          {r.item && <div><span className="muted">stored prompt</span> {r.item}</div>}
           {system && <div><span className="muted">instruction</span> {contentText(system.content)}</div>}
-          {user && <div><span className="muted">asked</span> {contentText(user.content)}</div>}
+          {asked && <div><span className="muted">asked</span> {asked}</div>}
         </div>
       )}
+      <MediaStrip session={session} parts={mediaParts(r.messages)} />
       {r.reasoning && <Thinking text={r.reasoning} />}
       {(r.tool_calls ?? []).map((c: any, i: number) => (
         <div key={i} className="tool-use ok inline">
@@ -429,9 +433,10 @@ function preview(args: any): string {
   return text.length > 90 ? `${text.slice(0, 89)}…` : text;
 }
 
-function contentText(content: any): string {
+function contentText(content: any, media = true): string {
   if (typeof content === "string") return content;
   return (content ?? [])
-    .map((part: any) => (part.type === "text" ? part.text : `[${part.type}${part[part.type] ? `: ${part[part.type]}` : ""}]`))
+    .filter((part: any) => media || part.type === "text")
+    .map((part: any) => (part.type === "text" ? part.text : `[${part.type}]`))
     .join(" ");
 }

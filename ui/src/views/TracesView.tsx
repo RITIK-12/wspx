@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { api, formatTokens, type Session } from "../api";
+import { MediaStrip, mediaParts } from "../media";
 
 // Two traces of one session, each a tree of spans. Leader: the driver model's run — every
 // LLM call with its reasoning, tokens and cost, every tool call with its full result, and
@@ -545,7 +546,7 @@ function openModelTree(record: any, forward: boolean): Span {
         tokens: { in: r.prompt_tokens ?? 0, out: r.output_tokens ?? 0 },
         badge: r.split ? `${r.split}: visible here only` : undefined,
         children: [],
-        detail: () => <Exchange record={r} />,
+        detail: () => <Exchange record={r} session={s.id} />,
       })),
       open: shown.length <= 6,
       detail: () => (
@@ -559,7 +560,7 @@ function openModelTree(record: any, forward: boolean): Span {
   return root;
 }
 
-function Exchange({ record: r }: { record: any }) {
+function Exchange({ record: r, session }: { record: any; session: string }) {
   const system = (r.messages ?? []).filter((m: any) => m.role === "system");
   return (
     <div className={`exchange ${r.kind}`}>
@@ -580,6 +581,12 @@ function Exchange({ record: r }: { record: any }) {
           <span className="muted small">instruction</span> {contentText(m.content)}
         </div>
       ))}
+      {r.item && (
+        <div className="instruction">
+          <span className="muted small">stored prompt</span> {r.item}
+        </div>
+      )}
+      <MediaStrip session={session} parts={mediaParts(r.messages)} />
       <details open>
         <summary>prompt as the model saw it</summary>
         <pre className="reasoning">{r.prompt}</pre>

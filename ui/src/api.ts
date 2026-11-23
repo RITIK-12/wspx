@@ -32,6 +32,21 @@ export function setToken(value: string) {
 
 export class ApiError extends Error {}
 
+/** A file (an image or video a prompt named) as a blob, with the token in a header. */
+export async function apiBlob(path: string): Promise<Blob> {
+  const res = await fetch(path, { headers: { authorization: `Bearer ${token}` } });
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      detail = (await res.json()).detail ?? detail;
+    } catch {
+      /* not JSON */
+    }
+    throw new ApiError(detail);
+  }
+  return res.blob();
+}
+
 export async function api<T = any>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await fetch(path, {
     ...init,

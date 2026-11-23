@@ -180,6 +180,19 @@ a { color: var(--accent); }
 .md blockquote { margin: 0 0 8px; padding-left: 10px; border-left: 3px solid var(--line); color: var(--muted); }
 .md hr { border: 0; border-top: 1px solid var(--line); margin: 10px 0; }
 .md > :last-child { margin-bottom: 0; }
+.media-strip { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 8px; }
+.frames { display: flex; flex-wrap: wrap; gap: 6px; align-items: flex-end; }
+.thumb { display: inline-flex; flex-direction: column; gap: 3px; padding: 4px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); max-width: 180px; cursor: zoom-in; }
+.thumb:disabled { cursor: default; opacity: 1; }
+.thumb img { display: block; max-width: 170px; max-height: 130px; border-radius: 5px; object-fit: contain; background: var(--sunk); }
+.thumb.video { cursor: pointer; }
+.thumb-note { display: inline-flex; align-items: center; justify-content: center; width: 120px; height: 80px; border-radius: 5px; background: var(--sunk); color: var(--muted); font-size: 18px; }
+.thumb-name { font-size: 11px; color: var(--muted); max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.media-missing { font-size: 12px; color: var(--muted); border: 1px dashed var(--line); border-radius: 6px; padding: 4px 8px; }
+.clip { max-width: min(420px, 100%); max-height: 300px; border-radius: 8px; background: #000; }
+.lightbox { position: fixed; inset: 0; z-index: 50; background: rgba(0, 0, 0, 0.82); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; padding: 16px; cursor: zoom-out; }
+.lightbox img { width: min(100%, 1000px); height: auto; max-height: calc(100vh - 80px); object-fit: contain; border-radius: 6px; }
+.lightbox-label { color: #ddd; font-size: 12px; }
 @media (max-width: 720px) { .bubble { max-width: 100%; } .avatar { display: none; } .chat-working { margin-left: 0; } }
 .timeline { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 8px; }
 .ev { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; background: var(--panel); }
