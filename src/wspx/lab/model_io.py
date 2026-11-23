@@ -25,6 +25,9 @@ MAX_RECORDS = 200
 MAX_CHARS = 8000
 """Characters kept per prompt or output; the middle of a longer text is elided."""
 
+MAX_FRAMES = 16
+"""Frame paths kept for a video given as frames; the count is kept too."""
+
 _REPEAT = re.compile(r"(<[^<>\s]{1,48}>)(\1){3,}")
 _THINK = re.compile(r"<(think|thinking)>(.*?)(?:</\1>|$)", re.S)
 _THINK_CLOSE = re.compile(r"^(.*?)</(?:think|thinking)>", re.S)
@@ -99,7 +102,15 @@ def _messages(prompt: Any) -> list[dict[str, Any]] | None:
                 kind = part.get("type")
                 if kind in ("image", "video"):
                     ref = part.get(kind)
-                    parts.append({"type": kind, kind: ref if isinstance(ref, str) else "(inline)"})
+                    entry: dict[str, Any] = {"type": kind}
+                    if isinstance(ref, str):  # a path in the project: never pixels
+                        entry[kind] = ref
+                    elif isinstance(ref, list) and all(isinstance(r, str) for r in ref):
+                        entry[kind] = ref[:MAX_FRAMES]
+                        entry["frames"] = len(ref)
+                    else:
+                        entry[kind] = "(inline)"
+                    parts.append(entry)
                 else:
                     parts.append({k: v for k, v in part.items() if isinstance(v, str | int)})
             content = parts
@@ -174,6 +185,8 @@ class ModelIO:
             messages = _messages(prompt)
             if messages is not None:
                 record["messages"] = messages
+            if isinstance(prompt, dict) and prompt.get("item"):
+                record["item"] = prompt["item"]
             if self.split:
                 record["split"] = self.split
             self.records.append(record)

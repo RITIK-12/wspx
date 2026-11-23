@@ -513,3 +513,78 @@ def test_the_open_model_trace_is_kept_for_the_user_only(tmp_path: Path) -> None:
             "token ids [1, 2, 3]",
             3,
         )
+
+
+def test_the_ui_gets_a_sessions_prompt_images_and_nothing_else(tmp_path: Path) -> None:
+    """Images a prompt named are served to the user from the project snapshot, unpacked once;
+    other files, paths outside the project and other callers are refused."""
+    from wspx.project import Project
+
+    root = tmp_path / "proj"
+    (root / "prompts").mkdir(parents=True)
+    (root / "wspx.toml").write_text('[project]\nname = "demo"\n')
+    png = b"\x89PNG\r\n\x1a\n" + b"\0" * 64
+    (root / "prompts" / "a.png").write_bytes(png)
+    found = Project.find(root)
+    assert found is not None
+    client, _ = make(tmp_path)
+    with client:
+        gzip = USER | {"content-type": "application/gzip"}
+        snapshot = client.post("/api/projects", content=found.pack(), headers=gzip).json()[
+            "snapshot"
+        ]
+        sid = client.post(
+            "/api/sessions",
+            json={"model": "tiny", "project": "demo", "snapshot": snapshot},
+            headers=USER,
+        ).json()["id"]
+        bare = client.post("/api/sessions", json={"model": "tiny"}, headers=USER).json()["id"]
+        url = f"/api/sessions/{sid}/media"
+        got = client.get(url, params={"path": "prompts/a.png"}, headers=USER)
+        assert got.status_code == 200, got.text
+        assert got.content == png
+        assert got.headers["content-type"] == "image/png"
+        assert "immutable" in got.headers["cache-control"]
+        refused = {
+            "../store/trace.db": 400,  # outside the project
+            "/etc/passwd": 400,
+            "wspx.toml": 400,  # not an image or video
+            "prompts/missing.png": 404,
+        }
+        for path, status in refused.items():
+            assert client.get(url, params={"path": path}, headers=USER).status_code == status, path
+        assert client.get(url, params={"path": "prompts/a.png"}).status_code == 401  # no token
+        runner = {"authorization": f"Bearer {mint(SECRET, sid, scope='runner')}"}
+        assert client.get(url, params={"path": "prompts/a.png"}, headers=runner).status_code == 401
+        nothing = client.get(f"/api/sessions/{bare}/media", params={"path": "a.png"}, headers=USER)
+        assert nothing.status_code == 404
+
+
+def test_snapshots_are_unpacked_once_and_the_oldest_are_dropped(tmp_path: Path) -> None:
+    import io
+    import tarfile
+
+    from wspx.control import media
+
+    def snapshot(name: str) -> bytes:
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            data = name.encode()
+            info = tarfile.TarInfo("prompts/a.png")
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+        return buf.getvalue()
+
+    cache = media.MediaCache(tmp_path / "cache")
+    reads: list[str] = []
+
+    def loader(name: str) -> Any:
+        return lambda: (reads.append(name), snapshot(name))[1]
+
+    for _ in range(3):
+        path, kind = cache.file(loader("one"), "sha256:one", "prompts/a.png")
+    assert (path.read_text(), kind, reads) == ("one", "image/png", ["one"])
+    for i in range(media.KEEP + 2):
+        cache.file(loader(f"s{i}"), f"sha256:s{i}", "prompts/a.png")
+    kept = [p for p in (tmp_path / "cache").iterdir() if (p / ".unpacked").exists()]
+    assert len(kept) == media.KEEP

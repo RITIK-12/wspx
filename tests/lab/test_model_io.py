@@ -148,3 +148,45 @@ def test_a_chat_prompt_is_recorded_as_the_model_saw_it(tmp_path: Path) -> None:
     assert "×" in record["prompt"]  # the image's tokens, collapsed
     assert record["kind"] == "generate"
     assert record["output_tokens"] >= 1
+
+
+def test_stored_prompts_and_frame_videos_keep_their_media_paths(tmp_path: Path) -> None:
+    """The UI shows a prompt's images from the paths it named: a stored prompt is recorded as
+    the messages it names, and a video given as frames keeps its frame paths (never pixels)."""
+    import json
+
+    from tests.lab.test_media import ask, picture, tiny_vlm
+
+    model, processor = tiny_vlm()
+    lab = open_lab(
+        model,
+        store=tmp_path / "s",
+        workdir=tmp_path,
+        tokenizer=processor.tokenizer,
+        processor=processor,
+    )
+    picture(tmp_path / "prompts" / "a.png", 0)
+    (tmp_path / "prompts" / "scenes.jsonl").write_text(
+        json.dumps(ask("prompts/a.png", "red?")) + "\n"
+    )
+    frames = [f"prompts/clip/{i}.png" for i in range(20)]
+    for i, f in enumerate(frames):
+        picture(tmp_path / f, i)
+    video = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "video", "video": frames}, {"type": "text", "text": "moved?"}],
+            }
+        ]
+    }
+    with TestClient(lab_server.LabServer(lab, exit_on_lapse=False).app()) as c:
+        stored = tool(c, "generate", {"prompt": {"item": "scenes/0"}, "max_tokens": 2})
+        clip = tool(c, "generate", {"prompt": video, "max_tokens": 2})
+    (record,) = stored["model_io"]["records"]
+    assert record["item"] == "scenes/0"
+    assert record["messages"][1]["content"][0] == {"type": "image", "image": "prompts/a.png"}
+    (record,) = clip["model_io"]["records"]
+    part = record["messages"][0]["content"][0]
+    assert (part["type"], part["frames"], part["video"]) == ("video", 20, frames[:16])
+    assert len(json.dumps(record)) < 20_000  # paths, never pixels

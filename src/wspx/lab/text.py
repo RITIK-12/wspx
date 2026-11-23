@@ -61,9 +61,20 @@ class Text:
         Each row is recorded in the open model's trace while a tool call runs.
         """
         batch = self._batch(prompts, device)
-        if self.io is not None:
-            batch.records = self.io.prompts(prompts, batch.ids, batch.mask)
+        if self.io is not None and self.io.active:
+            batch.records = self.io.prompts(
+                [self._as_recorded(p) for p in prompts], batch.ids, batch.mask
+            )
         return batch
+
+    def _as_recorded(self, prompt: Prompt) -> Prompt:
+        """A stored prompt as the messages it names (so its images show), keeping its name."""
+        if self.media is None or not isinstance(prompt, Mapping) or "item" not in prompt:
+            return prompt
+        resolved = self.media.resolve(prompt)
+        if isinstance(resolved, Mapping):
+            return {**resolved, "item": prompt["item"]}
+        return {"item": prompt["item"]}
 
     def _batch(self, prompts: Sequence[Prompt], device: torch.device | str = "cpu") -> Batch:
         if any(is_media(p) for p in prompts):

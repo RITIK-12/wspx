@@ -24,7 +24,13 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.types import Receive, Scope, Send
@@ -35,6 +41,7 @@ from wspx.auth import TokenError, check_bearer, verify
 from wspx.control.backend import Backend
 from wspx.control.gateway_client import GatewayAdmin
 from wspx.control.mcp_server import build_server
+from wspx.control.media import MediaCache
 from wspx.control.sessions import SessionManager
 from wspx.control.tracedb import TraceDB
 from wspx.errors import WspxError
@@ -105,6 +112,7 @@ def create_app(
 ) -> FastAPI:
     store = Store(settings.store_root)
     trace = TraceDB(Path(settings.store_root) / "trace.db")
+    media_cache = MediaCache()
     if gateway is None and settings.gateway_url and settings.gateway_admin_token:
         gateway = GatewayAdmin(settings.gateway_url, settings.gateway_admin_token)
     manager = SessionManager(
@@ -393,6 +401,26 @@ def create_app(
             except Exception as exc:  # a missing part must not lose the rest of the record
                 out[key] = {"error": str(exc)}
         return out
+
+    @app.get("/api/sessions/{sid}/media", dependencies=[Depends(user)])
+    async def session_media(sid: str, path: str) -> Response:
+        """An image or video a prompt in this session named, from its project snapshot."""
+        record = guarded(lambda: manager.get(sid))
+        if not record.snapshot:
+            raise HTTPException(404, "this session has no project files")
+        snapshot = record.snapshot
+        try:
+            found, kind = await offload(
+                lambda: media_cache.file(lambda: store.objects.get(snapshot), snapshot, path)
+            )
+        except FileNotFoundError:
+            raise HTTPException(404, f"{path}: not in this session's project") from None
+        except WspxError as exc:
+            raise HTTPException(400, str(exc)) from None
+        # a session's snapshot never changes, so the file at a path never does
+        return FileResponse(
+            found, media_type=kind, headers={"cache-control": "private, max-age=86400, immutable"}
+        )
 
     @app.get("/api/sessions/{sid}/handles", dependencies=[Depends(user)])
     def handles(sid: str) -> dict[str, Any]:
