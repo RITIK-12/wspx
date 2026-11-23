@@ -391,6 +391,20 @@ def test_a_looped_transformer_compiles_to_its_physical_layers(inkling: Any) -> N
     assert kind[f"{layer}.self_attn.o_proj.linear.weight"] == "writer"
     assert kind[f"{layer}.self_attn.o_proj.gate_proj.weight"] == "reader"
     assert "gate = model-width output that only passes through sigmoid" in ir.render_info()
+    # The UI's layer diagram: each layer type's sublayers in the order they run, from the op
+    # graph. Short convolutions whose weights are used without calling their module still
+    # land right after the block they follow.
+    looped = next(v for v in stack["variants"] if 9 in v["layers"])
+    blocks = {b["name"]: b for b in looped["blocks"]}
+    names = [b["name"] for b in looped["blocks"]]
+    assert names.index("self_attn") < names.index("post_attention_convolution") < names.index("mlp")
+    assert names.index("mlp") < names.index("post_mlp_convolution")
+    assert "attends" in blocks["self_attn"]["flags"]
+    assert blocks["mlp"]["flags"] == ["routes"]
+    assert blocks["mlp"]["writes"]
+    assert blocks["q_message_gate"]["flags"] == ["gates"]
+    assert blocks["input_layernorm"]["flags"] == ["norms"]
+    assert sum(len(b["tensors"]) for b in looped["blocks"]) == len(looped["tensors"])
     info = ir.render_info()
     assert "L6-17 run 3 times with the same weights" in info
     assert "24 layers, L0-L23" in info

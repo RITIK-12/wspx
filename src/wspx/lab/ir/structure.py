@@ -137,9 +137,13 @@ def build_structure(
         for name in params
     }
 
+    record = _stack_record(stack, params, layer_of, model) if stack is not None else None
+    if record is not None and main is not None:
+        for variant in record["variants"]:
+            variant["blocks"] = _blocks(record, variant["layers"][0], main, params, kinds)
     return {
         "hidden": hidden,
-        "stack": _stack_record(stack, params, layer_of, model) if stack is not None else None,
+        "stack": record,
         "others": [
             {"path": s["path"], "size": len(s["children"]), "tensors": s["tensors"]}
             for s in stacks[1:]
@@ -328,6 +332,85 @@ def _stacks(
     # Prefer what the forward pass ran through; nested lists (experts) hold a subset.
     found.sort(key=lambda s: (-s["called"], -s["total"], len(s["path"]), s["path"]))
     return found
+
+
+ATTENTION_OPS = ("scaled_dot_product", "flex_attention", "flash_attn")
+"""Ops that compute attention; eager attention shows as a softmax outside a router."""
+
+
+def _blocks(
+    stack: dict[str, Any],
+    layer: int,
+    graph: OpGraph,
+    params: dict[str, Any],
+    kinds: dict[str, str],
+) -> list[dict[str, Any]]:
+    """A layer's sublayers in the order they run: each top-level submodule of the layer with
+    its modules and tensors, ordered by the first op that reads them (exact even when a
+    module's weights are used without calling it), and what its traced ops and tensor kinds
+    show it does. Read off the op graph, never off names.
+    """
+    prefix = f"{stack['path']}." if stack["path"] else ""
+    path = prefix + stack["children"][layer]
+    inside = f"{path}."
+    first: dict[str, int] = {}
+    ops: dict[str, set[str]] = {}
+    for node in graph.nodes:
+        for use in node.params:
+            first.setdefault(use.name, node.idx)
+        if node.module.startswith(inside):
+            ops.setdefault(node.module[len(inside) :].split(".", 1)[0], set()).add(node.short_op)
+    modules: dict[str, list[str]] = {}
+    for name, info in params.items():
+        if info.module == path or info.module.startswith(inside):
+            modules.setdefault(
+                info.module[len(inside) :] if info.module != path else "", []
+            ).append(name)
+    never = len(graph.nodes)
+
+    def when(names: list[str]) -> int:
+        return min((first.get(n, never) for n in names), default=never)
+
+    groups: dict[str, list[str]] = {}
+    for rel in sorted(modules, key=lambda m: (when(modules[m]), m)):
+        groups.setdefault(rel.split(".", 1)[0] if rel else "(own)", []).append(rel)
+    out = []
+    for head, rels in sorted(
+        groups.items(), key=lambda g: (when([n for m in g[1] for n in modules[m]]), g[0])
+    ):
+        names = [
+            n for m in rels for n in sorted(modules[m], key=lambda n: (first.get(n, never), n))
+        ]
+        group_kinds = {kinds[n] for n in names}
+        op_names = ops.get(head, set())
+        flags = []
+        if any(a in op for op in op_names for a in ATTENTION_OPS) or (
+            any("softmax" in op for op in op_names) and not group_kinds & {"router", "expert"}
+        ):
+            flags.append("attends")
+        if group_kinds & {"router", "expert"}:
+            flags.append("routes")
+        if any("convolution" in op for op in op_names) or any(
+            len(params[n].shape) == 3 and kinds[n] not in ("expert",) for n in names
+        ):
+            flags.append("convolves")
+        if "gate" in group_kinds:
+            flags.append("gates")
+        if all(len(params[n].shape) <= 1 for n in names):
+            flags.append("norms")
+        out.append(
+            {
+                "name": head,
+                "modules": rels,
+                "tensors": [strip_weight(n[len(inside) :]) for n in names],
+                "flags": flags,
+                "writes": bool(group_kinds & {"writer", "expert"}),
+                "reads": bool(group_kinds & {"reader", "router", "expert"}),
+                "numel": sum(_numel(params[n].shape) for n in names),
+                "ran": when(names) < never,
+            }
+        )
+    return out
 
 
 def _key_roles(

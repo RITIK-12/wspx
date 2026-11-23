@@ -95,8 +95,9 @@ HandleLookup = Callable[[Handle, str], list[int]]
 """(handle, parameter) → unit indices along the tensor dim being narrowed."""
 
 
-IR_VERSION = 4
-"""4: roles at every key without a layer stack, the ``gate`` kind, and per-tensor facts from a
+IR_VERSION = 5
+"""5: each layer type's sublayer blocks in run order (the UI's layer diagram). 4: roles at
+every key without a layer stack, the ``gate`` kind, and per-tensor facts from a
 vision-language model's image pass."""
 
 KIND_LEGEND = (
