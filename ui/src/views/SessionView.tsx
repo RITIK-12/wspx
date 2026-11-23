@@ -120,6 +120,10 @@ function Event({ event }: { event: TimelineEvent }) {
             ? `human: ${p.type}${p.text ? ` "${p.text}"` : ""}`
             : event.kind === "hook"
               ? `${p.client} ${p.event ?? ""} ${p.tool ?? ""}${p.call_id ? ` → ${p.call_id}` : ""}`
-              : `${event.kind}: ${JSON.stringify(p).slice(0, 200)}`;
+              : event.kind === "model_io"
+                ? `open model: ${(p.records ?? []).filter((r: any) => r.kind === "generate").length} generation(s), ${
+                    (p.records ?? []).filter((r: any) => r.kind !== "generate").length
+                  } forward pass(es) for ${p.tool} (Traces → Open model)`
+                : `${event.kind}: ${JSON.stringify(p).slice(0, 200)}`;
   return <li className={`ev note ${event.kind}`}>{label} <span className="muted small">{time}</span></li>;
 }

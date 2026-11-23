@@ -104,6 +104,12 @@ a { color: var(--accent); }
 .ev.tool.failed { border-left-color: var(--danger); }
 .ev.note { border-style: dashed; color: var(--muted); font-size: 13px; }
 .ev.loop { color: var(--warn); border-color: var(--warn); }
+.ev.model { border-left: 3px solid var(--warn); }
+.exchange { border-top: 1px solid var(--line); padding-top: 8px; margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
+.exchange:first-of-type { border-top: 0; margin-top: 0; padding-top: 0; }
+.exchange.forward { opacity: 0.8; }
+.exchange .instruction { font-size: 13px; }
+.subtabs { margin-bottom: 0; border-bottom: 0; }
 .ev .text { white-space: pre-wrap; }
 .ev .call { font-size: 12.5px; }
 .ev .args { color: var(--muted); }

@@ -1,13 +1,20 @@
 import { useEffect, useState } from "react";
 import { api, formatTokens, type Session } from "../api";
 
-// The session's whole record, in order, from creation: what the driver was given, every turn
-// with its reasoning and token counts, every tool call with its full result, every human
-// action and lab change. Export saves the same document `wspx sessions export` reads.
+// Two traces of one session. Leader: the driver model's record from creation — what it was
+// given, every turn with its reasoning and token counts, every tool call with its full
+// result, every human action and lab change. Open model: everything the open-weight model
+// being edited was prompted with (chat template, system instructions and all) and what it
+// wrote back — reasoning, tool calls and answer — per tool call, with the weights it ran on.
+// Export saves the same document `wspx sessions export` reads.
+const VIEWS = ["Leader", "Open model"] as const;
+type View = (typeof VIEWS)[number];
+
 export function TracesView({ session }: { session: Session }) {
   const [record, setRecord] = useState<any>(null);
   const [error, setError] = useState("");
   const [handles, setHandles] = useState<Record<string, any>>({});
+  const [view, setView] = useState<View>("Leader");
   const live = ["starting", "running"].includes(session.status);
 
   useEffect(() => {
@@ -31,12 +38,6 @@ export function TracesView({ session }: { session: Session }) {
   if (!record) return <p className="muted">Loading…</p>;
 
   const events: any[] = record.events;
-  const turns = events.filter((e) => e.kind === "turn");
-  const calls = events.filter((e) => e.kind === "tool_call");
-  const sum = (key: string) =>
-    events
-      .filter((e) => e.kind === "turn" || e.kind === "compaction")
-      .reduce((n, e) => n + (e.payload.usage?.[key] ?? 0), 0);
   const save = () => {
     const blob = new Blob([JSON.stringify(record, null, 2)], { type: "application/json" });
     const link = document.createElement("a");
@@ -49,30 +50,151 @@ export function TracesView({ session }: { session: Session }) {
   return (
     <div className="full-trace">
       <div className="controls">
-        <div className="muted small">
-          {turns.length} turns · {calls.length} tool calls ({calls.filter((c) => !c.payload.ok).length} failed) ·{" "}
-          {formatTokens({
-            input: sum("input"),
-            cache_read: sum("cache_read"),
-            cache_write: sum("cache_write"),
-            output: sum("output"),
-            reasoning: sum("reasoning"),
-          })}{" "}
-          tokens
-          {typeof record.usage?.total_charged === "number" && <> · ${record.usage.total_charged.toFixed(4)}</>}
-        </div>
+        <nav className="tabs subtabs">
+          {VIEWS.map((v) => (
+            <button key={v} className={v === view ? "tab active" : "tab"} onClick={() => setView(v)}>
+              {v}
+            </button>
+          ))}
+        </nav>
         <span className="spacer" />
-        <button onClick={save} title="The same record `wspx sessions export` writes as files">
+        <button onClick={save} title="Both traces, as `wspx sessions export` writes them">
           Export
         </button>
+      </div>
+      {view === "Leader" ? (
+        <LeaderTrace events={events.filter((e) => e.kind !== "model_io")} usage={record.usage} handles={handles} />
+      ) : (
+        <OpenModelTrace events={events.filter((e) => e.kind === "model_io")} model={record.session?.model} />
+      )}
+    </div>
+  );
+}
+
+function LeaderTrace({ events, usage, handles }: { events: any[]; usage: any; handles: Record<string, any> }) {
+  const turns = events.filter((e) => e.kind === "turn");
+  const calls = events.filter((e) => e.kind === "tool_call");
+  const sum = (key: string) =>
+    events
+      .filter((e) => e.kind === "turn" || e.kind === "compaction")
+      .reduce((n, e) => n + (e.payload.usage?.[key] ?? 0), 0);
+  return (
+    <>
+      <div className="muted small">
+        {turns.length} turns · {calls.length} tool calls ({calls.filter((c) => !c.payload.ok).length} failed) ·{" "}
+        {formatTokens({
+          input: sum("input"),
+          cache_read: sum("cache_read"),
+          cache_write: sum("cache_write"),
+          output: sum("output"),
+          reasoning: sum("reasoning"),
+        })}{" "}
+        tokens
+        {typeof usage?.total_charged === "number" && <> · ${usage.total_charged.toFixed(4)}</>}
       </div>
       <ol className="timeline">
         {events.map((e) => (
           <Entry key={e.id} event={e} handles={handles} />
         ))}
       </ol>
+    </>
+  );
+}
+
+function OpenModelTrace({ events, model }: { events: any[]; model?: string }) {
+  const [all, setAll] = useState(false);
+  const records = events.flatMap((e) => e.payload.records ?? []);
+  const generations = records.filter((r: any) => r.kind === "generate");
+  const omitted = events.reduce((n, e) => n + (e.payload.omitted ?? 0), 0);
+  const tokens = (key: string) => records.reduce((n: number, r: any) => n + (r[key] ?? 0), 0);
+  if (!events.length) {
+    return <p className="muted">The open model has not been prompted yet in this session.</p>;
+  }
+  return (
+    <>
+      <div className="muted small">
+        {model} · {generations.length} generation(s), {records.length - generations.length} forward pass(es)
+        {omitted ? ` (+${omitted} not kept)` : ""} · prompts {tokens("prompt_tokens").toLocaleString()} tokens → output{" "}
+        {tokens("output_tokens").toLocaleString()} tokens ·{" "}
+        <label>
+          <input type="checkbox" checked={all} onChange={(e) => setAll(e.target.checked)} /> show forward passes
+        </label>
+      </div>
+      <ol className="timeline">
+        {events.map((e) => {
+          const shown = (e.payload.records ?? []).filter((r: any) => all || r.kind === "generate");
+          if (!shown.length && !all) return null;
+          return (
+            <li key={e.id} className="ev model">
+              <div className="meta">
+                <code>{e.payload.tool}</code>
+                {e.payload.turn != null && <> · turn {e.payload.turn}</>} · <code>{e.payload.call_id}</code> ·{" "}
+                {new Date(e.ts * 1000).toLocaleTimeString()} · {(e.payload.records ?? []).length} exchange(s)
+                {e.payload.omitted ? `, ${e.payload.omitted} more not kept` : ""}
+              </div>
+              {shown.map((r: any, i: number) => (
+                <Exchange key={i} record={r} />
+              ))}
+            </li>
+          );
+        })}
+      </ol>
+    </>
+  );
+}
+
+function Exchange({ record: r }: { record: any }) {
+  const system = (r.messages ?? []).filter((m: any) => m.role === "system");
+  return (
+    <div className={`exchange ${r.kind}`}>
+      <div className="meta">
+        {r.kind === "generate" ? "generation" : "forward pass"} · {r.purpose} · weights {r.weights} ·{" "}
+        {r.prompt_tokens} prompt tokens
+        {r.kind === "generate" && (
+          <>
+            {" "}
+            → {r.output_tokens} · stop {r.stop}
+          </>
+        )}
+        {r.split && <span className="badge warn">{r.split}: visible here only</span>}
+      </div>
+      {system.map((m: any, i: number) => (
+        <div key={i} className="instruction">
+          <span className="muted small">instruction</span> {contentText(m.content)}
+        </div>
+      ))}
+      <details>
+        <summary>prompt as the model saw it</summary>
+        <pre className="reasoning">{r.prompt}</pre>
+      </details>
+      {r.reasoning && (
+        <details open>
+          <summary>reasoning</summary>
+          <pre className="reasoning">{r.reasoning}</pre>
+        </details>
+      )}
+      {(r.tool_calls ?? []).map((c: any, i: number) => (
+        <div key={i} className="call">
+          → <code>{c.name ?? "tool call"}</code>{" "}
+          <code className="args">{JSON.stringify(c.arguments ?? c.raw)}</code>
+        </div>
+      ))}
+      {r.kind === "generate" && <div className="text">{r.answer || <span className="muted">(no answer text)</span>}</div>}
+      {r.kind === "generate" && r.output !== r.answer && (
+        <details>
+          <summary>raw output</summary>
+          <pre className="reasoning">{r.output}</pre>
+        </details>
+      )}
     </div>
   );
+}
+
+function contentText(content: any): string {
+  if (typeof content === "string") return content;
+  return (content ?? [])
+    .map((part: any) => (part.type === "text" ? part.text : `[${part.type}${part[part.type] ? `: ${part[part.type]}` : ""}]`))
+    .join(" ");
 }
 
 function Entry({ event, handles }: { event: any; handles: Record<string, any> }) {
