@@ -219,14 +219,17 @@ class VcsArgs(_Args):
     ]
     message: str | None = None
     rev: str | None = Field(
-        None, description="Revision: HEAD, HEAD~2, a branch, a commit id or 'base'."
+        None,
+        description="Revision: HEAD, HEAD~2, a branch, a commit id or 'base'. For branch: "
+        "where the new branch starts (default HEAD).",
     )
     a: str | None = None
     b: str | None = None
     name: str | None = Field(
         None,
-        description="branch: the new branch, created at HEAD and checked out (branch names are "
-        "shared by every session in the deployment); merge: the branch to merge.",
+        description="branch: the new branch, created at rev (default HEAD) and checked out "
+        "(branch names are shared by every session in the deployment); merge: the branch to "
+        "merge.",
     )
     address: str | None = Field(None, description="For blame.")
     suite: str | None = Field(None, description="For bisect.")

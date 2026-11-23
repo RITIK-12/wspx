@@ -265,6 +265,7 @@ def _load_lab(record: SessionRecord, store: Any) -> Any:
         base_reader=loaded.base_reader if loaded.readable else None,
         workdir=workdir,
         config=WspxConfig.discover(workdir) if workdir else None,
+        scratch=workdir is not None,
     )
 
 

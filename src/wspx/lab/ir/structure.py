@@ -235,6 +235,18 @@ def structural_semantics(
                 out_dim=1,
             )
         )
+    # ``final_norm`` too: it came only from the traced names, so a model whose traced names are
+    # off (Inkling) had none, and the address failed although arch named the norm.
+    for name in structure.get("final_norm_params", []):
+        if keys.get(name) != "final_norm":
+            roles.append(
+                Role(
+                    address="final_norm",
+                    param=name,
+                    kind="final_norm",
+                    module=params[name].module,
+                )
+            )
     head_dims: dict[str, int] = {}
     notes = list(old.notes)
     taken = {r.address for r in roles}

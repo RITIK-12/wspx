@@ -276,6 +276,7 @@ def main(argv: list[str] | None = None) -> None:
         workdir=workdir,
         config=WspxConfig.discover(workdir),
         processor=loaded.processor,
+        scratch=bool(args.snapshot),
     )
     server = LabServer(lab, lease_s=args.lease, token=os.environ.get("WSPX_LAB_TOKEN"))
     server.network = network_check()

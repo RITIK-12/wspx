@@ -19,7 +19,16 @@ from wspx.errors import WspxError
 from wspx.lab.index import tensor_stats
 from wspx.lab.ir.model_ir import ModelIR, Target
 from wspx.lab.media import is_media
-from wspx.lab.probe import Probe, layer_calls, pass_suffix, token_calls, writer_units
+from wspx.lab.probe import (
+    ExpertWrites,
+    Probe,
+    expert_writers,
+    expert_writes,
+    layer_calls,
+    pass_suffix,
+    token_calls,
+    writer_units,
+)
 from wspx.lab.tensors import select
 from wspx.lab.text import Prompt, Text
 
@@ -502,7 +511,11 @@ def forward_trace(
     attn_points = [p for p in probe.points if p.startswith("attn.")]
     wanted = [point for _, point in calls] + attn_points + list(route_points.values())
     units = writer_units(ir)
-    with torch.no_grad(), probe.capture(list(dict.fromkeys(wanted)), units=units) as cap:
+    with (
+        torch.no_grad(),
+        probe.capture(list(dict.fromkeys(wanted)), units=units) as cap,
+        expert_writes(model, ir) as expert_out,
+    ):
         logits = forward(model, ir, ids, mask, batch.extra)
     norm, unembed = _norm_and_unembed(model, ir)
     labels: list[str] = []
@@ -534,6 +547,9 @@ def forward_trace(
             real = final[-1].clamp_min(1e-30)
             lens_kl = float((real * (real.log() - lens)).sum())
     writers = _top_writers(model, ir, cap.unit_calls, tuple(ids.shape), top=top)
+    writers = sorted(
+        [*writers, *_top_expert_writers(model, ir, expert_out, top=top)], key=lambda x: -abs(x[1])
+    )[: top * 4]
     looped = [label for label in labels if "@" in label]
     lines = [
         f"forward trace · {ids.shape[1]} tokens · {len(labels)} layer calls"
@@ -663,6 +679,103 @@ def _top_writers(
     return scored[: top * 4]
 
 
+def _expert_unit(ir: ModelIR, param: str, expert: int, unit: int) -> str:
+    """``L9.mlp.experts.down_proj[e, :, j]``: one input feature of one expert, as grep and
+    activations name it."""
+    role = ir.primary_role(param)
+    key = ir.key_of(param)
+    return (
+        f"{key}[{expert}, :, {unit}]" if role and role.in_dim == 2 else f"{key}[{expert}, {unit}]"
+    )
+
+
+def _expert_norms(weight: torch.Tensor, ir: ModelIR, param: str, expert: int) -> torch.Tensor:
+    """‖w_j‖ of each input feature j of one expert's writer matrix."""
+    role = ir.primary_role(param)
+    assert role is not None
+    assert role.out_dim is not None
+    norms: torch.Tensor = weight[expert].detach().float().norm(dim=role.out_dim - 1)
+    return norms
+
+
+def _top_expert_writers(
+    model: torch.nn.Module, ir: ModelIR, routed: ExpertWrites, *, top: int
+) -> list[tuple[str, float]]:
+    """Expert units by what they wrote at the last token, ``weight · a_j · ‖w_j‖`` (the routing
+    weight scales the expert's output), on every call of their module (``@k`` on a pass).
+    Seen live: on Inkling every MLP write is an expert's, and the trace ranked attention only."""
+    params = dict(model.named_parameters())
+    scored: list[tuple[str, float]] = []
+    for param, calls in routed.calls.items():
+        for k, experts in enumerate(calls, start=1):
+            suffix = pass_suffix(ir, param, len(calls), k)
+            for e, (a, weight) in experts.items():
+                score = (
+                    weight * a.to(params[param].device) * _expert_norms(params[param], ir, param, e)
+                )
+                n = min(top, score.numel())
+                for j in torch.topk(score.abs(), k=n).indices.tolist():
+                    scored.append((_expert_unit(ir, param, e, j) + suffix, float(score[j])))
+    scored.sort(key=lambda x: -abs(x[1]))
+    return scored[: top * 4]
+
+
+def _write_norms(
+    model: torch.nn.Module, ir: ModelIR, units: list[str], routed: ExpertWrites
+) -> dict[Any, torch.Tensor]:
+    """‖w_j‖ of every writer unit under the weights loaded now: 2-D writers by tensor, and
+    each expert routed in ``routed`` by ``(tensor, expert)``."""
+    params = dict(model.named_parameters())
+    norms: dict[Any, torch.Tensor] = {}
+    for param in units:
+        role = ir.primary_role(param)
+        if role is not None and role.in_dim is not None:
+            norms[param] = _unit_norms(params[param], role.in_dim)
+    for param, calls in routed.calls.items():
+        for e in {e for experts in calls for e in experts}:
+            norms[(param, e)] = _expert_norms(params[param], ir, param, e)
+    return norms
+
+
+def _moved_expert_units(
+    ir: ModelIR,
+    here: ExpertWrites,
+    there: ExpertWrites,
+    norms_here: dict[Any, torch.Tensor],
+    norms_there: dict[Any, torch.Tensor],
+    *,
+    top: int,
+) -> list[tuple[str, float]]:
+    """How much each expert unit's write at the last token moved between two weight states
+    (each side's input, routing weight and weights); an expert routed on one side only
+    counts as writing nothing on the other."""
+    moved: list[tuple[str, float]] = []
+    for param, mine in here.calls.items():
+        theirs = there.calls.get(param, [])
+        if len(mine) != len(theirs):
+            continue
+        for k, (a_side, b_side) in enumerate(zip(mine, theirs, strict=True), start=1):
+            suffix = pass_suffix(ir, param, len(mine), k)
+            for e in sorted(set(a_side) | set(b_side)):
+                a = b = None
+                if e in a_side:
+                    h, w = a_side[e]
+                    a = w * h * norms_here[(param, e)].to(h.device)
+                if e in b_side:
+                    h, w = b_side[e]
+                    b = w * h * norms_there[(param, e)].to(h.device)
+                ref = a if a is not None else b
+                assert ref is not None
+                delta = (a if a is not None else torch.zeros_like(ref)) - (
+                    b if b is not None else torch.zeros_like(ref)
+                )
+                n = min(top, delta.numel())
+                for j in torch.topk(delta.abs(), k=n).indices.tolist():
+                    moved.append((_expert_unit(ir, param, e, j) + suffix, float(delta[j])))
+    moved.sort(key=lambda x: -abs(x[1]))
+    return moved[: top * 4]
+
+
 def _unit_norms(weight: torch.Tensor, in_dim: int) -> torch.Tensor:
     """‖w_j‖ for each unit j of a writer: the length of what it writes per unit of activation."""
     w = weight.detach().float()
@@ -695,10 +808,17 @@ def diff_trace(
     points = [point for _, point in calls]
     units = writer_units(ir)
     with torch.no_grad():
-        with probe.capture(points, units=units) as here:
+        with probe.capture(points, units=units) as here, expert_writes(model, ir) as routed_here:
             logits_here = forward(model, ir, ids, mask, batch.extra)
-        with switch, probe.capture(points, units=units) as there:
+        norms_here = _write_norms(model, ir, units, routed_here)
+        with (
+            switch,
+            probe.capture(points, units=units) as there,
+            expert_writes(model, ir) as routed_there,
+        ):
             logits_there = forward(model, ir, ids, mask, batch.extra)
+            # each side's own weights: an edited unit writes differently on the same input
+            norms_there = _write_norms(model, ir, units, routed_there)
     labels, divergence = [], []
     for label, p in calls:
         if p not in here.points or p not in there.points:
@@ -710,7 +830,6 @@ def diff_trace(
     out_b = logits_there[0].argmax(-1).tolist()
     changed = [i for i, (x, y) in enumerate(zip(out_a, out_b, strict=True)) if x != y]
     moved: list[tuple[str, float]] = []
-    params = dict(model.named_parameters())
     for param in units:
         role = ir.primary_role(param)
         shape = tuple(ids.shape)
@@ -718,12 +837,13 @@ def diff_trace(
         theirs = token_calls(there.unit_calls.get(param, []), shape)
         if role is None or role.in_dim is None or not mine or len(mine) != len(theirs):
             continue
-        norms = _unit_norms(params[param], role.in_dim)
+        n_here, n_there = norms_here[param], norms_there[param]
         for k, (x, y) in enumerate(zip(mine, theirs, strict=True), start=1):
-            delta = (x[0, -1] - y[0, -1]).float()
-            moved.extend(
-                _unit_scores(role, delta * norms, top, pass_suffix(ir, param, len(mine), k))
-            )
+            delta = x[0, -1].float() * n_here - y[0, -1].float() * n_there
+            moved.extend(_unit_scores(role, delta, top, pass_suffix(ir, param, len(mine), k)))
+    moved.extend(
+        _moved_expert_units(ir, routed_here, routed_there, norms_here, norms_there, top=top)
+    )
     moved.sort(key=lambda x: -abs(x[1]))
     # Seen live: 0.0012 and 0.0008 both printed 0.001, and only one counted as diverging.
     first = next((i for i, d in enumerate(divergence) if d > DIVERGED), None)
@@ -744,7 +864,10 @@ def diff_trace(
         )
     )
     if moved:
-        lines.append("most-moved units: " + ", ".join(f"{a} {s:+.2f}" for a, s in moved[:top]))
+        lines.append(
+            "most-moved units (what each writes at the last token; units downstream of an "
+            "edit move too): " + ", ".join(f"{a} {s:+.2f}" for a, s in moved[:top])
+        )
     return Trace(
         "diff",
         "\n".join(lines),
@@ -815,6 +938,11 @@ def attribution_trace(
         "units push the token up here, negative ones hold it down",
     ]
     lines.extend(f"  {i + 1:>2}. {a:<32s} {s:+.4f}" for i, (a, s) in enumerate(scored[:top]))
+    if expert_writers(ir):
+        lines.append(
+            "  ranks 2-D writers only: experts are not attributed here; trace without a "
+            "reference lists what they wrote, and activations ranks their inputs"
+        )
     return Trace(
         "attribution",
         "\n".join(lines),

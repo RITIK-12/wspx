@@ -396,6 +396,9 @@ def test_a_looped_transformer_compiles_to_its_physical_layers(inkling: Any) -> N
     assert router is not None
     assert router.kind == "router"
     assert ir.structure["final_norm"] == "model.language_model.norm"
+    # Seen live: the traced names are off on Inkling, and `final_norm` came only from them
+    assert [t.param for t in ir.resolve("final_norm")] == ["model.language_model.norm.weight"]
+    assert "final_norm (model.language_model.norm.weight, " in ir.render_info()
     assert ir.semantics.unembed == "lm_head.weight"
     # Seen live: the loop gates' projections, model-width but fed to tanh, were "writers"
     # and topped every writer ranking. The op graph shows where their output goes.
@@ -526,6 +529,15 @@ def test_what_a_driver_found_on_inkling_at_dev13(
     assert re.fullmatch(r"L9\.mlp\.experts\.down_proj\[\d, :, \d+\]", best.address)
     assert best.expert is not None
     assert "routed to it" in experts.result.expression
+    # Seen live (dev14): a ranking that keeps 4,096 of 78,336 read "4,096 of 78,336 matched"
+    from wspx.lab import session as session_module
+
+    monkeypatch.setattr(session_module, "EXPERT_UNITS_KEPT", 10)
+    capped = lab.activations([prompt], scope="L9.mlp.experts.down_proj", top=5).summary
+    assert re.search(r"top 5 of [\d,]+ cols ranked by mean \|activation\|", capped)
+    assert "(10 kept)" in capped
+    assert "matched" not in capped
+    assert "each expert's mean is over the tokens routed to it" in capped
 
     monkeypatch.setattr(analysis, "LENS_KL", 0.0)
     traced = lab.trace(prompt, top=2)
@@ -571,3 +583,69 @@ def test_expert_inputs_are_what_each_expert_was_routed(inkling: Any) -> None:
                 count[e] += 1
     assert torch.equal(got.counts[up].cpu(), count)
     assert torch.allclose(got.sums[up].cpu(), want, atol=1e-4)
+
+
+def test_expert_writes_add_up_to_the_experts_output(inkling: Any, tmp_path: Any) -> None:
+    """Seen live on Inkling (Haiku, dev14): every "top writers" list (trace, diff trace,
+    contrast) left out the experts, which do all of the model's MLP writing. What the capture
+    says each routed expert fed its down projection at the last token, times its routing
+    weight, must add up to the experts module's own output there, on every pass."""
+    from wspx.lab.probe import expert_writers, expert_writes
+    from wspx.lab.sdk import open_lab
+
+    model = inkling.eval()
+    ir = build_ir(model)
+    down = "model.language_model.layers.9.mlp.experts.down_proj"
+    assert down in expert_writers(ir)
+    assert "model.language_model.layers.9.mlp.experts.gate_up_proj" not in expert_writers(ir)
+    module = model.get_submodule(ir.params[down].module)
+    outputs: list[torch.Tensor] = []
+    hook = module.register_forward_hook(lambda _m, _a, out: outputs.append(out.detach().clone()))
+    try:
+        with torch.no_grad(), expert_writes(model, ir) as got:
+            model(input_ids=torch.tensor([[3, 9, 27, 81, 5, 7]]))
+    finally:
+        hook.remove()
+    calls = got.calls[down]
+    assert len(calls) == len(outputs) == 3  # L9 runs three times
+    weight = model.get_parameter(down).detach().float()
+    for experts, out in zip(calls, outputs, strict=True):
+        assert experts  # the last token was routed to some experts
+        total = sum(w * (weight[e] @ a) for e, (a, w) in experts.items())
+        assert torch.allclose(total, out.reshape(-1, out.shape[-1])[-1].float(), atol=1e-5)
+
+    # in this random model attention writes most; quiet it so the experts lead
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name.endswith("self_attn.o_proj.linear.weight"):
+                param.mul_(0.01)
+    (tmp_path / "work").mkdir()
+    lab = open_lab(model, store=tmp_path / "store", workdir=tmp_path / "work")
+    writers = [a for a, _ in lab.trace([3, 9, 27, 81, 5], top=5).data["writers"]]
+    assert any(".mlp.experts.down_proj[" in a and a.endswith(" @2") for a in writers)
+    d = lab.contrast([[3, 9, 27]], [[81, 5, 7]], name="d")
+    assert d.handle.startswith("dir:d(")
+    ranked = str(d.writers)
+    assert "tensors and experts" in ranked or ".mlp.experts.down_proj[" in ranked
+    assert "d-writers" in ranked
+
+    # an edited expert writes differently on the same input: L9's first pass reads what it
+    # read at base, and its writes move by exactly the edit
+    from wspx.lab import analysis
+
+    lab.edit.scale("L9.mlp.experts.down_proj", factor=1.5)
+    ids = torch.tensor([[3, 9, 27, 81, 5]])
+    with torch.no_grad():
+        with expert_writes(lab.model, lab.ir) as here:
+            analysis.forward(lab.model, lab.ir, ids, torch.ones_like(ids))
+        n_here = analysis._write_norms(lab.model, lab.ir, [], here)
+        with lab.at_base(), expert_writes(lab.model, lab.ir) as there:
+            analysis.forward(lab.model, lab.ir, ids, torch.ones_like(ids))
+            n_there = analysis._write_norms(lab.model, lab.ir, [], there)
+    moved = dict(analysis._moved_expert_units(lab.ir, here, there, n_here, n_there, top=500))
+    e, (a, w) = next(iter(here.calls[down][0].items()))
+    j = int((w * a * n_here[(down, e)]).abs().argmax())
+    write = float(w * a[j] * n_here[(down, e)][j])
+    assert moved[f"L9.mlp.experts.down_proj[{e}, :, {j}] @1"] == pytest.approx(write / 3, rel=1e-4)
+    shown = lab.trace([3, 9, 27, 81, 5], vs="base", top=5).summary
+    assert "most-moved units (what each writes at the last token" in shown

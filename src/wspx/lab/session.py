@@ -112,6 +112,7 @@ class Lab:
         workdir: Path | None = None,
         cache_bytes: int | None = None,
         processor: Any = None,
+        scratch: bool = False,
     ) -> None:
         self.model = model
         self.ir = ir
@@ -119,6 +120,8 @@ class Lab:
         self.session = session
         self.config = config or WspxConfig()
         self.workdir = Path(workdir or Path.cwd())
+        self.scratch = scratch
+        """The working directory is an unpacked copy of the project, deleted with the lab."""
         self.repo = Repo(store, ir.fingerprint)
         media = None
         if processor is not None:
@@ -140,6 +143,7 @@ class Lab:
         self.directions: dict[str, torch.Tensor] = {}
         self.results: dict[str, list[Hit]] = {}
         self.staged: list[PatchRecord] = []
+        self._last_check: tuple[tuple[Any, ...], Report] | None = None
         self.sources: dict[str, tuple[ModelIR, torch.nn.Module]] = {}
         self.context: dict[str, Any] = {}
         """Per-call provenance set by the caller: driver, call id."""
@@ -433,15 +437,23 @@ class Lab:
             name=name,
             description=(
                 f"{result.candidates} {result.units} ranked by {result.expression}"
-                if len(result.hits) == result.candidates
+                if result.is_ranking
                 else f"{len(result.hits)} of {result.candidates} {result.units} matching "
                 f"{result.expression}"
             ),
             # Seen live: "5 hits" for a ranking of 147,456 columns. Say what matched, and
             # how many of them the caller was shown.
             size=(
-                f"{len(result.hits):,} "
-                + ("ranked" if len(result.hits) == result.candidates else "matched")
+                (
+                    f"{result.candidates:,} ranked"
+                    + (
+                        f", {len(result.hits):,} kept"
+                        if len(result.hits) < result.candidates
+                        else ""
+                    )
+                    if result.is_ranking
+                    else f"{len(result.hits):,} matched"
+                )
                 + (f", top {top} shown" if len(result.hits) > top else "")
             ),
             call_id=self.context.get("call_id"),
@@ -602,7 +614,7 @@ class Lab:
             if any(n > 1 for n in [*ran.values(), *expert_ran.values()])
             else ""
         )
-        routed_note = "; an expert's over the tokens routed to it" if experts else ""
+        routed_note = "; each expert's mean is over the tokens routed to it" if experts else ""
         return GrepResult(
             f"mean |activation| on {len(prompts)} prompt(s){passes}{routed_note}",
             shown or "writers",
@@ -612,6 +624,7 @@ class Lab:
             scores,
             seconds=time.perf_counter() - started,
             skipped=skipped,
+            ranking=True,
         )
 
     def _prompts(self, value: Sequence[Prompt] | Prompt) -> list[Prompt]:
@@ -748,7 +761,9 @@ class Lab:
         self._save()
         ranking = f"abs(cos(dir:{name}))"
         try:
-            writers: GrepHits | str = self.grep(ranking, scope=_writer_scope(self.ir), top=5)
+            writers: GrepHits | str = self.grep(
+                ranking, scope=_writer_scope(self.ir), top=5, name=f"{name}-writers"
+            )
         except (RuntimeError, GrepError) as exc:  # the direction is kept either way
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -769,6 +784,8 @@ class Lab:
         target: str | int | None = None,
         top: int = 5,
     ) -> ToolResult:
+        if target is not None:  # before any forward pass: a bad target cost two of them
+            target = self.text.token_id(target)
         if reference is not None:
             t = analysis.attribution_trace(
                 self.model,
@@ -934,6 +951,23 @@ class Lab:
         records = self.staged if patch is None else [self._record(patch)]
         if not records:
             return Report(levels=[], diagnostics=[diag(Code.NO_OP, "nothing staged to check")])
+        # The same staged patches on the same weights check the same: commit reuses the check
+        # just run (seen live: every commit re-ran 37 canary passes and 4 generations).
+        key = (
+            level,
+            self.tree_key(self.tree.state),
+            self.repo.head(self.session),
+            tuple(r.oid for r in records),
+            tuple(r.oid for r in self.staged),
+            self.config.check.model_dump_json(),
+        )
+        if self._last_check is not None and self._last_check[0] == key:
+            return self._last_check[1].model_copy(deep=True)
+        report = self._check(records, level)
+        self._last_check = (key, report.model_copy(deep=True))
+        return report
+
+    def _check(self, records: list[PatchRecord], level: str) -> Report:
         deltas = [self._load_delta(d["blob"]) for r in records for d in r.deltas]
         precision = records[0].precision if len({r.precision for r in records}) == 1 else "merged"
         plan = EditPlan(
@@ -1220,17 +1254,27 @@ class Lab:
         self.tree.checkout(tree)
         if oid:
             self._verify(self.repo.get_commit(oid))
+        detached = False
         if branch:
             self.repo.switch(self.session, branch)
-        elif oid:
-            self.repo.detach(self.session, oid)
+        elif rev.strip() != "HEAD":
+            # A commit or base: HEAD moves there too, detached. Seen live: `checkout base` left
+            # HEAD on the branch tip, so the next commit recorded the base tree on top of it and
+            # silently dropped the tip's edits.
+            self.repo.detach(self.session, oid or "")
+            detached = True
         self.staged = []
         self._save()
         ms = (time.perf_counter() - started) * 1000
         where = branch or (short(oid) if oid else "base")
+        note = (
+            "\nHEAD is detached here: commits start a new line from it; `vcs branch` names one"
+            if detached
+            else ""
+        )
         return ToolResult(
             f"checked out {where} · {len(tree.tensors())} patched tensor(s) · "
-            f"hashes verified · {ms:.0f} ms",
+            f"hashes verified · {ms:.0f} ms{note}",
             {"head": oid},
         )
 
@@ -1246,10 +1290,26 @@ class Lab:
             return ToolResult(
                 "\n".join(lines) or "(no branches)", {"branches": self.repo.branches()}
             )
-        self.repo.create_branch(name, self.repo.resolve(at, self.session))
+        oid = self.repo.resolve(at, self.session)
+        moved = switch and oid != self.repo.head(self.session)
+        if moved and self.staged:
+            raise VCSError(
+                f"{len(self.staged)} staged patch(es) would be lost starting {name} at {at}; "
+                "commit them or drop them with `vcs discard` first"
+            )
+        self.repo.create_branch(name, oid)
+        if moved:  # the weights follow, or the next commit records the old tree on top of it
+            self.tree.checkout(TreeState.from_dict(self.repo.tree_of_oid(oid)))
+            if oid:
+                self._verify(self.repo.get_commit(oid))
+            self._save()
         if switch:
             self.repo.switch(self.session, name)
-        return ToolResult(f"branch {name} at {at}" + (" (switched)" if switch else ""))
+        # the commit, not the word: "at HEAD" hid where HEAD was
+        return ToolResult(
+            f"branch {name} at {short(oid) if oid else 'base'}" + (" (switched)" if switch else ""),
+            {"head": oid},
+        )
 
     def revert(self, rev: str = "HEAD") -> ToolResult:
         if self.staged:
@@ -1481,7 +1541,8 @@ class Lab:
             self._save()
             return ToolResult(
                 f"fast-forwarded {here or 'HEAD'} to {branch} ({short(theirs)}): nothing "
-                "changed on this side, so no merge commit is needed",
+                "changed on this side, so no merge commit is needed"
+                + ("; the strategies were not used" if strategies else ""),
                 {"commit": theirs, "fast_forward": True},
             )
         base = self.repo.merge_base(ours, theirs)
@@ -1552,13 +1613,25 @@ class Lab:
         state = TreeState.from_dict(new_tree)
         kl_ours = kl_theirs = None
         if self.ir.is_lm:
-            ids, mask = self._canary()
+            # Seen live: the open model's trace showed these three runs as one, labelled with
+            # this side's weights. Record each on the weights it ran on.
+            active, self.io.active = self.io.active, False
+            try:
+                ids, mask = self._canary()
+            finally:
+                self.io.active = active
+            runs = (
+                ("merge: the merged tree", self.at_state(state)),
+                (f"merge: {branch}", self.at_state(self._state_of(theirs))),
+                ("merge: this side", contextlib.nullcontext()),
+            )
+            logits = []
             with torch.no_grad():
-                with self.at_state(state):
-                    m = analysis.forward(self.model, self.ir, ids, mask)
-                with self.at_state(self._state_of(theirs)):
-                    t = analysis.forward(self.model, self.ir, ids, mask)
-                o = analysis.forward(self.model, self.ir, ids, mask)
+                for purpose, weights in runs:
+                    with weights, self.io.using(purpose):
+                        self.io.prompts([None] * ids.shape[0], ids, mask)
+                        logits.append(analysis.forward(self.model, self.ir, ids, mask))
+            m, t, o = logits
             kl_ours, kl_theirs = token_kl(o, m, mask), token_kl(t, m, mask)
         self.tree.checkout(state)
         suites_failed = self._rerun_recorded(ours, theirs)
@@ -1613,6 +1686,22 @@ class Lab:
         strategies_used = ", ".join(
             f"{_display(self.ir, r['tensor'])}: {r['strategy']}" for r in report
         )
+        # Seen live: a strategy for a tensor only one side changed was dropped without a word.
+        resolved = {r["tensor"] for r in report}
+        unused = sorted(t for t in requested if t not in resolved)
+
+        def why(tensor: str) -> str:
+            if tensor in other:
+                return f"only {branch} changed it"
+            if tensor in mine:
+                return "only this side changed it"
+            return "neither side changed it"
+
+        unused_text = "".join(
+            f"\nstrategy for {_display(self.ir, t)} not used: {why(t)}, so there was nothing "
+            "to combine"
+            for t in unused[:4]
+        ) + (f"\n… and {len(unused) - 4} more" if len(unused) > 4 else "")
         return ToolResult(
             f"merged {branch} as {commit.short} [{status}] · {len(both)} tensor(s) changed on "
             f"both sides"
@@ -1624,6 +1713,7 @@ class Lab:
                 else ""
             )
             + f" · {kl_text}"
+            + unused_text
             + (f"\nneeds review: {'; '.join(review)}" if review else ""),
             {"commit": commit.oid, "merge": info},
         )
@@ -1747,6 +1837,12 @@ class Lab:
         else:
             raise WspxError(f"unknown export kind {kind!r}; use merged, peft, gguf or bundle")
         notes = "".join(f"\n  ! {w}" for w in info.get("warnings", []))
+        if self.scratch:  # seen live: a cloud export "succeeded" and was gone with the lab
+            notes += (
+                "\n  ! the lab works in a copy of the project that is deleted when it stops, so "
+                "this file will not outlive the lab; the commits are in the store already, "
+                "and `wspx push` shares the store"
+            )
         errors = info.get("svd_error") or {}
         if errors:
             notes += "".join(
@@ -1857,8 +1953,10 @@ class GrepHits:
                     tokens = "  writes: " + ", ".join(self.lab.text.show(t) for t, _ in tops)
             lines.append(f"{h.address:<32} {h.score:+.4f}{tokens}")
         r = self.result
-        if len(r.hits) == r.candidates:  # no threshold (a ranking): every unit "matches"
+        if r.is_ranking:  # no threshold: every unit "matches"
             head = f"top {len(self.hits)} of {r.candidates:,} {r.units} ranked by {r.expression}"
+            if len(r.hits) < r.candidates:
+                head += f" ({len(r.hits):,} kept)"
         else:
             head = f"{len(r.hits):,} of {r.candidates:,} {r.units} matched" + (
                 f", showing the top {len(self.hits)} (raise --top or narrow)"
@@ -2042,15 +2140,19 @@ def _default_scope(expression: str) -> str:
 
 
 def _writer_scope(ir: ModelIR) -> str:
-    return ",".join(
-        sorted(
-            {
-                ".".join(["L*", *r.address.split(".")[1:]])
-                for r in ir.roles
-                if r.kind == "writer" and r.split is None
-            }
-        )
-    )
+    """Every tensor that writes the stream: 2-D writers and expert down projections, a stack
+    layer's as an ``L*`` glob and any other by its key. Seen live: a vision writer's key went
+    through the glob as ``L*.vision_tower.…`` (matching nothing), and experts were left out."""
+    from wspx.lab.probe import expert_writers
+
+    params = {r.param for r in ir.roles if r.kind == "writer" and r.split is None}
+    params |= set(expert_writers(ir))
+    layer_of = ir.structure.get("layer_of", {})
+    scopes = set()
+    for param in params:
+        key = ir.key_of(param)
+        scopes.add(".".join(["L*", *key.split(".")[1:]]) if param in layer_of else key)
+    return ",".join(sorted(scopes))
 
 
 def _unit_dim(ir: ModelIR, target: Target) -> int:

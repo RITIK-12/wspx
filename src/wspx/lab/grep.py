@@ -721,6 +721,14 @@ class GrepResult:
     """Tensors in the scope that could not be split into units (convolutions, vectors)."""
     thresholds: list[str] = field(default_factory=list)
     """What each σ threshold came to: scores are raw values, compared against these."""
+    ranking: bool | None = None
+    """True when no threshold filters the units, so ``hits`` is the top of a ranking (which
+    may keep fewer than every candidate). None: a ranking when every candidate is a hit."""
+
+    @property
+    def is_ranking(self) -> bool:
+        # Seen live: experts' activations kept 4,096 of 78,336 and read "4,096 matched".
+        return self.ranking if self.ranking is not None else len(self.hits) == self.candidates
 
     @property
     def units(self) -> str:

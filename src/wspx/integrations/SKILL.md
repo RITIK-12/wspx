@@ -45,8 +45,8 @@ The tools come in groups; each description starts with its group.
 - Every tensor has an exact key from the module tree: `L9.self_attn.o_proj` is
   layer 9's `self_attn.o_proj.weight` (`L<n>` is the n-th child of the layer
   stack; `.weight` is dropped, `.bias` is kept). `embed` and `unembed` are the
-  model's input and output embeddings. Outside the stack a key is the parameter
-  name. Raw parameter names and globs (`L*.mlp.experts.*`, `L6-17.*`) always work.
+  model's input and output embeddings, and `final_norm` the norm before the
+  unembedding. Outside the stack a key is the parameter name. Raw parameter names and globs (`L*.mlp.experts.*`, `L6-17.*`) always work.
 - Slices pick units: `L9.mlp.down_proj[:, 812]`, `embed[" Wait"]`, and
   `L9.mlp.experts.down_proj[3]` for expert 3. `L9` alone is the whole layer.
 - Every result names the exact key it touched. Short names such as `L9.mlp.down`

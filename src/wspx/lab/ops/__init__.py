@@ -80,6 +80,13 @@ def registry() -> dict[str, Op]:
 def get(name: str) -> Op:
     ops = registry()
     if name not in ops:
+        called = name.split("(", 1)[0].strip()
+        if "(" in name and called in ops:
+            # Seen live: a driver passed the whole call, op="project_out(direction=…, …)"
+            raise PatchError(
+                f"op is the name alone ({called!r}); put its arguments in args, e.g. "
+                f'op="{called}", args={{...}} as in {signature(called)}'
+            )
         raise PatchError(f"unknown op {name!r}; available: {', '.join(edit_ops())}")
     return ops[name]
 

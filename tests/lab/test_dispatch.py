@@ -348,3 +348,109 @@ def test_sigma_thresholds_say_what_they_came_to(lab) -> None:  # type: ignore[no
     hits = call(lab, "grep", {"expression": "colnorm > 1σ", "in": "L*.mlp.down", "top": 2})
     assert "threshold 1σ = " in hits.summary
     assert "(mean " in hits.summary
+
+
+def test_checkout_base_moves_head_so_a_new_branch_keeps_every_edit(lab) -> None:  # type: ignore[no-untyped-def]
+    """Seen live on Inkling: `checkout base` only reset the weights, HEAD stayed on the branch
+    tip, and the next commit there recorded the base tree on top of it, silently dropping the
+    tip's edit; the merge then carried the loss over."""
+    down0, down1 = "model.layers.0.mlp.down_proj.weight", "model.layers.1.mlp.down_proj.weight"
+    _vcs(lab, "branch", name="work")
+    call(lab, "edit", {"op": "scale", "args": {"targets": "L0.mlp.down", "factor": 0.9}})
+    tip = lab.repo.get_commit(lab.repo.resolve(_vcs(lab, "commit", message="L0").split()[1]))
+
+    out = _vcs(lab, "checkout", rev="base")
+    assert "HEAD is detached" in out
+    assert _vcs(lab, "status").startswith("on (detached) at (base)")
+    assert _vcs(lab, "branch", name="side").startswith("branch side at base (switched)")
+    call(lab, "edit", {"op": "scale", "args": {"targets": "L1.mlp.down", "factor": 0.9}})
+    side = lab.repo.get_commit(lab.repo.resolve(_vcs(lab, "commit", message="L1").split()[1]))
+    assert side.parents == []  # it starts at base, not at work's tip
+    assert set(lab.repo.tree_of_oid(side.oid)["merged"]) == {down1}
+
+    _vcs(lab, "checkout", rev="work")
+    merged = _vcs(lab, "merge", name="side", strategies={"L1.mlp.down": "orthogonalize"})
+    assert merged.startswith("merged side as ")  # a real merge, not a fast-forward
+    assert "strategy for L1.mlp.down_proj not used: only side changed it" in merged
+    head = lab.repo.tree_of_oid(lab.repo.head(lab.session))
+    assert set(head["merged"]) == {down0, down1}  # the tip's L0 edit survives
+    assert lab.repo.head(lab.session) != tip.oid
+
+    # a branch named at a revision says where it starts
+    assert _vcs(lab, "branch", name="from-tip", rev=tip.oid).startswith(
+        f"branch from-tip at {tip.short} (switched)"
+    )
+    assert sorted(lab.tree.state.tensors()) == [down0]  # the weights are the tip's too
+    # checkout HEAD keeps the branch
+    _vcs(lab, "checkout", rev="HEAD")
+    assert lab.repo.current_branch(lab.session) == "from-tip"
+    call(lab, "edit", {"op": "scale", "args": {"targets": "L2.mlp.down", "factor": 0.9}})
+    refused = call(lab, "vcs", {"action": "branch", "name": "lost", "rev": "base"})
+    assert not refused.ok
+    assert "staged patch(es) would be lost" in refused.summary
+
+
+def test_what_haiku_tripped_on_at_dev14(lab) -> None:  # type: ignore[no-untyped-def]
+    """Seen live (Haiku on Inkling, dev14): an op given as a whole call got "unknown op"; a
+    quoted target was refused after two forward passes; every commit re-ran the check just
+    run; and the open model's trace showed merge's three canary runs as one, on one side's
+    weights."""
+    called = call(lab, "edit", {"op": "scale(targets='L0.mlp.down', factor=0.9)"})
+    assert not called.ok
+    assert "op is the name alone ('scale'); put its arguments in args" in called.summary
+
+    runs = []
+    original = lab._smoke
+    lab._smoke = lambda: runs.append(1) or original()  # type: ignore[method-assign]
+    call(lab, "edit", {"op": "scale", "args": {"targets": "L0.mlp.down", "factor": 0.9}})
+    assert call(lab, "check", {"level": "smoke"}).ok
+    _vcs(lab, "commit", message="L0")
+    assert len(runs) == 1  # commit reused the check
+    call(lab, "edit", {"op": "scale", "args": {"targets": "L1.mlp.down", "factor": 0.9}})
+    _vcs(lab, "commit", message="L1")
+    assert len(runs) == 2  # a new patch is checked anew
+
+    main = lab.repo.current_branch(lab.session)
+    _vcs(lab, "branch", name="other", rev="HEAD~1")
+    call(lab, "edit", {"op": "scale", "args": {"targets": "L2.mlp.down", "factor": 0.9}})
+    _vcs(lab, "commit", message="L2")
+    _vcs(lab, "checkout", rev=main)
+    lab.io.begin("vcs")
+    _vcs(lab, "merge", name="other")
+    records = lab.io.drain()["records"]
+    purposes = {r["purpose"]: r["weights"] for r in records}
+    assert set(purposes) == {"merge: the merged tree", "merge: other", "merge: this side"}
+    assert len(set(purposes.values())) == 3  # each on its own weights
+    assert purposes["merge: this side"].startswith("HEAD ")
+
+
+def test_a_quoted_target_is_its_token() -> None:
+    from wspx.lab.text import Text
+
+    class Tok:
+        def __call__(self, text: str, add_special_tokens: bool = False) -> dict[str, list[int]]:
+            return {"input_ids": [7] if text == " Paris" else [1] * len(text)}
+
+        def decode(self, ids: list[int]) -> str:
+            return "x"
+
+    text = Text(Tok())
+    assert text.token_id('" Paris"') == 7
+    assert text.token_id(" Paris") == 7
+    with pytest.raises(Exception, match="tokens"):
+        text.token_id('"ab"')
+
+
+def test_an_export_into_the_labs_copy_of_the_project_says_it_will_go(lab) -> None:  # type: ignore[no-untyped-def]
+    """Seen live: a cloud lab's bundle export "succeeded" into a copy deleted with the lab."""
+    call(lab, "edit", {"op": "scale", "args": {"targets": "L0.mlp.down", "factor": 0.9}})
+    _vcs(lab, "commit", message="L0")
+    assert "outlive" not in _tool_ok(lab, "export", kind="bundle", path="out/a.bundle")
+    lab.scratch = True
+    assert "will not outlive the lab" in _tool_ok(lab, "export", kind="bundle", path="out/b.bundle")
+
+
+def _tool_ok(lab, tool: str, **args: object) -> str:  # type: ignore[no-untyped-def]
+    result = call(lab, tool, args)
+    assert result.ok, result.summary
+    return result.summary

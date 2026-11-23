@@ -298,6 +298,19 @@ def expert_inputs(
             )
 
         handles.append(module.register_forward_pre_hook(count))
+    try:
+        with _eager_experts(model), mode:
+            yield result
+    finally:
+        for handle in handles:
+            handle.remove()
+        result.sums, result.counts = mode.sums, mode.counts
+
+
+@contextmanager
+def _eager_experts(model: torch.nn.Module) -> Iterator[None]:
+    """Run the model's own per-expert loop: fused experts kernels (grouped or batched
+    matmuls) never show one expert's slice. The kernel is restored after."""
     configs: dict[int, Any] = {}
     for m in model.modules():
         config = getattr(m, "config", None)
@@ -307,14 +320,183 @@ def expert_inputs(
     try:
         for c in configs.values():
             c._experts_implementation = "eager"
-        with mode:
-            yield result
+        yield
     finally:
         for k, c in configs.items():
             c._experts_implementation = saved[k]
+
+
+def expert_writers(ir: ModelIR) -> list[str]:
+    """3-D expert tensors that write the residual stream: each expert's matrix has a
+    width-long output and a narrower input (the down projection), as a 2-D writer does."""
+    hidden = ir.structure.get("hidden")
+    out = []
+    for role in ir.roles:
+        if role.kind != "expert" or role.expert is not None or role.split is not None:
+            continue
+        shape = ir.params[role.param].shape
+        if hidden is None or role.in_dim is None or role.out_dim is None or len(shape) != 3:
+            continue
+        if shape[role.out_dim] == hidden and shape[role.in_dim] != hidden:
+            out.append(role.param)
+    return list(dict.fromkeys(out))
+
+
+def _expert_readers(ir: ModelIR, module: str) -> list[str]:
+    """The expert tensors of a module that read the stream (gate/up): their inputs are the
+    routed tokens' states, so a row of them says which token a row is."""
+    hidden = ir.structure.get("hidden")
+    out = []
+    for role in ir.roles:
+        if role.kind != "expert" or role.expert is not None or role.in_dim is None:
+            continue
+        info = ir.params[role.param]
+        if info.module == module and info.shape[role.in_dim] == hidden:
+            out.append(role.param)
+    return list(dict.fromkeys(out))
+
+
+@dataclass
+class ExpertWrites:
+    calls: dict[str, list[dict[int, tuple[torch.Tensor, float]]]] = field(default_factory=dict)
+    """Writer expert tensor → one entry per call of its module: routed expert → (what it fed
+    its writer at the last token, the routing weight that scaled its output)."""
+
+
+class _ExpertWrites(TorchDispatchMode):  # type: ignore[no-untyped-call]
+    """At the last token, each routed expert's input to its writer (down) tensor. The rows of
+    an expert's matmul are its routed tokens, in an order the kernel chooses; the reader's
+    input rows are copies of those tokens' states, so the row equal to the last token's
+    state is the last token, and the writer's matmul that follows has it at the same row."""
+
+    def __init__(
+        self,
+        params: dict[str, torch.Tensor],
+        widths: dict[str, int],
+        module_of: dict[str, str],
+        writers: set[str],
+    ) -> None:
+        super().__init__()  # type: ignore[no-untyped-call]
+        self.by_storage = {p.untyped_storage().data_ptr(): (n, p) for n, p in params.items()}
+        self.widths = widths
+        self.module_of = module_of
+        self.writers = writers
+        self.last: dict[str, torch.Tensor] = {}
+        self.weights: dict[str, dict[int, float]] = {}
+        self.rows: dict[str, dict[int, int]] = {}
+        self.calls: dict[str, list[dict[int, tuple[torch.Tensor, float]]]] = {}
+
+    def start(self, module: str, args: tuple[Any, ...], hidden: int) -> None:
+        """The experts module is called: its input's last row is the last token's state."""
+        x = args[0] if args and isinstance(args[0], torch.Tensor) else None
+        self.rows[module] = {}
+        for name, owner in self.module_of.items():
+            if owner == module and name in self.writers:
+                self.calls.setdefault(name, []).append({})
+        if x is None or x.shape[-1] != hidden:
+            self.last.pop(module, None)
+            return
+        self.last[module] = x.detach().reshape(-1, hidden)[-1]
+        index, weight = (args[1], args[2]) if len(args) >= 3 else (None, None)
+        routed: dict[int, float] = {}
+        if (
+            isinstance(index, torch.Tensor)
+            and isinstance(weight, torch.Tensor)
+            and index.shape == weight.shape
+            and index.dim() >= 1
+        ):
+            last_index = index.reshape(-1, index.shape[-1])[-1].tolist()
+            last_weight = weight.reshape(-1, weight.shape[-1])[-1].float().tolist()
+            routed = {int(e): float(w) for e, w in zip(last_index, last_weight, strict=True)}
+        self.weights[module] = routed
+
+    def __torch_dispatch__(
+        self,
+        func: Any,
+        types: Any,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        out = func(*args, **(kwargs or {}))
+        if str(func) not in _MATMULS:
+            return out
+        tensors = [a for a in args if isinstance(a, torch.Tensor)]
+        for w in tensors:
+            found = self.by_storage.get(w.untyped_storage().data_ptr()) if w.dim() == 2 else None
+            if found is None:
+                continue
+            name, param = found
+            if w.numel() != param[0].numel():
+                return out
+            expert = int((w.storage_offset() - param.storage_offset()) // param.stride(0))
+            module = self.module_of[name]
+            last = self.last.get(module)
+            width = self.widths[name]
+            x = next(
+                (
+                    a
+                    for a in tensors
+                    if a is not w
+                    and a.dim() >= 2
+                    and a.shape[-1] == width
+                    and a.untyped_storage().data_ptr() != w.untyped_storage().data_ptr()
+                ),
+                None,
+            )
+            if x is None or last is None or not 0 <= expert < param.shape[0]:
+                return out
+            rows = x.detach().reshape(-1, width)
+            if name in self.writers:
+                row = self.rows.get(module, {}).get(expert)
+                if row is not None and row < rows.shape[0] and self.calls.get(name):
+                    weight = self.weights.get(module, {}).get(expert, 1.0)
+                    self.calls[name][-1][expert] = (rows[row].float(), weight)
+            else:
+                hit = (rows == last.to(rows.dtype)).all(-1).nonzero()
+                if hit.numel():
+                    self.rows.setdefault(module, {})[expert] = int(hit[-1])
+            return out
+        return out
+
+
+@contextmanager
+def expert_writes(model: torch.nn.Module, ir: ModelIR) -> Iterator[ExpertWrites]:
+    """Record, on every call of each experts module, what each expert routed at the last
+    token fed its writer tensor, and its routing weight (``ExpertWrites``). Empty when the
+    model has no expert writers or its experts kernel shows no per-expert slices."""
+    result = ExpertWrites()
+    writers = expert_writers(ir)
+    if not writers:
+        yield result
+        return
+    hidden = int(ir.structure["hidden"])
+    named = dict(model.named_parameters())
+    module_of: dict[str, str] = {}
+    widths: dict[str, int] = {}
+    for name in writers:
+        module = ir.params[name].module
+        for param in [name, *_expert_readers(ir, module)]:
+            role = ir.primary_role(param)
+            assert role is not None
+            assert role.in_dim is not None
+            module_of[param] = module
+            widths[param] = ir.params[param].shape[role.in_dim]
+    mode = _ExpertWrites({n: named[n] for n in module_of}, widths, module_of, set(writers))
+    result.calls = mode.calls  # live: what has run so far is readable inside the block
+    handles = []
+    for module in dict.fromkeys(module_of.values()):
+
+        def start(_m: torch.nn.Module, args: tuple[Any, ...], key: str = module) -> None:
+            mode.start(key, args, hidden)
+
+        handles.append(model.get_submodule(module).register_forward_pre_hook(start))
+    try:
+        with _eager_experts(model), mode:
+            yield result
+    finally:
         for handle in handles:
             handle.remove()
-        result.sums, result.counts = mode.sums, mode.counts
+        result.calls = {k: v for k, v in mode.calls.items() if any(v)}
 
 
 class _Recorder(TorchDispatchMode):  # type: ignore[no-untyped-call]

@@ -100,6 +100,11 @@ class Text:
         if self.tokenizer is None:
             raise WspxError(f"{token!r}: no tokenizer; use a token id")
         ids = self.tokenizer(token, add_special_tokens=False)["input_ids"]
+        if len(ids) != 1 and len(token) > 2 and token[0] == token[-1] == '"':
+            # Seen live: target='" Paris"', quoted as arch and grep write tokens (embed[" Wait"])
+            inner = self.tokenizer(token[1:-1], add_special_tokens=False)["input_ids"]
+            if len(inner) == 1:
+                return int(inner[0])
         if len(ids) != 1:
             pieces = [self.decode([i]) for i in ids]
             raise WspxError(f"{token!r} is {len(ids)} tokens {pieces}; use one token or a token id")

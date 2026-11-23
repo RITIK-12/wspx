@@ -291,7 +291,7 @@ def numeric_check(ir: ModelIR, tree: WorkingTree, plan: EditPlan, cfg: CheckSect
             add(
                 diag(
                     Code.REL_NORM,
-                    f"relative norm change {rel:.3f} > {cfg.max_rel_norm}",
+                    f"relative norm change {_beyond(rel, cfg.max_rel_norm)} > {cfg.max_rel_norm}",
                     target=target,
                     fixes=[
                         Fix(
@@ -521,3 +521,12 @@ def smoke_report(metrics: SmokeMetrics, cfg: CheckSection) -> Report:
             )
         )
     return report
+
+
+def _beyond(value: float, limit: float) -> str:
+    """``value`` with enough decimals to show it is past ``limit``. Seen live: a 0.95 scale
+    in bfloat16 changed the norm by 0.0502 and printed "0.050 > 0.05"."""
+    digits = 3
+    while round(value, digits) <= limit and digits < 8:
+        digits += 1
+    return f"{value:.{digits}f}"

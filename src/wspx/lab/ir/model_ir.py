@@ -95,7 +95,7 @@ HandleLookup = Callable[[Handle, str], list[int]]
 """(handle, parameter) → unit indices along the tensor dim being narrowed."""
 
 
-IR_VERSION = 6
+IR_VERSION = 7
 """6: the passes each looped tensor runs on, and which sublayers add back to the stream.
 5: each layer type's sublayer blocks in run order (the UI's layer diagram). 4: roles at
 every key without a layer stack, the ``gate`` kind, and per-tensor facts from a
@@ -620,7 +620,11 @@ class ModelIR:
             lines.append("before the stack: " + ", ".join(named(p) for p in before[:8]))
         after = [p for p in st.get("final", []) if p not in st.get("final_norm_params", [])]
         tail = [named(p) for p in after[:6]]
-        if st.get("final_norm"):
+        norm = [p for p in st.get("final_norm_params", []) if p in self.params]
+        if norm:  # by its address, like embed and unembed
+            sizes = ", ".join(f"{p}, {'×'.join(map(str, self.params[p].shape))}" for p in norm[:2])
+            tail.append(f"final_norm ({sizes})")
+        elif st.get("final_norm"):
             tail.append(f"final norm {st['final_norm']}")
         if st.get("tied"):
             tail.append("unembed (tied: the same tensor as embed)")
