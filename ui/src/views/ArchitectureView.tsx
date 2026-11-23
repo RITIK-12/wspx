@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type Dispatch, type KeyboardEvent, type ReactNode, type SetStateAction } from "react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
 import { api, toolCall, type Session } from "../api";
 
 // The compiled map as a block diagram, drawn like the classic transformer figure: boxes joined
@@ -51,37 +51,40 @@ export function ArchitectureView({ session }: { session: Session }) {
     <div className="archx">
       <Summary arch={arch} onFind={pick} index={index} />
       <div className="archx-grid">
-        <section className="archx-diagram">
-          <div className="archx-tools">
-            <span className="muted small">Click a box to open its weights{arch.stack ? " · pick a layer on the strip, or ↑ ↓" : ""}</span>
-            <span className="spacer" />
-            {layerBoxes.length > 0 && (
-              <button onClick={() => setOpen((o) => new Set([...o, ...layerBoxes]))}>Open this layer</button>
-            )}
-            <button onClick={() => setOpen(new Set())} disabled={open.size === 0}>
-              Close all
-            </button>
-          </div>
-          <Diagram arch={arch} index={index} layer={layer} onLayer={setLayer} open={open} onToggle={toggle} tensor={tensor} onTensor={pick} />
-          {extra.length > 0 && (
-            <div className="archx-extra">
-              <div className="muted small">Outside the stack, not on the path above</div>
-              {extra.map((o: any) => (
-                <div key={o.path} className="small">
-                  <code>{o.path}</code> <span className="muted">· {o.tensors.length} weight{o.tensors.length === 1 ? "" : "s"} · {human(o.numel)}</span>
-                  <div className="archx-chips">
-                    {o.tensors.slice(0, 12).map((n: string) => (
-                      <button key={n} className={`wchip ${n === tensor ? "active" : ""}`} onClick={() => pick(n)} title={n}>
-                        {arch.tensors[n].key} <span className="muted">{arch.tensors[n].shape.join("×")}</span>
-                      </button>
-                    ))}
-                    {o.tensors.length > 12 && <span className="muted small">+{o.tensors.length - 12} more · use Find</span>}
-                  </div>
-                </div>
-              ))}
+        <div className="archx-main">
+          {arch.stack && <LayerDock arch={arch} index={index} layer={layer} onLayer={setLayer} />}
+          <section className="archx-diagram">
+            <div className="archx-tools">
+              <span className="muted small">Click a box to open its weights{arch.stack ? " · pick a layer from the tabs on the left" : ""}</span>
+              <span className="spacer" />
+              {layerBoxes.length > 0 && (
+                <button onClick={() => setOpen((o) => new Set([...o, ...layerBoxes]))}>Open this layer</button>
+              )}
+              <button onClick={() => setOpen(new Set())} disabled={open.size === 0}>
+                Close all
+              </button>
             </div>
-          )}
-        </section>
+            <Diagram arch={arch} index={index} layer={layer} open={open} onToggle={toggle} tensor={tensor} onTensor={pick} />
+            {extra.length > 0 && (
+              <div className="archx-extra">
+                <div className="muted small">Outside the stack, not on the path above</div>
+                {extra.map((o: any) => (
+                  <div key={o.path} className="small">
+                    <code>{o.path}</code> <span className="muted">· {o.tensors.length} weight{o.tensors.length === 1 ? "" : "s"} · {human(o.numel)}</span>
+                    <div className="archx-chips">
+                      {o.tensors.slice(0, 12).map((n: string) => (
+                        <button key={n} className={`wchip ${n === tensor ? "active" : ""}`} onClick={() => pick(n)} title={n}>
+                          {arch.tensors[n].key} <span className="muted">{arch.tensors[n].shape.join("×")}</span>
+                        </button>
+                      ))}
+                      {o.tensors.length > 12 && <span className="muted small">+{o.tensors.length - 12} more · use Find</span>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
+        </div>
         <aside className="archx-weights">
           <WeightPanel arch={arch} session={session} param={tensor} />
         </aside>
@@ -158,6 +161,75 @@ function human(n: number): string {
 
 function numel(shape: number[]): number {
   return shape.reduce((a, b) => a * b, 1);
+}
+
+// --------------------------------------------------------------------------- layer tabs
+
+/** Every layer as a tab, coloured by its type, docked beside the diagram and centred in view;
+ * layers that run more than once are bracketed together. */
+function LayerDock({ arch, index, layer, onLayer }: { arch: Arch; index: Index; layer: number; onLayer: (l: number) => void }) {
+  const stack = arch.stack;
+  const size: number = stack.size;
+  const tabs = useRef<(HTMLButtonElement | null)[]>([]);
+  const box = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    // Keep the open tab in view inside the dock, without scrolling the page.
+    const el = tabs.current[layer];
+    const b = box.current;
+    if (!el || !b) return;
+    if (el.offsetTop < b.scrollTop) b.scrollTop = el.offsetTop - 8;
+    else if (el.offsetTop + el.offsetHeight > b.scrollTop + b.clientHeight) b.scrollTop = el.offsetTop + el.offsetHeight - b.clientHeight + 8;
+  }, [layer]);
+  const go = (l: number) => {
+    const next = Math.max(0, Math.min(size - 1, l));
+    onLayer(next);
+    tabs.current[next]?.focus();
+  };
+  const keys = (e: KeyboardEvent) => {
+    const to: Record<string, number> = { ArrowUp: layer - 1, ArrowDown: layer + 1, PageUp: layer - 5, PageDown: layer + 5, Home: 0, End: size - 1 };
+    if (e.key in to) {
+      e.preventDefault();
+      go(to[e.key]);
+    }
+  };
+  return (
+    <nav className="archx-dock" aria-label="Layers">
+      <div className="dock-box" ref={box}>
+        <div className="dock-list" role="tablist" aria-orientation="vertical" onKeyDown={keys}>
+          <div className="dock-head">{size} layers</div>
+          {stack.segments.map(([a, b, times]: number[]) => (
+            <div
+              key={a}
+              className={`dock-seg${times > 1 ? " looped" : ""}`}
+              title={times > 1 ? `L${a}-L${b} run ${times} times per forward pass, with the same weights` : undefined}
+            >
+              {times > 1 && <div className="dock-loop">↻ ×{times}</div>}
+              {Array.from({ length: b - a + 1 }, (_, k) => a + k).map((l) => {
+                const v = index.variantOf[l] ?? 0;
+                return (
+                  <button
+                    key={l}
+                    ref={(el) => {
+                      tabs.current[l] = el;
+                    }}
+                    role="tab"
+                    aria-selected={l === layer}
+                    tabIndex={l === layer ? 0 : -1}
+                    className={`dock-tab${l === layer ? " on" : ""}`}
+                    style={{ ["--v" as any]: VARIANT_COLORS[v % VARIANT_COLORS.length] }}
+                    onClick={() => onLayer(l)}
+                    title={`L${l} · ${stack.variants[v].class}${stack.variants.length > 1 ? ` (type ${letter(v)})` : ""}${times > 1 ? ` · runs ×${times}` : ""}`}
+                  >
+                    L{l}
+                  </button>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      </div>
+    </nav>
+  );
 }
 
 // --------------------------------------------------------------------------- summary
@@ -308,13 +380,12 @@ function Diagram(props: {
   arch: Arch;
   index: Index;
   layer: number;
-  onLayer: Dispatch<SetStateAction<number>>;
   open: Set<string>;
   onToggle: (id: string) => void;
   tensor: string | null;
   onTensor: (p: string) => void;
 }) {
-  const { arch, index, layer, onLayer, open, onToggle, tensor, onTensor } = props;
+  const { arch, index, layer, open, onToggle, tensor, onTensor } = props;
   const ref = useRef<SVGSVGElement>(null);
   useEffect(() => {
     ref.current?.querySelector(".bd-chip.on")?.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -325,17 +396,15 @@ function Diagram(props: {
   const vision = arch.others
     .filter((o: any) => o.vision_only)
     .sort((a: any, b: any) => Number(!!b.stack) - Number(!!a.stack) || b.numel - a.numel);
-  const loops: number[][] = stack ? stack.segments.filter((g: number[]) => g[2] > 1) : [];
   const hidden = arch.hidden;
 
-  // Columns: [vision | N×] [frame: lane, boxes, layer strip, loops] [position embedding]
+  // Columns: [vision | N×] [frame: lane, boxes] [position embedding]
   const leftZone = Math.max(vision.length ? SIDE_W + 40 : 12, stack ? 76 : 12);
   const frameX = leftZone;
   const laneX = frameX + 18;
   const colX = laneX + LANE;
   const cx = colX + BW / 2;
-  const stripX = colX + BW + 18;
-  const frameR = stripX + 26 + (loops.length ? 44 : 14);
+  const frameR = colX + BW + 18;
   const posW = 160;
   const posX = colX + BW + 36;
 
@@ -602,10 +671,8 @@ function Diagram(props: {
       }
     }
 
-    // The layer strip: every layer, coloured by type, the one drawn here marked; loops beside it.
     const size = stack.size;
-    const cell = Math.max(7, Math.min(16, (iy - by) / size));
-    const bottom = Math.max(iy + 16, by + cell * size + 14);
+    const bottom = iy + 16;
     wire(cx, iy, cx, bottom);
     frames.push(<rect key="frame" className="bd-frame" x={frameX} y={top} width={frameR - frameX} height={bottom - top} rx={14} />);
     const headRoom = Math.floor((cx - 14 - frameX - 14) / 6.2);
@@ -621,84 +688,6 @@ function Diagram(props: {
     const mid = (top + bottom) / 2;
     text(frameX - 12, mid + 2, `${size}×`, "bd-n", "end");
     text(frameX - 12, mid + 20, stack.variants.length > 1 ? `${stack.variants.length} types` : "layers", "bd-note", "end");
-
-    const step = (d: number) => onLayer((l) => Math.max(0, Math.min(size - 1, l + d)));
-    const keys = (e: KeyboardEvent) => {
-      const moves: Record<string, () => void> = {
-        ArrowUp: () => step(-1),
-        ArrowLeft: () => step(-1),
-        ArrowDown: () => step(1),
-        ArrowRight: () => step(1),
-        PageUp: () => step(-5),
-        PageDown: () => step(5),
-        Home: () => onLayer(0),
-        End: () => onLayer(size - 1),
-      };
-      if (moves[e.key]) {
-        e.preventDefault();
-        moves[e.key]();
-      }
-    };
-    const gap = cell >= 9 ? 2 : 1;
-    nodes.push(
-      <g
-        key="strip"
-        className="bd-strip"
-        role="slider"
-        tabIndex={0}
-        aria-label="Layer"
-        aria-orientation="vertical"
-        aria-valuemin={0}
-        aria-valuemax={size - 1}
-        aria-valuenow={layer}
-        aria-valuetext={`L${layer}`}
-        onKeyDown={keys}
-      >
-        <text className="bd-note" x={stripX + 13} y={by - 8} textAnchor="middle">
-          layers
-        </text>
-        {Array.from({ length: size }, (_, l) => {
-          const v = index.variantOf[l] ?? 0;
-          const r = stack.runs[l] ?? 1;
-          return (
-            <rect
-              key={l}
-              className={`bd-cell${l === layer ? " on" : ""}`}
-              x={stripX}
-              y={by + l * cell}
-              width={26}
-              height={cell - gap}
-              rx={Math.min(3, cell / 3)}
-              style={{ ["--v" as any]: VARIANT_COLORS[v % VARIANT_COLORS.length] }}
-              onClick={() => onLayer(l)}
-            >
-              <title>{`L${l} · ${stack.variants[v].class}${stack.variants.length > 1 ? ` (type ${letter(v)})` : ""}${r > 1 ? ` · runs ×${r}` : ""}`}</title>
-            </rect>
-          );
-        })}
-        {cell >= 12 &&
-          Array.from({ length: size }, (_, l) => (
-            <text key={`t${l}`} className={`bd-cell-label${l === layer ? " on" : ""}`} x={stripX + 13} y={by + l * cell + cell / 2 + 2.5} textAnchor="middle">
-              {l}
-            </text>
-          ))}
-        <path className="bd-pointer" d={`M ${stripX - 3} ${by + layer * cell + (cell - gap) / 2} l -7 -5 v 10 z`} />
-        {loops.map(([a, b, times]) => {
-          const x = stripX + 32;
-          const y0 = by + a * cell + 1;
-          const y1 = by + (b + 1) * cell - gap - 1;
-          return (
-            <g key={`loop${a}`}>
-              <path className="bd-loop" d={`M ${x} ${y1} h 6 V ${y0} h -6`} markerEnd="url(#bd-arrow-skip)" />
-              <text className="bd-loop-label" x={x + 10} y={(y0 + y1) / 2 + 4}>
-                ↻{times}
-              </text>
-              <title>{`L${a}-L${b} run ${times} times per forward pass, with the same weights`}</title>
-            </g>
-          );
-        })}
-      </g>,
-    );
     y = bottom;
   } else {
     const ends = new Set([...embedParams, ...arch.pos_embed, ...arch.final, ...arch.final_norm_params, arch.unembed]);
