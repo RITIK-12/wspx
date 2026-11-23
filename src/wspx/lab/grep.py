@@ -722,6 +722,19 @@ class GrepResult:
     thresholds: list[str] = field(default_factory=list)
     """What each σ threshold came to: scores are raw values, compared against these."""
 
+    @property
+    def units(self) -> str:
+        """What the candidates are, plural. On the tensor axis each expert of a 3-D expert
+        tensor is ranked on its own, so a model of 1091 tensors had "7,187 tensors"."""
+        if self.axis == "tensor" and any(h.expert is not None for h in self.scores):
+            return "tensors and experts"
+        return f"{self.axis}s"
+
+    @property
+    def tensors(self) -> int:
+        """Distinct tensors among the candidates."""
+        return len({h.param for h in self.scores})
+
 
 def grep(
     env: Environment,

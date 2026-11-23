@@ -464,7 +464,7 @@ def test_probes_see_every_pass_of_a_loop(inkling: Any, tmp_path: Any) -> None:
     lab.edit.scale("L8.self_attn.o_proj.linear[:, 3]", factor=0.5)
     diff = lab.trace(prompt, vs="base")
     assert diff.data["first_divergence"] == "L8@1"
-    assert "L5:0.000" in diff.summary
+    assert "L5:0 " in diff.summary  # exactly unchanged before the edit
     assert "L8@3:" in diff.summary
 
     one = lab.activations([prompt], scope="L9@2.self_attn.o_proj.linear", top=3)
@@ -484,3 +484,90 @@ def test_probes_see_every_pass_of_a_loop(inkling: Any, tmp_path: Any) -> None:
         lab.contrast([prompt], [[7, 7, 7, 1, 2]], name="far", layer=30)
     with pytest.raises(WspxError, match="pass 4 does not exist"):
         lab.contrast([prompt], [[7, 7, 7, 1, 2]], name="far", layer="L9@4")
+
+
+def test_what_a_driver_found_on_inkling_at_dev13(
+    inkling: Any, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Seen live on Inkling-2-Mini (Fable, dev13): arch said the loop's message gates run 3×
+    (they run on passes 2 and 3 only); activations called a gate's first call "pass 1" and
+    could not rank expert tensors; the last logit-lens row was read as the model's prediction;
+    grep counted 7,187 "tensors" in a model of 1091; sliding layers' query vectors were
+    "vector" and full layers' "reader"; arch's long config line pushed out what followed."""
+    import re
+
+    from wspx.lab import analysis
+    from wspx.lab.sdk import open_lab
+
+    (tmp_path / "work").mkdir()
+    lab = open_lab(inkling, store=tmp_path / "store", workdir=tmp_path / "work")
+    ir = lab.ir
+    prompt = [3, 9, 27, 81, 5]
+    layer = "model.language_model.layers.9."
+
+    gate = f"{layer}q_message_gate.down_proj.weight"
+    assert ir.passes_of(gate) == [2, 3]
+    assert (ir.runs_of(gate), ir.layer_runs_of(gate)) == (2, 3)
+    assert ir.passes_of(f"{layer}self_attn.q_proj.linear.weight") == [1, 2, 3]
+    assert len(ir.structure["passes"]) == 144  # 12 gate tensors in each of L6-17
+    assert "runs 2×" in lab.arch("L9.q_message_gate.down_proj").summary
+    bare = lab.arch().summary
+    assert "144 tensors run on pass(es) 2, 3 only" in bare
+    assert bare.splitlines()[-1].startswith("config: ")  # last, and capped
+    assert len(bare.splitlines()[-1]) <= 1500
+
+    first = lab.activations([prompt], scope="L9@1.q_message_gate.down_proj", top=3)
+    assert first.result.hits == []
+    assert "runs on pass(es) 2, 3 of its layer; no pass 1" in " ".join(first.result.skipped)
+    assert lab.activations([prompt], scope="L9@2.q_message_gate.down_proj", top=3).result.hits
+
+    experts = lab.activations([prompt], scope="L9.mlp.experts.down_proj", top=5)
+    best = experts.result.hits[0]
+    assert re.fullmatch(r"L9\.mlp\.experts\.down_proj\[\d, :, \d+\]", best.address)
+    assert best.expert is not None
+    assert "routed to it" in experts.result.expression
+
+    monkeypatch.setattr(analysis, "LENS_KL", 0.0)
+    traced = lab.trace(prompt, top=2)
+    assert any(line.startswith("output ") for line in traced.summary.splitlines())
+    assert "is not the model's prediction" in traced.summary
+    assert "final_input.query act there" in traced.summary
+
+    ranked = lab.grep("norm > 0", scope="L9.mlp.experts.*", axis="tensor", top=3)
+    assert "16 tensors and experts" in ranked.summary  # 2 tensors × 8 experts
+    assert "2 tensors in the scope; each expert" in ranked.summary
+    assert "16 ranked, top 3 shown" in lab.handles.table()
+
+    assert ir.primary_role(f"{layer}attention_input.query").kind == "reader"
+    assert ir.primary_role("model.language_model.final_input.query").kind == "reader"
+    assert ir.primary_role("model.language_model.layers.5.attention_input.query").kind == "reader"
+
+
+def test_expert_inputs_are_what_each_expert_was_routed(inkling: Any) -> None:
+    """activations' per-expert inputs, against the experts module's own input and routing."""
+    from wspx.lab.probe import expert_inputs
+
+    model = inkling.eval()
+    ir = build_ir(model)
+    up = "model.language_model.layers.9.mlp.experts.gate_up_proj"
+    module = model.get_submodule(ir.params[up].module)
+    calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+    hook = module.register_forward_pre_hook(
+        lambda _m, args: calls.append((args[0].detach().clone(), args[1].detach().clone()))
+    )
+    try:
+        with torch.no_grad(), expert_inputs(model, ir, [up], only=2) as got:
+            model(input_ids=torch.tensor([[3, 9, 27, 81, 5, 7]]))
+    finally:
+        hook.remove()
+    hidden, routed = calls[1]  # pass 2 of L9
+    n = ir.params[up].shape[0]
+    want = torch.zeros(n, hidden.shape[-1])
+    count = torch.zeros(n)
+    for token, experts in zip(hidden.reshape(-1, hidden.shape[-1]), routed, strict=True):
+        for e in experts.tolist():
+            if e < n:
+                want[e] += token.abs().float()
+                count[e] += 1
+    assert torch.equal(got.counts[up].cpu(), count)
+    assert torch.allclose(got.sums[up].cpu(), want, atol=1e-4)

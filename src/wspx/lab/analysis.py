@@ -51,8 +51,15 @@ def show(
         out["map"] = magnitude_map(view, grid)
     role = target.role or ir.primary_role(target.param)
     if view.dim() == 1 and text is not None and role is not None and "norm" not in role.kind:
-        tokens = _vocab_of_vector(ir, params, view.float(), role.kind, final_scale)
-        if tokens:
+        tokens, vocab = _vocab_of_vector(ir, params, view.float(), role.kind, final_scale)
+        floor = chance_cos(vocab, view.numel())
+        if tokens and tokens[0][1] < floor:
+            # Seen live: final_input.query "read" tokens at noise-level cosines.
+            out["vocab_note"] = (
+                f"no token stands out: the best cosine, {tokens[0][1]:.2f}, is what a random "
+                f"direction reaches over {vocab:,} tokens (about {floor:.2f})"
+            )
+        elif tokens:
             out["vocab"] = [(text.show(t), s) for t, s in tokens]
             out["vocab_label"] = (
                 "nearest embeddings (cos)"
@@ -87,6 +94,8 @@ def render_show(info: dict[str, Any]) -> str:
     if info.get("vocab"):
         label = info.get("vocab_label", "tokens")
         lines.append(f"  {label}: " + ", ".join(f"{t} {v:.2f}" for t, v in info["vocab"][:8]))
+    elif info.get("vocab_note"):
+        lines.append(f"  tokens: {info['vocab_note']}")
     if "values" in info:
         lines.append(
             f"  values ({len(info['values'])} of {info['values_total']}): {info['values']}"
@@ -126,11 +135,12 @@ def _vocab_of_vector(
     kind: str,
     final_scale: torch.Tensor | None,
     k: int = 8,
-) -> list[tuple[int, float]]:
+) -> tuple[list[tuple[int, float]], int]:
+    """The tokens nearest a vector, by cosine, and how many tokens it was compared with."""
     writes = kind in ("writer", "stem", "expert")  # embeddings: compared with the embedding table
     name = ir.semantics.unembed if writes else ir.semantics.embed
     if name is None:
-        return []
+        return [], 0
     table = params[name].detach().float()
     role = next(
         (r for r in ir.roles_of(name) if r.kind == ("unembed" if writes else "embed")), None
@@ -138,12 +148,21 @@ def _vocab_of_vector(
     if role is not None and role.kind == "unembed" and role.out_dim == 1:
         table = table.T
     if table.shape[1] != vec.numel():
-        return []
+        return [], 0
     if writes and final_scale is not None and final_scale.numel() == vec.numel():
         vec = vec * final_scale.to(vec.device)
     cos = (table @ vec) / (table.norm(dim=1) * vec.norm()).clamp_min(1e-30)
     top = torch.topk(cos, k=min(k, cos.numel()))
-    return [(int(i), float(v)) for i, v in zip(top.indices, top.values, strict=True)]
+    tokens = [(int(i), float(v)) for i, v in zip(top.indices, top.values, strict=True)]
+    return tokens, int(table.shape[0])
+
+
+def chance_cos(vocab: int, width: int) -> float:
+    """The best cosine a random direction of ``width`` reaches over ``vocab`` tokens, about
+    sqrt(2 ln V / d): a nearest-token list below it says nothing about the vector."""
+    if vocab < 2 or width < 1:
+        return 0.0
+    return math.sqrt(2 * math.log(vocab) / width)
 
 
 # --------------------------------------------------------------------------- forward helpers
@@ -439,14 +458,30 @@ def _norm_and_unembed(model: torch.nn.Module, ir: ModelIR) -> tuple[Any, Any]:
     weight = dict(model.named_parameters())[head_name]
     role = next(r for r in ir.roles if r.address == "unembed")
 
+    config = getattr(model, "config", None)
+    text_config = (
+        config.get_text_config()
+        if config is not None and hasattr(config, "get_text_config")
+        else config
+    )
+    softcap = getattr(text_config, "final_logit_softcapping", None)
+
     def unembed(h: torch.Tensor) -> torch.Tensor:
         if head is not None and isinstance(head, torch.nn.Linear) and head.weight is weight:
             projected: torch.Tensor = head(h)
-            return projected
-        w = weight if role.out_dim == 0 else weight.T
-        return h @ w.T.to(h.dtype)
+        else:
+            w = weight if role.out_dim == 0 else weight.T
+            projected = h @ w.T.to(h.dtype)
+        if softcap:  # the model caps its own logits so; the lens does what it does
+            projected = torch.tanh(projected / softcap) * softcap
+        return projected
 
     return norm, unembed
+
+
+LENS_KL = 0.05
+"""Above this KL (nats) between the model's output and the last lens row, the trace says the
+lens is not the model's prediction."""
 
 
 def forward_trace(
@@ -491,6 +526,13 @@ def forward_trace(
         final = torch.softmax(logits[0].float(), dim=-1)
         entropy = (-(final * final.clamp_min(1e-30).log()).sum(-1)).tolist()
         out_ids = final.argmax(-1).tolist()
+        output = torch.topk(final[-1], k=top)
+        lens_kl = None
+        if labels:
+            last = cap.points[calls[[lab for lab, _ in calls].index(labels[-1])][1]]
+            lens = torch.log_softmax(unembed(norm(last[:, -1:])).float()[0, -1], dim=-1)
+            real = final[-1].clamp_min(1e-30)
+            lens_kl = float((real * (real.log() - lens)).sum())
     writers = _top_writers(model, ir, cap.unit_calls, tuple(ids.shape), top=top)
     looped = [label for label in labels if "@" in label]
     lines = [
@@ -502,7 +544,11 @@ def forward_trace(
         ),
         "lens = the final norm and the unembedding applied to each layer call's output",
         "call    |h|      logit lens @ last token"
-        + ("  ·  experts routed @ last token" if any(e is not None for e in experts) else ""),
+        + (
+            "  ·  experts routed @ last token, by router score"
+            if any(e is not None for e in experts)
+            else ""
+        ),
     ]
     for i, label in enumerate(labels):
         toks = ", ".join(
@@ -511,6 +557,22 @@ def forward_trace(
         routed_to = experts[i]
         routed = f"  ·  {' '.join(map(str, routed_to))}" if routed_to is not None else ""
         lines.append(f"{label:<7s} {resid_norm[i]:<8.3g} {toks}{routed}")
+    shown = ", ".join(
+        f"{text.show(t)} {p:.2f}"
+        for t, p in zip(output.indices.tolist(), output.values.tolist(), strict=True)
+    )
+    lines.append(f"{'output':<7s} {'':<8s} {shown}   (the model's own prediction)")
+    if lens_kl is not None and lens_kl > LENS_KL:
+        # Seen on Inkling: the L23 lens said ' Paris' 1.00; the model's entropy there was 3.95.
+        normed = set(ir.structure.get("final_norm_params", []))
+        after = [ir.key_of(p) for p in ir.structure.get("final", []) if p not in normed]
+        lines.append(
+            f"the lens at {labels[-1]} is not the model's prediction (KL {lens_kl:.2f}): the model "
+            "changes the stream after its last layer"
+            + (f" ({', '.join(after[:4])} act there)" if after else "")
+            + ", so each lens row is what the final norm and unembedding make of that call's "
+            "output alone"
+        )
     lines.append(
         "predicted next token at the last 3 positions (H = entropy): "
         + " ".join(
@@ -529,10 +591,15 @@ def forward_trace(
         "lens_p": lens_p,
         "entropy": entropy,
         "output_ids": out_ids,
+        "output_top": output.indices.tolist(),
+        "output_p": output.values.tolist(),
         "input_ids": ids[0].tolist(),
     }
     return Trace(
-        "forward", "\n".join(lines), arrays, {"calls": labels, "writers": writers, "routes": routes}
+        "forward",
+        "\n".join(lines),
+        arrays,
+        {"calls": labels, "writers": writers, "routes": routes, "lens_kl": lens_kl},
     )
 
 
@@ -543,13 +610,31 @@ def _route_point(probe: Probe, resid_point: str) -> str | None:
 
 
 def _last_token_experts(route: Any) -> list[int] | None:
-    """The experts a router's ``topk`` picked for the last token (its indices output)."""
+    """The experts a router's ``topk`` picked for the last token, highest score first. A
+    ``topk(sorted=False)`` returns them in no meaningful order (seen live: seven ascending,
+    then one out of place), so they are put in the order of the scores it returned."""
     outs = route if isinstance(route, list | tuple) else [route]
     indices = next((o for o in reversed(outs) if not o.is_floating_point()), None)
     if indices is None or indices.dim() == 0:
         return None
-    rows = indices.reshape(-1, indices.shape[-1]) if indices.dim() > 1 else indices.reshape(1, -1)
-    return [int(e) for e in rows[-1].tolist()]
+    width = indices.shape[-1]
+    rows = indices.reshape(-1, width) if indices.dim() > 1 else indices.reshape(1, -1)
+    picked = [int(e) for e in rows[-1].tolist()]
+    scores = next((o for o in outs if o.is_floating_point() and o.shape == indices.shape), None)
+    if scores is None:
+        return sorted(picked)
+    values = (scores.reshape(-1, width) if scores.dim() > 1 else scores.reshape(1, -1))[-1]
+    order = sorted(range(len(picked)), key=lambda i: -float(values[i]))
+    return [picked[i] for i in order]
+
+
+DIVERGED = 1e-5
+"""Relative change above float noise: a layer call that moved this much has diverged."""
+
+
+def _change(d: float) -> str:
+    """A relative change, small ones kept visible: 0, 8e-04, 0.012."""
+    return "0" if d == 0 else f"{d:.0e}" if d < 1e-3 else f"{d:.3f}"
 
 
 def _top_writers(
@@ -573,7 +658,7 @@ def _top_writers(
         norms = _unit_norms(params[param], role.in_dim)
         for k, acts in enumerate(calls, start=1):
             a = acts[0, position].float()
-            scored.extend(_unit_scores(role, a * norms, top, pass_suffix(len(calls), k)))
+            scored.extend(_unit_scores(role, a * norms, top, pass_suffix(ir, param, len(calls), k)))
     scored.sort(key=lambda x: -abs(x[1]))
     return scored[: top * 4]
 
@@ -636,12 +721,20 @@ def diff_trace(
         norms = _unit_norms(params[param], role.in_dim)
         for k, (x, y) in enumerate(zip(mine, theirs, strict=True), start=1):
             delta = (x[0, -1] - y[0, -1]).float()
-            moved.extend(_unit_scores(role, delta * norms, top, pass_suffix(len(mine), k)))
+            moved.extend(
+                _unit_scores(role, delta * norms, top, pass_suffix(ir, param, len(mine), k))
+            )
     moved.sort(key=lambda x: -abs(x[1]))
-    first = next((i for i, d in enumerate(divergence) if d > 1e-3), None)
+    # Seen live: 0.0012 and 0.0008 both printed 0.001, and only one counted as diverging.
+    first = next((i for i, d in enumerate(divergence) if d > DIVERGED), None)
     lines = ["diff trace · relative residual change at the last token, per layer call"]
-    lines.append(" ".join(f"{label}:{d:.3f}" for label, d in zip(labels, divergence, strict=True)))
-    lines.append(f"first divergence: {labels[first] if first is not None else 'none'}")
+    lines.append(
+        " ".join(f"{label}:{_change(d)}" for label, d in zip(labels, divergence, strict=True))
+    )
+    lines.append(
+        f"first divergence: {labels[first] if first is not None else 'none'}"
+        f" (the first call whose change is above {DIVERGED:g})"
+    )
     lines.append(
         f"output tokens changed at {len(changed)} of {len(out_a)} positions"
         + (
@@ -711,7 +804,8 @@ def attribution_trace(
             (grad,) = token_calls([acts.grad], shape)
             score = (a_f[0, -1].float() - ref_acts[0, -1].float()) * grad[0, -1].float()
             # rank over a wide pool; a pass of a looped layer is tagged @k
-            scored.extend(_unit_scores(role, score, max(top, 10), pass_suffix(len(kept), k)))
+            tag = pass_suffix(ir, param, len(kept), k)
+            scored.extend(_unit_scores(role, score, max(top, 10), tag))
     scored.sort(key=lambda x: -abs(x[1]))
     logp_ref = float(torch.log_softmax(ref_logits[0, -1].float(), dim=-1)[tid])
     lines = [

@@ -201,6 +201,33 @@ class TestIndexAndShow:
         assert info["vocab"]
         assert "norm" in analysis.render_show(info)
 
+    def test_show_says_when_no_token_stands_out(
+        self,
+        llama: tuple,  # type: ignore[type-arg]
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Seen live: final_input.query "read" tokens at cosines any random vector reaches.
+        model, ir = llama
+        target = ir.resolve("L1.mlp.down[:, 3]")[0]
+        monkeypatch.setattr(analysis, "chance_cos", lambda vocab, width: 2.0)
+        info = analysis.show(ir, dict(model.named_parameters()), target, text=Text(None))
+        assert "vocab" not in info
+        assert "no token stands out" in analysis.render_show(info)
+
+    def test_chance_cos_is_what_random_directions_reach(self) -> None:
+        assert analysis.chance_cos(200058, 2304) == pytest.approx(0.1029, abs=1e-3)
+        torch.manual_seed(0)
+        table, v = torch.randn(5000, 256), torch.randn(256)
+        best = float(((table @ v) / (table.norm(dim=1) * v.norm())).max())
+        assert abs(best - analysis.chance_cos(5000, 256)) < 0.06
+
+    def test_routed_experts_come_by_router_score(self) -> None:
+        # Seen live: seven experts ascending, then an eighth out of place (topk unsorted).
+        scores = torch.tensor([[[0.1, 0.9, 0.5]]])
+        picked = torch.tensor([[[4, 2, 7]]])
+        assert analysis._last_token_experts([scores, picked]) == [2, 7, 4]
+        assert analysis._last_token_experts([picked]) == [2, 4, 7]
+
 
 class TestProbesAndTraces:
     def test_points_match_block_outputs(self, llama: tuple) -> None:  # type: ignore[type-arg]

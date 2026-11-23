@@ -222,6 +222,17 @@ class TestSuites:
         assert "cached" not in other.test("canary").summary
         assert "cached" in lab.test("canary").summary
 
+    def test_diff_and_trace_say_what_their_numbers_are(self, lab: Lab) -> None:
+        # Seen live: 2,654,188 of 2,654,208 "elements" for a whole expert; 0.0012 and 0.0008
+        # both printed 0.001, and only one of them counted as the first divergence.
+        lab.edit.scale("L1.mlp.down[:, 0:4]", factor=0.5)
+        assert "elements = values that changed" in lab.diff("HEAD").summary
+        traced = lab.trace([1, 9, 2, 10], vs="base")
+        assert "(the first call whose change is above 1e-05)" in traced.summary
+        assert "L0:0 " in traced.summary
+        hits = lab.grep("writes(5) > 0", scope="L*.mlp.down", top=3)
+        assert "cos with one token: a random direction gives about ±" in hits.summary
+
     def test_diff_shows_current_suites_and_never_held_out_ones(self, lab: Lab) -> None:
         """Seen live: vcs diff listed another project's held-out suite to the driver, and three
         versions of one suite with different scores."""

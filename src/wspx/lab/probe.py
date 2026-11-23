@@ -162,9 +162,27 @@ def token_calls(calls: list[torch.Tensor], tokens: tuple[int, ...]) -> list[torc
     return out
 
 
-def pass_suffix(calls: int, k: int) -> str:
-    """`` @k`` for the k-th (1-based) of several calls of a module, else nothing."""
-    return f" @{k}" if calls > 1 else ""
+def pass_of_call(ir: ModelIR, param: str, k: int, calls: int) -> int:
+    """The pass of its layer (1-based) that the k-th call of a tensor's module ran in. A loop
+    gate called from the second pass on runs in passes 2 and 3, so its first call is pass 2."""
+    passes = ir.passes_of(param)
+    return passes[k - 1] if len(passes) == calls and k <= len(passes) else k
+
+
+def call_of_pass(ir: ModelIR, param: str, k: int, calls: int) -> int | None:
+    """Which call (0-based) of a tensor's module ran in pass ``k`` of its layer, if any."""
+    passes = ir.passes_of(param)
+    if len(passes) == calls:
+        return passes.index(k) if k in passes else None
+    return k - 1 if 1 <= k <= calls else None
+
+
+def pass_suffix(ir: ModelIR, param: str, calls: int, k: int) -> str:
+    """`` @p`` for the k-th call of a tensor's module in a looped layer, ``p`` being the pass
+    of the layer it ran in (the numbering trace uses), else nothing."""
+    if calls > 1 or ir.layer_runs_of(param) > 1:
+        return f" @{pass_of_call(ir, param, k, calls)}"
+    return ""
 
 
 def _first_tensor(value: Any) -> torch.Tensor | None:
@@ -177,6 +195,126 @@ def _first_tensor(value: Any) -> torch.Tensor | None:
                 return found
     hidden = getattr(value, "last_hidden_state", None)
     return hidden if isinstance(hidden, torch.Tensor) else None
+
+
+_MATMULS = frozenset(
+    {"aten.mm.default", "aten.addmm.default", "aten.linear.default", "aten.matmul.default"}
+)
+
+
+class _ExpertInputs(TorchDispatchMode):  # type: ignore[no-untyped-call]
+    """Each expert's input to a 3-D expert tensor, seen where an op multiplies by one
+    expert's slice (``F.linear(x, w[e])``): the slice is a view of the parameter, and its
+    offset in the parameter's storage says which expert it is."""
+
+    def __init__(self, params: dict[str, torch.Tensor], widths: dict[str, int]) -> None:
+        super().__init__()  # type: ignore[no-untyped-call]
+        self.by_storage = {p.untyped_storage().data_ptr(): (n, p) for n, p in params.items()}
+        self.widths = widths
+        self.wanted: dict[str, bool] = dict.fromkeys(params, True)
+        self.sums: dict[str, torch.Tensor] = {}
+        self.counts: dict[str, torch.Tensor] = {}
+
+    def __torch_dispatch__(
+        self,
+        func: Any,
+        types: Any,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        out = func(*args, **(kwargs or {}))
+        if str(func) not in _MATMULS:
+            return out
+        tensors = [a for a in args if isinstance(a, torch.Tensor)]
+        for w in tensors:
+            found = self.by_storage.get(w.untyped_storage().data_ptr()) if w.dim() == 2 else None
+            if found is None:
+                continue
+            name, param = found
+            if w.numel() != param[0].numel() or not self.wanted[name]:
+                return out
+            expert = (w.storage_offset() - param.storage_offset()) // param.stride(0)
+            width = self.widths[name]
+            x = next(
+                (
+                    a
+                    for a in tensors
+                    if a is not w
+                    and a.dim() >= 2
+                    and a.shape[-1] == width
+                    and a.untyped_storage().data_ptr() != w.untyped_storage().data_ptr()
+                ),
+                None,
+            )
+            if x is None or not 0 <= expert < param.shape[0]:
+                return out
+            rows = x.detach().reshape(-1, width)
+            if name not in self.sums:
+                self.sums[name] = torch.zeros(param.shape[0], width, device=rows.device)
+                self.counts[name] = torch.zeros(param.shape[0], device=rows.device)
+            self.sums[name][expert] += rows.abs().float().sum(0)
+            self.counts[name][expert] += rows.shape[0]
+            return out
+        return out
+
+
+@dataclass
+class ExpertInputs:
+    sums: dict[str, torch.Tensor] = field(default_factory=dict)
+    """Expert tensor → ``[experts, input features]`` sum of |input| over routed tokens."""
+    counts: dict[str, torch.Tensor] = field(default_factory=dict)
+    """Expert tensor → tokens routed to each expert."""
+    calls: dict[str, int] = field(default_factory=dict)
+    """Expert tensor → how many times its module ran."""
+
+
+@contextmanager
+def expert_inputs(
+    model: torch.nn.Module, ir: ModelIR, params: list[str], *, only: int | None = None
+) -> Iterator[ExpertInputs]:
+    """Record what each expert of these 3-D expert tensors read, over the tokens routed to
+    it. Fused experts kernels (grouped or batched matmuls) never show one expert's slice,
+    so the model's own per-expert loop runs while recording, and the kernel is restored
+    after. ``only`` keeps one pass of a looped layer."""
+    named = dict(model.named_parameters())
+    widths = {}
+    for name in params:
+        role = ir.primary_role(name)
+        assert role is not None
+        assert role.in_dim is not None
+        widths[name] = ir.params[name].shape[role.in_dim]
+    mode = _ExpertInputs({n: named[n] for n in params}, widths)
+    result = ExpertInputs()
+    handles = []
+    for name in params:
+        module = model.get_submodule(ir.params[name].module)
+
+        def count(_m: torch.nn.Module, _args: Any, key: str = name) -> None:
+            k = result.calls.get(key, 0)
+            result.calls[key] = k + 1
+            passes = ir.passes_of(key)
+            mode.wanted[key] = only is None or (
+                passes[k] == only if k < len(passes) else k + 1 == only
+            )
+
+        handles.append(module.register_forward_pre_hook(count))
+    configs: dict[int, Any] = {}
+    for m in model.modules():
+        config = getattr(m, "config", None)
+        if hasattr(config, "_experts_implementation"):
+            configs[id(config)] = config
+    saved = {k: c._experts_implementation for k, c in configs.items()}
+    try:
+        for c in configs.values():
+            c._experts_implementation = "eager"
+        with mode:
+            yield result
+    finally:
+        for k, c in configs.items():
+            c._experts_implementation = saved[k]
+        for handle in handles:
+            handle.remove()
+        result.sums, result.counts = mode.sums, mode.counts
 
 
 class _Recorder(TorchDispatchMode):  # type: ignore[no-untyped-call]

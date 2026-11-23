@@ -75,6 +75,8 @@ MAX_TOP = 200
 BUDGET_CHARS = 6000
 RUN_TAIL_LINES = 200
 RUN_TAIL_BYTES = 16 * 1024
+EXPERT_UNITS_KEPT = 4096
+"""activations keeps this many of an expert tensor's best (expert, feature) units."""
 
 
 @dataclass
@@ -315,7 +317,7 @@ class Lab:
         head = self.repo.head(self.session)
         branch = self.repo.current_branch(self.session) or "(detached)"
         lines = [
-            self.ir.render_info(),
+            self.ir.render_info(config=False),
             f"branch {branch} · HEAD {short(head) if head else '(base)'} · "
             f"{len(self.staged)} staged patch(es)",
         ]
@@ -333,6 +335,8 @@ class Lab:
                 )
         if self.heldout_queries:
             lines.append(f"held-out queries so far: {self.heldout_queries}")
+        if self.ir.render_config():
+            lines.append(self.ir.render_config())  # last: it is the one part that can run long
         if handles:
             lines.append("handles:\n" + self.handles.table(limit=200))
         return ToolResult(
@@ -428,12 +432,18 @@ class Lab:
             ),
             name=name,
             description=(
-                f"{result.candidates} {result.axis}s ranked by {result.expression}"
+                f"{result.candidates} {result.units} ranked by {result.expression}"
                 if len(result.hits) == result.candidates
-                else f"{len(result.hits)} of {result.candidates} {result.axis}s matching "
+                else f"{len(result.hits)} of {result.candidates} {result.units} matching "
                 f"{result.expression}"
             ),
-            size=f"{min(len(result.hits), top)} hits",
+            # Seen live: "5 hits" for a ranking of 147,456 columns. Say what matched, and
+            # how many of them the caller was shown.
+            size=(
+                f"{len(result.hits):,} "
+                + ("ranked" if len(result.hits) == result.candidates else "matched")
+                + (f", top {top} shown" if len(result.hits) > top else "")
+            ),
             call_id=self.context.get("call_id"),
         )
         rel = f"results/{self.session}/{entry.key[1:]}.parquet"
@@ -454,7 +464,7 @@ class Lab:
         model width (what each neuron writes). A layer that runs more than once is averaged
         over every pass, unless the scope names one: ``L6@2.self_attn.o_proj.linear``.
         """
-        from wspx.lab.probe import token_calls, writer_units
+        from wspx.lab.probe import call_of_pass, expert_inputs, token_calls, writer_units
 
         shown = scope
         only: int | None = None
@@ -471,37 +481,54 @@ class Lab:
             else writer_units(self.ir)
         )
         units: list[str] = []
+        experts: list[str] = []
         skipped: list[str] = []
         for param in params:
             role = self.ir.primary_role(param)
-            if (
-                len(self.ir.params[param].shape) == 2
-                and role is not None
-                and role.in_dim is not None
-            ):
+            rank = len(self.ir.params[param].shape)
+            if rank == 2 and role is not None and role.in_dim is not None:
                 units.append(param)
+            elif rank == 3 and role is not None and role.experts and role.in_dim is not None:
+                experts.append(param)  # seen live: Inkling's experts were out of reach
             else:
-                why = (
-                    f"{role.experts} experts in one tensor"
-                    if role is not None and role.experts
-                    else "not a 2-D matrix that an op contracts"
-                )
-                skipped.append(f"{self.ir.key_of(param)} ({why})")
-        if not units:
+                skipped.append(f"{self.ir.key_of(param)} (not a matrix that an op contracts)")
+        if not units and not experts:
             raise GrepError(
-                "activations ranks the input features of 2-D matrices; the scope has none"
+                "activations ranks the input features of 2-D matrices, and of each expert in "
+                "3-D expert tensors; the scope has none"
                 + (f" (skipped: {', '.join(skipped[:5])})" if skipped else "")
             )
         started = time.perf_counter()
-        size = analysis.MEDIA_BATCH if any(is_media(p) for p in prompts) else 16
+        # An expert sees only the tokens routed to it, padding included: one prompt at a time.
+        size = 1 if experts else analysis.MEDIA_BATCH if any(is_media(p) for p in prompts) else 16
+        expert_sums: dict[str, torch.Tensor] = {}
+        expert_counts: dict[str, torch.Tensor] = {}
+        expert_ran: dict[str, int] = {}
         totals: dict[str, torch.Tensor] = {}
         counts: dict[str, float] = {}
         ran: dict[str, int] = {}
         for start in range(0, len(prompts), size):
             batch = self.text.batch(prompts[start : start + size], self.device)
             ids, mask = batch
-            with torch.no_grad(), self.probe.capture([], units=units) as cap:
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(torch.no_grad())
+                cap = stack.enter_context(self.probe.capture([], units=units))
+                seen = (
+                    stack.enter_context(expert_inputs(self.model, self.ir, experts, only=only))
+                    if experts
+                    else None
+                )
                 analysis.forward(self.model, self.ir, ids, mask, batch.extra)
+            if seen is not None:
+                for name in experts:
+                    expert_ran[name] = max(expert_ran.get(name, 0), seen.calls.get(name, 0))
+                    if name in seen.sums:
+                        if name in expert_sums:
+                            expert_sums[name] = expert_sums[name] + seen.sums[name]
+                            expert_counts[name] = expert_counts[name] + seen.counts[name]
+                        else:
+                            expert_sums[name] = seen.sums[name]
+                            expert_counts[name] = seen.counts[name]
             m = mask.unsqueeze(-1).float()
             for param in units:
                 calls = token_calls(cap.unit_calls.get(param, []), tuple(ids.shape))
@@ -509,9 +536,10 @@ class Lab:
                     continue  # the module did not run on these prompts' tokens
                 ran[param] = max(ran.get(param, 0), len(calls))
                 if only is not None:
-                    if len(calls) < only:
+                    at = call_of_pass(self.ir, param, only, len(calls))
+                    if at is None:
                         continue
-                    calls = [calls[only - 1]]
+                    calls = [calls[at]]
                 part = sum((c.float().abs() * m).sum((0, 1)) for c in calls)
                 assert isinstance(part, torch.Tensor)
                 totals[param] = totals[param] + part if param in totals else part
@@ -524,8 +552,9 @@ class Lab:
             width = self.ir.params[param].shape[role.in_dim]
             key = self.ir.key_of(param)
             if param not in totals:
+                runs_on = ", ".join(str(p) for p in self.ir.passes_of(param))
                 skipped.append(
-                    f"{key} (runs {ran[param]} time(s) per forward pass; no pass {only})"
+                    f"{key} (runs on pass(es) {runs_on} of its layer; no pass {only})"
                     if param in ran
                     else f"{key} (did not run on these prompts)"
                 )
@@ -539,19 +568,46 @@ class Lab:
                 Hit(f"{key}[:, {j}]" if cols else f"{key}[{j}]", param, None, j, s)
                 for j, s in enumerate(mean)
             )
+        candidates = len(scores)
+        for name in experts:
+            role = self.ir.primary_role(name)
+            assert role is not None
+            key = self.ir.key_of(name)
+            count = expert_counts.get(name)
+            if count is None or not bool((count > 0).any()):
+                runs_on = ", ".join(str(p) for p in self.ir.passes_of(name))
+                skipped.append(
+                    f"{key} (did not run on these prompts)"
+                    if not expert_ran.get(name)
+                    else f"{key} (runs on pass(es) {runs_on} of its layer; no pass {only})"
+                    if only is not None
+                    else f"{key} (no expert's input was seen: the experts kernel is fused)"
+                )
+                continue
+            routed = count > 0
+            per_unit = expert_sums[name] / count.clamp_min(1)[:, None]
+            width = int(per_unit.shape[1])
+            candidates += int(routed.sum()) * width
+            flat = per_unit.masked_fill(~routed[:, None], float("-inf")).flatten()
+            best = torch.topk(flat, min(EXPERT_UNITS_KEPT, int(routed.sum()) * width))
+            for value, at in zip(best.values.tolist(), best.indices.tolist(), strict=True):
+                e, j = divmod(at, width)
+                where = f"{e}, :, {j}" if role.in_dim == 2 else f"{e}, {j}"
+                scores.append(Hit(f"{key}[{where}]", name, e, j, value))
         scores.sort(key=lambda h: -h.score)
         passes = (
             f", pass {only}"
             if only is not None
             else ", averaged over every pass"
-            if any(n > 1 for n in ran.values())
+            if any(n > 1 for n in [*ran.values(), *expert_ran.values()])
             else ""
         )
+        routed_note = "; an expert's over the tokens routed to it" if experts else ""
         return GrepResult(
-            f"mean |activation| on {len(prompts)} prompt(s){passes}",
+            f"mean |activation| on {len(prompts)} prompt(s){passes}{routed_note}",
             shown or "writers",
             "col",
-            len(scores),
+            candidates,
             scores,
             scores,
             seconds=time.perf_counter() - started,
@@ -1284,6 +1340,12 @@ class Lab:
             lines.append(
                 f"  patched but no net change: {', '.join(_display(self.ir, n) for n in cancelled)}"
             )
+        if rows:
+            # Seen live: scaling a whole expert showed 2,654,188 of its 2,654,208 elements.
+            lines.append(
+                "  elements = values that changed; an edit can leave some of its target as it "
+                "was (a zero stays zero under scale)"
+            )
         behaviour = self._behaviour_diff(sa, sb)
         lines.extend(behaviour)
         return ToolResult(
@@ -1782,25 +1844,40 @@ class GrepHits:
     def summary(self) -> str:
         lines = []
         index = self.lab.index
+        ir = self.lab.ir
+        width = int(ir.structure.get("hidden") or 0)
+        unembed = ir.semantics.unembed
+        vocab = int(ir.params[unembed].shape[0]) if unembed in ir.params else 0
+        floor = analysis.chance_cos(vocab, width)
         for h in self.hits:
             tokens = ""
             if index is not None:
                 tops = index.unit_tokens(h.param, h.unit, h.expert)[:4]
-                if tops:
+                if tops and tops[0][1] >= floor:  # below it, the list is noise
                     tokens = "  writes: " + ", ".join(self.lab.text.show(t) for t, _ in tops)
             lines.append(f"{h.address:<32} {h.score:+.4f}{tokens}")
         r = self.result
         if len(r.hits) == r.candidates:  # no threshold (a ranking): every unit "matches"
-            head = f"top {len(self.hits)} of {r.candidates:,} {r.axis}s ranked by {r.expression}"
+            head = f"top {len(self.hits)} of {r.candidates:,} {r.units} ranked by {r.expression}"
         else:
-            head = f"{len(r.hits):,} of {r.candidates:,} {r.axis}s matched" + (
+            head = f"{len(r.hits):,} of {r.candidates:,} {r.units} matched" + (
                 f", showing the top {len(self.hits)} (raise --top or narrow)"
                 if len(r.hits) > len(self.hits)
                 else ""
             )
         tail = f"{head} · {r.seconds * 1000:.0f} ms · saved as {self.handle}"
+        if r.units == "tensors and experts":
+            tail += (
+                f"\n{r.tensors:,} tensors in the scope; each expert of an expert tensor is "
+                "ranked on its own"
+            )
         if r.thresholds:  # scores are raw values; say what they were compared against
             tail += "\nthreshold " + "; ".join(r.thresholds)
+        if width and any(f in r.expression for f in ("writes(", "reads(", "cos(")):
+            tail += (
+                f"\ncos with one token: a random direction gives about ±{1 / math.sqrt(width):.3f}"
+                f" (1σ) at width {width}"
+            )
         if r.skipped:
             tail += (
                 f"\nskipped {len(r.skipped)} tensor(s) with no {r.axis} units: "
