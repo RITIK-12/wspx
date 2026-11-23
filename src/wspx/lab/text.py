@@ -13,6 +13,7 @@ import torch
 
 from wspx.errors import WspxError
 from wspx.lab.media import Batch, Media, is_media
+from wspx.lab.model_io import ModelIO
 
 Prompt = str | Sequence[int] | Mapping[str, Any]
 
@@ -34,6 +35,8 @@ class Text:
             pad = getattr(tokenizer, "eos_token_id", None)
         self.pad_id = pad if pad is not None else pad_id
         self.eos_id = getattr(tokenizer, "eos_token_id", None) if tokenizer is not None else None
+        self.io: ModelIO | None = None
+        """The open model's trace recorder, set by the lab."""
 
     def unrestricted(self) -> Text:
         """The same encoder with media access to the whole project (for suites)."""
@@ -44,7 +47,7 @@ class Text:
 
     def ids(self, prompt: Prompt) -> list[int]:
         if is_media(prompt):
-            return [int(t) for t in self.batch([prompt]).ids[0].tolist()]
+            return [int(t) for t in self._batch([prompt]).ids[0].tolist()]
         if isinstance(prompt, str):
             if self.tokenizer is None:
                 raise WspxError("this model has no tokenizer; pass prompts as lists of token ids")
@@ -55,7 +58,14 @@ class Text:
         """Left-padded ids and attention mask, so every row ends at its last real token.
 
         Unpacks as ``ids, mask``; image and video prompts also carry pixel inputs in ``extra``.
+        Each row is recorded in the open model's trace while a tool call runs.
         """
+        batch = self._batch(prompts, device)
+        if self.io is not None:
+            batch.records = self.io.prompts(prompts, batch.ids, batch.mask)
+        return batch
+
+    def _batch(self, prompts: Sequence[Prompt], device: torch.device | str = "cpu") -> Batch:
         if any(is_media(p) for p in prompts):
             if self.media is None:
                 raise WspxError(

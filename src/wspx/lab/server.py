@@ -166,7 +166,11 @@ class LabServer:
                 with self._lock:
                     self.lab.context = dict(body.get("context") or {})
                     self.lab.context["call_id"] = body.get("call_id")
-                    result = call(self.lab, name, body.get("args") or {})
+                    self.lab.io.begin(name)
+                    try:
+                        result = call(self.lab, name, body.get("args") or {})
+                    finally:
+                        model_io = self.lab.io.drain()
                     self.calls += 1
                     return {
                         "summary": result.budgeted(),
@@ -176,6 +180,8 @@ class LabServer:
                         "journal": self.journal(),
                         "workspace": self.workspace(),
                         "fingerprint": self.lab.ir.fingerprint,
+                        # the open model's trace: for the user only, never the driver
+                        "model_io": model_io,
                     }
 
             return _JSON(await run_in_threadpool(run))

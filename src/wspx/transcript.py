@@ -1,7 +1,10 @@
-"""A session's record as files: the full trace, a readable transcript and the session itself.
+"""A session's record as files: two traces, each raw and readable, and the session itself.
 
-Works on the document the control plane serves at ``/api/sessions/{sid}/export``
-(``format: wspx-session/1``), so it runs on any machine with the CLI, no lab needed.
+The leader trace is the driver model's: what it was given, its turns with reasoning, the
+tools it called and the results it got. The open model trace is the open-weight model's:
+every prompt it was given, as it saw it, and what it wrote back. Works on the document the
+control plane serves at ``/api/sessions/{sid}/export`` (``format: wspx-session/1``), so it
+runs on any machine with the CLI, no lab needed.
 """
 
 from __future__ import annotations
@@ -14,22 +17,29 @@ from typing import Any
 FORMAT = "wspx-session/1"
 
 
+FILES = ("leader.jsonl", "leader.md", "open-model.jsonl", "open-model.md", "session.json")
+
+
 def write(export: dict[str, Any], out: Path) -> Path:
-    """Write ``trace.jsonl``, ``transcript.md`` and ``session.json`` into ``out/<session id>``."""
+    """Write both traces (``.jsonl`` and ``.md``) and ``session.json`` into ``out/<session id>``."""
     sid = str(export["session"]["id"])
     folder = Path(out) / sid
     folder.mkdir(parents=True, exist_ok=True)
-    with (folder / "trace.jsonl").open("w") as f:
-        for event in export["events"]:
-            f.write(json.dumps(event, default=str) + "\n")
-    (folder / "transcript.md").write_text(render(export))
+    leader = [e for e in export["events"] if e["kind"] != "model_io"]
+    model = [e for e in export["events"] if e["kind"] == "model_io"]
+    for name, events in (("leader", leader), ("open-model", model)):
+        with (folder / f"{name}.jsonl").open("w") as f:
+            for event in events:
+                f.write(json.dumps(event, default=str) + "\n")
+    (folder / "leader.md").write_text(render(export))
+    (folder / "open-model.md").write_text(render_open_model(export))
     meta = {k: v for k, v in export.items() if k != "events"}
     (folder / "session.json").write_text(json.dumps(meta, indent=2, default=str) + "\n")
     return folder
 
 
 def render(export: dict[str, Any]) -> str:
-    """The whole session as Markdown, in the order it happened."""
+    """The leader's trace as Markdown, in the order it happened."""
     s = export["session"]
     lines = [
         f"# Session {s['id']}",
@@ -44,11 +54,73 @@ def render(export: dict[str, Any]) -> str:
         "",
     ]
     lines += _spend(export.get("usage"))
-    lines += ["## Trace", ""]
+    lines += ["## Leader trace", ""]
     for event in export["events"]:
-        lines += _event(event)
+        if event["kind"] != "model_io":
+            lines += _event(event)
     lines += _commits(export.get("commits"))
     return "\n".join(lines).rstrip() + "\n"
+
+
+def render_open_model(export: dict[str, Any]) -> str:
+    """The open model's trace as Markdown: each tool call's prompts and generations."""
+    s = export["session"]
+    events = [e for e in export["events"] if e["kind"] == "model_io"]
+    records = [r for e in events for r in e["payload"].get("records") or []]
+    made = [r for r in records if r.get("kind") == "generate"]
+    lines = [
+        f"# Open model trace · session {s['id']}",
+        "",
+        f"- **Model:** {s['model']} · {s.get('dtype', '')}",
+        f"- **Exchanges:** {len(made)} generation(s), {len(records) - len(made)} forward pass(es)"
+        + (
+            f", {sum(e['payload'].get('omitted', 0) for e in events)} more not kept"
+            if events
+            else ""
+        ),
+        f"- **Tokens:** prompts {sum(r.get('prompt_tokens', 0) for r in records):,} → output "
+        f"{sum(r.get('output_tokens') or 0 for r in made):,}",
+        "",
+    ]
+    if not events:
+        return "\n".join([*lines, "The open model was not prompted in this session.", ""])
+    for e in events:
+        p = e["payload"]
+        turn = f" · turn {p['turn']}" if p.get("turn") is not None else ""
+        lines += [f"## `{p.get('tool')}`{turn} · {p.get('call_id')} · {_clock(e.get('ts'))}", ""]
+        for i, r in enumerate(p.get("records") or [], 1):
+            lines += _exchange(i, r)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _exchange(i: int, r: dict[str, Any]) -> list[str]:
+    what = "generation" if r.get("kind") == "generate" else "forward pass"
+    head = f"### {i}. {what} · {r.get('purpose')} · weights {r.get('weights')} · "
+    head += f"{r.get('prompt_tokens')} prompt tokens"
+    if r.get("kind") == "generate":
+        head += f" → {r.get('output_tokens')} · stop {r.get('stop')}"
+    if r.get("split"):
+        head += f" · {r['split']} (shown to the user only)"
+    out = [head, "", "Prompt as the model saw it:", "", _fence(r.get("prompt", "")), ""]
+    if r.get("reasoning"):
+        out += ["**Reasoning**", "", _quote(r["reasoning"]), ""]
+    for call in r.get("tool_calls") or []:
+        args = call.get("arguments", call.get("raw"))
+        out.append(f"- calls `{call.get('name') or 'tool'}` `{json.dumps(args)}`")
+    if r.get("tool_calls"):
+        out.append("")
+    if r.get("kind") == "generate":
+        out += ["**Answer**", "", r.get("answer") or "(no answer text)", ""]
+        if r.get("output") != r.get("answer"):
+            out += [
+                "<details><summary>Raw output</summary>",
+                "",
+                _fence(r.get("output", "")),
+                "",
+                "</details>",
+                "",
+            ]
+    return out
 
 
 def _event(e: dict[str, Any]) -> list[str]:

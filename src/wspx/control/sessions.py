@@ -403,6 +403,9 @@ class SessionManager:
             if note:
                 note = note.format(time.time() - started)
         latency = time.time() - started
+        # The open model's exchanges are the user's record only: they include held-out and
+        # blind suite items, so they never go back to the caller.
+        model_io = result.pop("model_io", None)
         if source == "driver" and record.max_lab_s is not None:
             left = max(0.0, record.max_lab_s - record.lab_used(time.time()))
             note = (note + " · " if note else "") + (
@@ -414,6 +417,13 @@ class SessionManager:
         self.trace.tool_call(
             sid, call_id, name, args, result, turn=turn, latency=latency, source=source
         )
+        if model_io and (model_io.get("records") or model_io.get("omitted")):
+            self.trace.event(
+                sid,
+                "model_io",
+                {"call_id": call_id, "tool": name, "turn": turn, **model_io},
+                source="open_model",
+            )
         return result
 
     def _store_served(

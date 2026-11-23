@@ -44,10 +44,15 @@ wspx open                   # watch the session in the browser
 project has its own current session, which the commands below act on; pass
 `--session` to pick another.
 
-A session's trace records everything from its start: the driver's prompt, each
-turn's reasoning, text and token counts, and every tool call with its full
-result. `wspx sessions export` writes it as `trace.jsonl`, `transcript.md` and
-`session.json`; the UI's Traces tab shows the same record.
+A session keeps two traces from its start. The leader trace is the driver
+model's: its prompt, each turn's reasoning, text and token counts, and every
+tool call with its full result. The open model trace is the open-weight
+model's: every prompt it was given, as it saw it after the chat template, and
+what it wrote back, split into reasoning, tool calls and answer, with the
+weights it ran on. Held-out and blind suite items appear there too, so it is
+shown to you only, never to the driver. `wspx sessions export` writes
+`leader.jsonl`, `leader.md`, `open-model.jsonl`, `open-model.md` and
+`session.json`; the UI's Traces tab shows both, one tab each.
 
 ## Commands
 

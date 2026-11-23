@@ -40,6 +40,8 @@ class Batch:
     ids: torch.Tensor
     mask: torch.Tensor
     extra: dict[str, torch.Tensor] = field(default_factory=dict)
+    records: list[Any] = field(default_factory=list)
+    """The open model's trace records of these rows (see :mod:`wspx.lab.model_io`)."""
 
     def __iter__(self) -> Any:
         # text-only callers unpack ``ids, mask = text.batch(...)``

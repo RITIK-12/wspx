@@ -367,7 +367,7 @@ def sessions_export(
         "wspx-sessions"
     ),
 ) -> None:
-    """Write a session's full record: trace.jsonl, transcript.md and session.json."""
+    """Write a session's two traces, leader and open model (.jsonl and .md), and session.json."""
     from wspx import transcript
 
     try:
@@ -375,7 +375,7 @@ def sessions_export(
     except WspxError as exc:
         _fail(exc)
         return
-    typer.echo(f"wrote {folder}/ (trace.jsonl, transcript.md, session.json)")
+    typer.echo(f"wrote {folder}/ ({', '.join(transcript.FILES)})")
 
 
 @app.command("open")

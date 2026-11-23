@@ -486,3 +486,30 @@ def test_lab_failures_are_results_not_crashes() -> None:
     gone = httpx.Client(base_url="http://lab", transport=httpx.MockTransport(refuse))
     with pytest.raises(LabUnavailable):
         _post_tool(gone, "edit", {}, "c_1", {})
+
+
+def test_the_open_model_trace_is_kept_for_the_user_only(tmp_path: Path) -> None:
+    """What the open model was given and wrote is the user's record (held-out items
+    included): it is stored as its own trace and never returned to the caller."""
+    client, manager = make(tmp_path)
+    with client:
+        sid = client.post("/api/sessions", json={"model": "tiny"}, headers=USER).json()["id"]
+        wait(lambda: sid in manager.labs)
+        for source in ("driver", "mcp"):
+            out = manager.tool(
+                sid, "generate", {"prompt": [1, 2, 3], "max_tokens": 3}, source=source
+            )
+            assert out["ok"], out["summary"]
+            assert "model_io" not in out
+            assert "model_io" not in json.dumps(out)
+        manager.tool(sid, "arch", {}, source="driver")  # no prompt to the model: no record
+        events = client.get(f"/api/sessions/{sid}/export", headers=USER).json()["events"]
+        traced = [e for e in events if e["kind"] == "model_io"]
+        assert [e["source"] for e in traced] == ["open_model", "open_model"]
+        assert [e["payload"]["tool"] for e in traced] == ["generate", "generate"]
+        (record,) = traced[0]["payload"]["records"]
+        assert (record["kind"], record["prompt"], record["output_tokens"]) == (
+            "generate",
+            "token ids [1, 2, 3]",
+            3,
+        )

@@ -57,6 +57,7 @@ from wspx.lab.grep import Environment, GrepResult, Hit, grep
 from wspx.lab.index import ModelIndex, build_index
 from wspx.lab.ir.model_ir import ModelIR, Target
 from wspx.lab.media import Media, canary_inputs, is_media
+from wspx.lab.model_io import ModelIO
 from wspx.lab.ops import OpContext
 from wspx.lab.patch import TensorDelta, materialize
 from wspx.lab.probe import Probe
@@ -126,6 +127,9 @@ class Lab:
                 forbidden=tuple(self.workdir / p for p in self.config.tests.paths),
             )
         self.text = Text(tokenizer, vocab_size=ir.vocab_size, media=media)
+        self.io = ModelIO(_decoder(tokenizer), self._weights_label)
+        """The open model's trace: what it was given and what it said, per tool call."""
+        self.text.io = self.io
         self.tree = WorkingTree(
             model, ir, load_delta=self._load_delta, base_reader=base_reader, cache_bytes=cache_bytes
         )
@@ -908,9 +912,15 @@ class Lab:
         gen = torch.Generator().manual_seed(1234)
         vocab = self.ir.vocab_size or 2
         ids = torch.randint(0, vocab, (8, 16), generator=gen).to(self.device)
-        return ids, torch.ones_like(ids)
+        mask = torch.ones_like(ids)
+        self.io.prompts([None] * ids.shape[0], ids, mask)  # no tokenizer: not through Text
+        return ids, mask
 
     def _smoke(self) -> SmokeMetrics:
+        with self.io.using("check canary"):
+            return self._smoke_metrics()
+
+    def _smoke_metrics(self) -> SmokeMetrics:
         ids, mask = self._canary()
         if self._base_canary is None:
             with torch.no_grad(), self.at_base():
@@ -963,7 +973,19 @@ class Lab:
         extra = {k: v for k, v in inputs.items() if k not in ("input_ids", "attention_mask")}
         ids = inputs["input_ids"]
         mask = inputs.get("attention_mask", torch.ones_like(ids))
+        self.io.prompts([None] * ids.shape[0], ids, mask)  # rendered by the processor, not Text
         return analysis.forward(self.model, self.ir, ids, mask, extra)
+
+    def _weights_label(self) -> str:
+        """Which weights the open model is running on, for its trace."""
+        state = self.tree.state
+        if not state.tensors():
+            return "base"
+        key = self.tree_key(state)
+        head = self.repo.head(self.session)
+        if head and key == self.tree_key(TreeState.from_dict(self.repo.tree_of_oid(head))):
+            return f"HEAD {short(head)}"
+        return f"edited tree {key[:8]}" + (f" ({len(self.staged)} staged)" if self.staged else "")
 
     # ------------------------------------------------------------------ test
 
@@ -1014,7 +1036,8 @@ class Lab:
             if self._data_unchanged(cached):
                 cached.cached = True
                 return cached
-        with self.at_state(state):
+        split = "heldout" if suite.heldout else "blind" if suite.blind else None
+        with self.at_state(state), self.io.using(f"suite {suite.name}", split):
             model = SuiteModel(self.model, self.ir, self.text.unrestricted(), self.at_base)
             result = runner.run_suite(suite, model, key)
         self.store.write_file(rel, result.to_json())
@@ -1843,6 +1866,13 @@ class EditNamespace:
             return self._lab.edit_op(op, **_bind_positional(op, positional, args))
 
         return call
+
+
+def _decoder(tokenizer: Any) -> Any:
+    """Token ids to the text the model saw, special tokens (chat roles, images) included."""
+    if tokenizer is None:
+        return None
+    return lambda ids: str(tokenizer.decode(ids, skip_special_tokens=False))
 
 
 def _bind_positional(op: str, positional: tuple[Any, ...], args: dict[str, Any]) -> dict[str, Any]:

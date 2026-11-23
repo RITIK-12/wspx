@@ -279,6 +279,33 @@ EXPORT = {
                 "summary": "L3.mlp.down[:, 7]",
             },
         },
+        {
+            "id": 5,
+            "kind": "model_io",
+            "source": "open_model",
+            "ts": 5.0,
+            "payload": {
+                "tool": "generate",
+                "call_id": "c2",
+                "turn": 2,
+                "omitted": 0,
+                "records": [
+                    {
+                        "kind": "generate",
+                        "purpose": "generate",
+                        "weights": "base",
+                        "prompt": "<|im_start|>system\nBe brief.<|im_end|>",
+                        "prompt_tokens": 9,
+                        "output": "<think>easy</think>Paris<|im_end|>",
+                        "reasoning": "easy",
+                        "tool_calls": [],
+                        "answer": "Paris",
+                        "output_tokens": 5,
+                        "stop": "eos",
+                    }
+                ],
+            },
+        },
     ],
     "usage": {"groups": [{"provider": "anthropic", "model": "x", "n": 1, "c": 0.01}]},
 }
@@ -296,9 +323,16 @@ def test_sessions_export_writes_the_whole_record(
     result = runner.invoke(main.app, ["sessions", "export", "s_1", "-o", str(tmp_path)])
     assert result.exit_code == 0, result.output
     folder = tmp_path / "s_1"
-    lines = (folder / "trace.jsonl").read_text().splitlines()
+    lines = (folder / "leader.jsonl").read_text().splitlines()
     assert [json.loads(line)["kind"] for line in lines] == ["session", "start", "turn", "tool_call"]
-    md = (folder / "transcript.md").read_text()
+    (exchange,) = (folder / "open-model.jsonl").read_text().splitlines()
+    assert json.loads(exchange)["payload"]["records"][0]["answer"] == "Paris"
+    model = (folder / "open-model.md").read_text()
+    assert "Be brief." in model  # the instruction, as the model saw it
+    assert "> easy" in model  # its reasoning
+    assert "**Answer**\n\nParis" in model
+    md = (folder / "leader.md").read_text()
+    assert "Paris" not in md  # the leader's trace is the driver's alone
     assert "> I should grep first" in md  # the driver's reasoning
     assert "in 6,054 (6,000 cache read, 50 written) → out 90 tokens" in md
     assert "L3.mlp.down[:, 7]" in md  # the tool's result

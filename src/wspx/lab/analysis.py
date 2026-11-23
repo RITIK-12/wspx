@@ -363,7 +363,26 @@ def generate_scored(
     for row, seq in enumerate(sequences):
         new = seq[ids.shape[1] :].tolist()
         rows.append((new, watched[row][: len(new)]))
+    if text.io is not None and b.records:
+        text.io.outputs(
+            b.records,
+            [new for new, _ in rows],
+            settings={"max_tokens": max_tokens, "temperature": temperature, "top_p": top_p},
+            stop_ids=_stop_ids(model, text),
+        )
     return rows
+
+
+def _stop_ids(model: torch.nn.Module, text: Text) -> set[int]:
+    """Token ids that end a generation: the generation config's and the tokenizer's eos."""
+    found: set[int] = set()
+    config = getattr(model, "generation_config", None)
+    for value in (getattr(config, "eos_token_id", None), text.eos_id):
+        if isinstance(value, int):
+            found.add(value)
+        elif isinstance(value, list | tuple):
+            found.update(int(v) for v in value)
+    return found
 
 
 # --------------------------------------------------------------------------- traces
