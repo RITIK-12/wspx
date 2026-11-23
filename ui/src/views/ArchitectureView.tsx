@@ -859,10 +859,14 @@ function WeightPanel({ arch, session, param }: { arch: Arch; session: Session; p
             <dd>{t.experts} on dim 0</dd>
           </>
         )}
-        {t.runs > 1 && (
+        {(t.runs > 1 || t.passes) && (
           <>
             <dt>runs</dt>
-            <dd>{t.runs}× per forward pass: an edit changes every pass</dd>
+            <dd>
+              {t.passes
+                ? `on pass${t.passes.length > 1 ? "es" : ""} ${t.passes.join(", ")} of its layer only: ${t.runs}× per forward pass`
+                : `${t.runs}× per forward pass: an edit changes every pass`}
+            </dd>
           </>
         )}
         <dt>traced</dt>

@@ -46,7 +46,9 @@ def architecture(store: Store, fingerprint: str | None) -> dict[str, Any]:
             "out": facts.get(name, {}).get("out"),
             "experts": facts.get(name, {}).get("experts"),
             "layer": layer_of.get(name),
-            "runs": stack["runs"][layer_of[name]] if stack and name in layer_of else 1,
+            "runs": len(st.get("passes", {}).get(name, ()))
+            or (stack["runs"][layer_of[name]] if stack and name in layer_of else 1),
+            "passes": st.get("passes", {}).get(name),
             "exercised": coverage.get(name, {}).get("exercised", True),
             "phases": coverage.get(name, {}).get("phases", []),
         }

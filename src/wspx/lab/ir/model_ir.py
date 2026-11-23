@@ -95,10 +95,15 @@ HandleLookup = Callable[[Handle, str], list[int]]
 """(handle, parameter) → unit indices along the tensor dim being narrowed."""
 
 
-IR_VERSION = 5
-"""5: each layer type's sublayer blocks in run order (the UI's layer diagram). 4: roles at
+IR_VERSION = 6
+"""6: the passes each looped tensor runs on, and which sublayers add back to the stream.
+5: each layer type's sublayer blocks in run order (the UI's layer diagram). 4: roles at
 every key without a layer stack, the ``gate`` kind, and per-tensor facts from a
 vision-language model's image pass."""
+
+CONFIG_CHARS = 1500
+"""The config line's share of arch's output."""
+
 
 KIND_LEGEND = (
     ("writer", "output is model-width and reaches the stream"),
@@ -155,6 +160,19 @@ class ModelIR:
         return str(self.structure.get("keys", {}).get(name, name))
 
     def runs_of(self, param: str) -> int:
+        """How many times this tensor is used per forward pass: once per pass of its layer,
+        or fewer for a module that runs on only some passes (1 outside the stack)."""
+        return len(self.passes_of(param))
+
+    def passes_of(self, param: str) -> list[int]:
+        """The passes of its layer (1-based) this tensor's module runs on: ``[2, 3]`` for a
+        loop gate called from the second pass on; ``[1]`` outside a looped layer."""
+        special = self.structure.get("passes", {}).get(self.canonical(param))
+        if special:
+            return [int(p) for p in special]
+        return list(range(1, self.layer_runs_of(param) + 1))
+
+    def layer_runs_of(self, param: str) -> int:
         """How many times the layer holding this tensor runs per forward pass (1 outside it)."""
         stack = self.structure.get("stack")
         layer = self.structure.get("layer_of", {}).get(self.canonical(param))
@@ -468,8 +486,12 @@ class ModelIR:
             "vision_only": self.vision_only,
         }
 
-    def render_info(self) -> str:
-        """The architecture map, read off the module tree and the call log (``arch``)."""
+    def render_info(self, *, config: bool = True) -> str:
+        """The architecture map, read off the module tree and the call log (``arch``).
+
+        The config line comes last, capped: on a large model it ran past the output budget
+        and pushed out what followed it.
+        """
         s = self.summary()
         st = self.structure
         dtypes = sorted({p.dtype for p in self.params.values()})
@@ -496,10 +518,6 @@ class ModelIR:
         lines.append(
             f"coverage {s['coverage']} tensors exercised · phases {', '.join(s['phases'])}"
         )
-        config = st.get("config") or {}
-        if config:
-            entries = " · ".join(f"{k}={_config_value(v)}" for k, v in config.items())
-            lines.append(f"config: {entries}")
         lines.extend(f"note: {n}" for n in self.semantics.notes)
         layer_of = st.get("layer_of", {})
         example = next((n for n in self.params if n in layer_of and n.endswith(".weight")), None)
@@ -527,7 +545,22 @@ class ModelIR:
                 + ", ".join(f"L<n>.{a}" for a in aliases[:12])
                 + (" …" if len(aliases) > 12 else "")
             )
+        if config and self.render_config():
+            lines.append(self.render_config())
         return "\n".join(lines)
+
+    def render_config(self, limit: int = CONFIG_CHARS) -> str:
+        """The model config as one line, at most ``limit`` characters."""
+        config = self.structure.get("config") or {}
+        if not config:
+            return ""
+        entries = [f"{k}={_config_value(v)}" for k, v in config.items()]
+        line = "config: "
+        for i, entry in enumerate(entries):
+            if len(line) + len(entry) + 3 > limit - 24:  # room for " · … NN more keys"
+                return f"{line} · … {len(entries) - i} more keys"
+            line += entry if i == 0 else f" · {entry}"
+        return line
 
     def _render_stack(self, stack: dict[str, Any]) -> list[str]:
         n = stack["size"]
@@ -544,6 +577,20 @@ class ModelIR:
                 )
             elif times == 0:
                 lines.append(f"  {_span(a, b)} did not run in the traced pass")
+        partial = self.structure.get("passes", {})
+        if partial:
+            # Seen on a looped model: its loop gates run from the second pass on only.
+            groups: dict[tuple[int, ...], set[str]] = {}
+            for name, passes in partial.items():
+                inner = self.key_of(name).split(".", 1)[-1]
+                groups.setdefault(tuple(passes), set()).add(inner.rsplit(".", 1)[0])
+            for passes, modules in sorted(groups.items()):
+                shown = ", ".join(sorted(modules)[:6]) + (" …" if len(modules) > 6 else "")
+                count = sum(1 for p in partial.values() if tuple(p) == passes)
+                lines.append(
+                    f"  {count} tensors run on pass(es) {', '.join(map(str, passes))} only, "
+                    f"not every pass: {shown}"
+                )
         lines.append("layer types (arch L<n> lists one layer's tensors):")
         for i, v in enumerate(stack["variants"]):
             label = chr(ord("A") + i) if i < 26 else str(i)
@@ -766,6 +813,15 @@ def _config_value(value: Any) -> str:
         if ints == sorted(set(ints)) and len(ints) > 3:
             return "[" + _layers_text(ints).replace("L", "") + "]"
         return "[" + ",".join(map(str, ints)) + "]"
+    if isinstance(value, list) and len(value) > 4 and all(isinstance(v, str) for v in value):
+        runs: list[list[Any]] = []
+        for v in value:  # layer_types: 24 names in a few runs
+            if runs and runs[-1][0] == v:
+                runs[-1][1] += 1
+            else:
+                runs.append([v, 1])
+        return "[" + ", ".join(v if n == 1 else f"{v}×{n}" for v, n in runs) + "]"
     if isinstance(value, float):
         return f"{value:g}"
-    return str(value)
+    text = str(value)
+    return text if len(text) <= 160 else f"{text[:159]}…"

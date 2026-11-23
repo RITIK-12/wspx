@@ -141,6 +141,7 @@ def build_structure(
     if record is not None and main is not None:
         for variant in record["variants"]:
             variant["blocks"] = _blocks(record, variant["layers"][0], main, params, kinds)
+    passes = _passes(record, layer_of, params, calls) if record is not None else {}
     return {
         "hidden": hidden,
         "stack": record,
@@ -157,6 +158,7 @@ def build_structure(
         "final_norm": final_norm,
         "final_norm_params": final_norm_params,
         "routers": sorted(routers),
+        "passes": passes,
         "keys": keys,
         "layer_of": layer_of,
         "kinds": kinds,
@@ -412,6 +414,36 @@ def _blocks(
                 "ran": when(names) < never,
             }
         )
+    return out
+
+
+def _passes(
+    stack: dict[str, Any], layer_of: dict[str, int], params: dict[str, Any], calls: list[str]
+) -> dict[str, list[int]]:
+    """Tensors of a looped layer whose module runs on only some of the layer's passes (a
+    loop gate called from the second pass on), with the passes it runs on, 1-based. Read off
+    the call log: a module call belongs to the pass its layer was on. Tensors whose module
+    runs on every pass, or is never called (its weights used directly), are left out.
+    """
+    prefix = f"{stack['path']}." if stack["path"] else ""
+    index = {prefix + child: i for i, child in enumerate(stack["children"])}
+    passes_so_far = [0] * len(stack["children"])
+    called: dict[str, set[int]] = {}
+    for path in calls:
+        if path in index:
+            passes_so_far[index[path]] += 1
+            continue
+        if prefix and not path.startswith(prefix):
+            continue
+        layer = index.get(prefix + path[len(prefix) :].split(".", 1)[0])
+        if layer is not None and passes_so_far[layer]:
+            called.setdefault(path, set()).add(passes_so_far[layer])
+    out: dict[str, list[int]] = {}
+    for name, layer in layer_of.items():
+        runs = stack["runs"][layer]
+        ran = sorted(called.get(params[name].module, ()))
+        if runs > 1 and ran and ran != list(range(1, runs + 1)):
+            out[name] = ran
     return out
 
 
@@ -713,6 +745,17 @@ def _kind(
         if hidden is not None and width_in == hidden and width_out != hidden:
             return "reader"
         return "matrix"
+    read = fact.get("in")
+    out = fact.get("out")
+    # A query vector dotted with the stream, or a table of them, reads it as a (3, width) one
+    # does; seen live, the 1-D ones were "vector" and the 2-D ones "reader".
+    if (
+        read is not None
+        and hidden is not None
+        and shape[read] == hidden
+        and (out is None or shape[out] != hidden)
+    ):
+        return "reader"
     if len(shape) <= 1:
         return "norm" if "norm" in module_class.lower() else "vector"
     return "param"
