@@ -187,8 +187,12 @@ class ModelIO:
         *,
         settings: dict[str, Any],
         stop_ids: set[int],
+        seconds: float | None = None,
     ) -> None:
-        """Turn forward records into generations: the text each row wrote, split up."""
+        """Turn forward records into generations: the text each row wrote, split up.
+
+        ``seconds`` is the whole batch's generation time; each record keeps it with the batch
+        size, since the rows were generated together."""
         for record, new in zip(records, rows, strict=False):
             if record is None:
                 continue
@@ -201,6 +205,8 @@ class ModelIO:
                 output_tokens=len(kept),
                 stop="eos" if cut is not None else "max_tokens",
                 settings=settings,
+                seconds=seconds,
+                batch=len(rows),
                 **split_output(raw),
             )
             for key in ("reasoning", "answer"):

@@ -119,6 +119,9 @@ class TestProxy:
         call(client)
         summary = ledger.usage_summary(session="s1")
         assert summary["total_charged"] == pytest.approx(OPUS.input + OPUS.output * 0.1)
+        price = summary["groups"][0]["price"]  # what a trace needs to cost each call
+        assert (price["input"], price["output"]) == (OPUS.input, OPUS.output)
+        assert price["cache_read"] == pytest.approx(OPUS.read)
 
     def test_anthropic_stream_is_relayed_and_metered(self, setup) -> None:  # type: ignore[no-untyped-def]
         client, upstream, ledger = setup

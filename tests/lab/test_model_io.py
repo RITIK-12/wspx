@@ -98,6 +98,8 @@ def test_each_tool_call_returns_what_the_open_model_saw_and_wrote(client: Any) -
     assert first["output_tokens"] == 4
     assert first["stop"] == "max_tokens"
     assert first["settings"]["max_tokens"] == 4
+    assert first["batch"] == 2  # generated together, so they share the batch's time
+    assert first["seconds"] > 0
     assert "model_io" not in str(out["summary"])
     nothing = tool(client, "arch", {})
     assert nothing["model_io"] == {"records": [], "omitted": 0}

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 import re
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -351,10 +352,12 @@ def generate_scored(
             return scores
 
         kwargs["logits_processor"] = LogitsProcessorList([record])
+    started = time.perf_counter()
     with torch.no_grad():
         sequences = model.generate(  # type: ignore[operator]
             input_ids=ids, attention_mask=mask, **b.extra, **kwargs
         )
+    seconds = time.perf_counter() - started
     watched: list[list[list[float]]] = [[] for _ in range(len(prompts))]
     if steps:
         table = torch.stack(steps, dim=1).cpu().tolist()  # (rows, steps, watched)
@@ -369,6 +372,7 @@ def generate_scored(
             [new for new, _ in rows],
             settings={"max_tokens": max_tokens, "temperature": temperature, "top_p": top_p},
             stop_ids=_stop_ids(model, text),
+            seconds=seconds,
         )
     return rows
 

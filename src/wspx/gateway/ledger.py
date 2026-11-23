@@ -534,6 +534,19 @@ class Ledger:
                 0
             ]
         groups = [dict(r) for r in rows]
+        table = self.price_table()
+        for g in groups:  # per-million prices, so a trace can cost each call it shows
+            price = table.get(g["provider"], g["model"])
+            g["price"] = (
+                None
+                if price is None
+                else {
+                    "input": price.input,
+                    "output": price.output,
+                    "cache_read": price.read,
+                    "cache_write": price.write,
+                }
+            )
         return {
             "groups": groups,
             "total_charged": sum(g["ch"] or 0 for g in groups),
