@@ -41,6 +41,10 @@ class TestParsing:
         assert out["tool_calls"] == [{"name": "search", "arguments": {"q": "x"}}, {"raw": "oops"}]
         assert out["answer"] == "Let me look."
 
+    def test_only_end_of_turn_markers_are_trimmed(self) -> None:
+        assert split_output("<div>hi</div><end_of_turn>")["answer"] == "<div>hi</div>"
+        assert split_output("Paris</s><pad><pad>")["answer"] == "Paris"
+
     def test_plain_text_is_the_answer(self) -> None:
         assert split_output("just text") == {
             "reasoning": None,

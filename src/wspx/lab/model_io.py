@@ -31,7 +31,10 @@ _THINK_CLOSE = re.compile(r"^(.*?)</(?:think|thinking)>", re.S)
 _ANALYSIS = re.compile(r"<\|channel\|>analysis<\|message\|>(.*?)(?=<\|end\|>|<\|start\|>|$)", re.S)
 _FINAL = re.compile(r"<\|channel\|>final<\|message\|>(.*?)(?=<\|end\|>|<\|return\|>|$)", re.S)
 _TOOL_CALL = re.compile(r"<tool_call>\s*(.*?)\s*(?:</tool_call>|$)", re.S)
-_TRAILING_SPECIAL = re.compile(r"(?:\s*<\|?[\w\-./]+\|?>)+\s*$")
+_TRAILING_SPECIAL = re.compile(
+    r"(?:\s*(?:<\|[^<>|]+\|>|</s>|<eos>|<pad>|<unk>|<end_of_turn>|<\|?endoftext\|?>))+\s*$"
+)
+"""End-of-turn markers after the answer; an ordinary closing tag such as ``</div>`` stays."""
 
 
 def collapse(text: str) -> str:
