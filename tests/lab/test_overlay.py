@@ -86,3 +86,26 @@ def test_glob_finds_files_that_exist_only_in_the_base_store(tmp_path: Path) -> N
         "runs/tree/canary/0.json",
         "runs/tree/canary/1.json",
     ]
+
+
+def test_a_branch_deleted_in_the_overlay_is_gone_not_unborn(tmp_path: Path) -> None:
+    """Seen live (Fable on Inkling, 0.1.1): a cloud lab wrote an empty file for a deleted
+    branch, and an empty ref is an unborn branch: the deleted name could be checked out (at
+    base) and deleted again, and a base branch deleted in the overlay stayed listed."""
+    real = tmp_path / "store"
+    base = Store(real)
+    a, b, c = (f"sha256:{ch * 64}" for ch in "abc")
+    base.refs.update("heads/old", a, expected=None)
+    overlay = OverlayStore(real, tmp_path / "overlay")
+    overlay.refs.update("heads/new", b, expected=None)
+    for name in ("heads/old", "heads/new"):
+        assert overlay.refs.exists(name)
+        overlay.refs.delete(name)
+        assert not overlay.refs.exists(name)
+        assert overlay.refs.read(name) is None
+    assert overlay.refs.list("heads/") == {}
+    overlay.refs.update("heads/new", c, expected=None)  # a new branch of that name
+    assert overlay.refs.list("heads/") == {"heads/new": c}
+    apply_journal(base, overlay.journal.drain())
+    assert not base.refs.exists("heads/old")
+    assert base.refs.read("heads/new") == c

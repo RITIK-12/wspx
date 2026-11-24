@@ -180,8 +180,9 @@ class EditArgs(_Args):
         "targets to those units. "
         "units: unit indices. at: a block (14 or 'L14'). key, value: dir: handles or vectors, "
         "key in the target's input space and value in its output space. "
-        "source: 'base' restores the unedited weights. Merging uses orthogonalize "
-        "(vcs merge strategies).",
+        "source: 'base' restores the unedited weights. bake_steer needs a writer bias in "
+        "block at (most models have none), or at=0 for the token embedding. Merging uses "
+        "orthogonalize (vcs merge strategies).",
     )
     args: dict[str, Any] = Field(
         default_factory=dict,

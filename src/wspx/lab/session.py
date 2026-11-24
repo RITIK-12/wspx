@@ -488,11 +488,11 @@ class Lab:
                 only = int(looped.group(2))
                 if only < 1:
                     raise GrepError(f"{shown}: passes count from 1")
-        params = (
-            list(dict.fromkeys(t.param for t in self.resolve(scope)))
-            if scope
-            else writer_units(self.ir)
-        )
+        targets = self.resolve(scope) if scope else []
+        params = list(dict.fromkeys(t.param for t in targets)) if scope else writer_units(self.ir)
+        # Seen live: a slice in the scope (an expert, L23.mlp.experts.down_proj[56], or some
+        # columns) was dropped and every unit was ranked. Keep what each target selects.
+        picked = _selected_units(self.ir, targets)
         units: list[str] = []
         experts: list[str] = []
         skipped: list[str] = []
@@ -577,9 +577,11 @@ class Lab:
                 continue
             mean = (totals[param] / counts[param]).tolist()
             cols = role.in_dim == 1
+            allowed = picked.get(param, (None, None))[1]
             scores.extend(
                 Hit(f"{key}[:, {j}]" if cols else f"{key}[{j}]", param, None, j, s)
                 for j, s in enumerate(mean)
+                if allowed is None or j in allowed
             )
         candidates = len(scores)
         for name in experts:
@@ -600,9 +602,23 @@ class Lab:
             routed = count > 0
             per_unit = expert_sums[name] / count.clamp_min(1)[:, None]
             width = int(per_unit.shape[1])
-            candidates += int(routed.sum()) * width
-            flat = per_unit.masked_fill(~routed[:, None], float("-inf")).flatten()
-            best = torch.topk(flat, min(EXPERT_UNITS_KEPT, int(routed.sum()) * width))
+            valid = routed[:, None].expand(-1, width).clone()
+            only_experts, only_units = picked.get(name, (None, None))
+            if only_experts is not None:
+                keep_e = torch.zeros_like(routed)
+                keep_e[list(only_experts)] = True
+                valid &= keep_e[:, None]
+            if only_units is not None:
+                keep_u = torch.zeros(width, dtype=torch.bool, device=valid.device)
+                keep_u[list(only_units)] = True
+                valid &= keep_u[None, :]
+            n_valid = int(valid.sum())
+            if n_valid == 0:
+                skipped.append(f"{key} (no token was routed to the selected expert(s))")
+                continue
+            candidates += n_valid
+            flat = per_unit.masked_fill(~valid, float("-inf")).flatten()
+            best = torch.topk(flat, min(EXPERT_UNITS_KEPT, n_valid))
             for value, at in zip(best.values.tolist(), best.indices.tolist(), strict=True):
                 e, j = divmod(at, width)
                 where = f"{e}, :, {j}" if role.in_dim == 2 else f"{e}, {j}"
@@ -780,7 +796,30 @@ class Lab:
                 f"  not ranked ({type(exc).__name__}: {str(exc)[:160]}); "
                 f"rank them with grep '{ranking}' over a narrower scope"
             )
+        if isinstance(writers, GrepHits):
+            # Ranked by |cos|, shown with its sign. Seen live: a unit at cos -0.44 printed as
+            # +0.44 and was taken for one that writes the direction.
+            writers.hits = [
+                Hit(h.address, h.param, h.expert, h.unit, self._signed_cos(h, d.vector))
+                for h in writers.hits
+            ]
+            writers.signed = True
         return DirectionRef(self, entry.display, d, writers)
+
+    def _signed_cos(self, hit: Hit, vector: torch.Tensor) -> float:
+        """cos between what one writer unit writes and ``vector``."""
+        weight = self.params[hit.param].detach()
+        role = self.ir.primary_role(hit.param)
+        if role is None or role.in_dim is None:
+            return hit.score
+        in_dim = role.in_dim
+        if hit.expert is not None and weight.dim() == 3:
+            weight, in_dim = weight[hit.expert], in_dim - 1
+        unit = weight.select(in_dim, hit.unit).float()
+        v = vector.to(unit.device).float()
+        if unit.numel() != v.numel():
+            return hit.score
+        return float(unit @ v / (unit.norm() * v.norm()).clamp_min(1e-30))
 
     # ------------------------------------------------------------------ trace
 
@@ -1040,6 +1079,9 @@ class Lab:
             return ids, mask
         gen = torch.Generator().manual_seed(1234)
         vocab = self.ir.vocab_size or 2
+        unembed = self.ir.semantics.unembed
+        if unembed in self.ir.params:  # a padded vocabulary has ids the head never scores
+            vocab = min(vocab, int(self.ir.params[unembed].shape[0]))
         ids = torch.randint(0, vocab, (8, 16), generator=gen).to(self.device)
         mask = torch.ones_like(ids)
         self.io.prompts([None] * ids.shape[0], ids, mask)  # no tokenizer: not through Text
@@ -1249,6 +1291,12 @@ class Lab:
         lines = [
             f"{c.short} {time.strftime('%Y-%m-%d %H:%M', time.localtime(c.time))} "
             f"{'[needs-review] ' if c.status != 'ok' else ''}{c.message.splitlines()[0]}"
+            # seen live: a merge read as one more linear commit
+            + (
+                f" (merge of {', '.join(short(p) for p in c.parents)})"
+                if len(c.parents) > 1
+                else ""
+            )
             for c in rows
         ]
         return ToolResult("\n".join(lines) or "(no commits)", {"commits": [c.oid for c in rows]})
@@ -1321,9 +1369,12 @@ class Lab:
             return self._delete_branch(name)
         if name is None:
             current = self.repo.current_branch(self.session)
+            known = dict(self.repo.branches())
+            if current and current not in known:  # an unborn branch: no commits yet
+                known[current] = ""
             lines = [
-                f"{'*' if b == current else ' '} {b} {short(o)}"
-                for b, o in sorted(self.repo.branches().items())
+                f"{'*' if b == current else ' '} {b} {short(o) if o else '(base, no commits)'}"
+                for b, o in sorted(known.items())
             ]
             return ToolResult(
                 "\n".join(lines) or "(no branches)", {"branches": self.repo.branches()}
@@ -1435,11 +1486,12 @@ class Lab:
                 cancelled.append(name)
                 continue
             rank, rank_text = _delta_rank(delta, nz, self.device)
+            hunks = _hunks(self.ir.key_of(name), wa, wb, nz)
             rows.append(
                 {
                     "tensor": name,
                     "address": _display(self.ir, name),
-                    "hunks": _hunks(self.ir.key_of(name), wa, wb, nz),
+                    "hunks": hunks,
                     "precision": "adapter"
                     if sa.adapter.get(name) != sb.adapter.get(name)
                     and sa.merged.get(name) == sb.merged.get(name)
@@ -1449,7 +1501,7 @@ class Lab:
                     "rank": rank,
                     "rank_text": rank_text,
                     "touched": int(nz.sum()),
-                    "slices": _where(nz),
+                    "slices": _where(nz, hunks),
                 }
             )
         blocks = {
@@ -2020,6 +2072,8 @@ class GrepHits:
         self.handle = handle
         self.result = result
         self.hits = result.hits[:top]
+        self.signed = False
+        """The hits' scores are the signed value of an abs() ranking."""
 
     def __iter__(self) -> Iterator[Hit]:
         return iter(self.hits)
@@ -2049,6 +2103,8 @@ class GrepHits:
         r = self.result
         if r.is_ranking:  # no threshold: every unit "matches"
             head = f"top {len(self.hits)} of {r.candidates:,} {r.units} ranked by {r.expression}"
+            if self.signed:
+                head += " (shown with its sign)"
             if len(r.hits) < r.candidates:  # seen live: "(4,096 kept)" read as unexplained
                 head += f" (the result set keeps the best {len(r.hits):,})"
         else:
@@ -2207,6 +2263,14 @@ def _delta_rank(
     """A change's rank. Big matrices are sketched: exact (almost surely) below the sketch size.
     Only the rows and columns that changed take part, on the lab's device. Seen live: a full
     SVD of a 2304×3072 tensor, on the CPU, made one diff take 11-32 s for two changed columns."""
+    if delta.dim() == 3 and nz is not None:  # one matrix per expert
+        experts = torch.nonzero(nz.flatten(1).any(dim=1)).reshape(-1).tolist()
+        ranks = [_delta_rank(delta[e], nz[e], device)[0] for e in experts[:16]]
+        if not ranks or any(r is None for r in ranks):
+            return None, "n/a"
+        top = max(r for r in ranks if r is not None)
+        more = "≤" if len(experts) > 16 else ""
+        return top, f"{more}{top} per expert"
     if delta.dim() != 2:
         return None, "n/a"
     if nz is not None:
@@ -2270,12 +2334,17 @@ def _unit_dim(ir: ModelIR, target: Target) -> int:
     return role.in_dim if writes else role.out_dim
 
 
-def _where(mask: torch.Tensor) -> str:
-    """Where a change is: the bounding slice, and the changed indices along a dim where only
-    a few of those it spans changed. Seen live: "[:, 1544:1801]" for two changed columns."""
+def _where(mask: torch.Tensor, hunks: list[dict[str, Any]] | None = None) -> str:
+    """Where a change is: the changed slices when there are few (seen live: experts and columns
+    listed apart read as crossed, not paired), else the bounding slice and the changed indices
+    along a dim where only a few of those it spans changed (seen live: "[:, 1544:1801]" for
+    two changed columns)."""
     box = _bbox(mask)
     if mask.dim() == 0 or not mask.any():
         return box
+    if hunks and "more" not in hunks[-1] and len(hunks) <= 8 and mask.dim() > 1:
+        spots = [h["where"][h["where"].index("[") :] for h in hunks]
+        return spots[0] if len(spots) == 1 else f"{len(spots)} slices: {', '.join(spots)}"
     notes = []
     for d in range(mask.dim()):
         other = tuple(i for i in range(mask.dim()) if i != d)
@@ -2283,12 +2352,9 @@ def _where(mask: torch.Tensor) -> str:
         idx = torch.nonzero(hit).reshape(-1).tolist()
         span = idx[-1] - idx[0] + 1
         if len(idx) < span and len(idx) <= 8:
-            name = (
-                {0: "row", 1: "col"}.get(d, f"dim-{d} index")
-                if mask.dim() == 2
-                else ("expert" if d == 0 and mask.dim() == 3 else f"dim-{d} index")
-            )
-            notes.append(f"{len(idx)} {name}s: {', '.join(map(str, idx))}")
+            names = {2: ("rows", "cols"), 3: ("experts", "rows", "cols")}.get(mask.dim())
+            name = names[d] if names else f"dim-{d} indices"
+            notes.append(f"{len(idx)} {name}: {', '.join(map(str, idx))}")
     return box + (f" (only {'; '.join(notes)})" if notes else "")
 
 
@@ -2418,3 +2484,33 @@ def _ranked_over(ir: ModelIR, hits: GrepHits) -> str:
         for p, n in sorted(patterns.items(), key=lambda kv: -sizes[kv[0]])
     ]
     return "\nranked over: " + ", ".join(parts)
+
+
+def _selected_units(
+    ir: ModelIR, targets: list[Target]
+) -> dict[str, tuple[set[int] | None, set[int] | None]]:
+    """For each tensor a scope names with a slice: the experts it keeps (dim 0 of a 3-D expert
+    tensor) and the input features (the units activations ranks). None keeps all."""
+    out: dict[str, tuple[set[int] | None, set[int] | None]] = {}
+    for t in targets:
+        role = t.role or ir.primary_role(t.param)
+        shape = ir.params[t.param].shape
+        if role is None or role.in_dim is None or t.index is None:
+            out[t.param] = (None, None)
+            continue
+        index = normalize_index(t.index, len(shape))
+
+        def chosen(sel: Any, size: int) -> set[int] | None:
+            if isinstance(sel, slice):
+                picked = set(range(*sel.indices(size)))
+                return None if len(picked) == size else picked
+            return {sel} if isinstance(sel, int) else set(sel)
+
+        experts = chosen(index[0], shape[0]) if len(shape) == 3 and role.experts else None
+        units = chosen(index[role.in_dim], shape[role.in_dim])
+        if t.param in out:  # several targets on one tensor: keep the union
+            e0, u0 = out[t.param]
+            experts = None if e0 is None or experts is None else e0 | experts
+            units = None if u0 is None or units is None else u0 | units
+        out[t.param] = (experts, units)
+    return out

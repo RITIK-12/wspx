@@ -113,7 +113,8 @@ def render_show(info: dict[str, Any]) -> str:
         m = info["map"]
         lines.append(
             f"  map: {m['rows']}×{m['cols']} blocks of RMS magnitude over its "
-            f"{m['of'][0]}×{m['of'][1]} values, in the structured result (the UI draws it)"
+            f"{m['of'][0]}×{m['of'][1]} values (grid cells along the longer side, keeping its "
+            "shape), in the structured result (the UI draws it)"
         )
     return "\n".join(lines)
 
@@ -234,10 +235,19 @@ class Direction:
                 "it needs at least 2 a side)"
             )
         k, n = self.held_out
-        return (
+        text = (
             f"held-out separation {self.separation:.2f} ({k}/{n} prompts on their own side "
             "when left out)"
         )
+        if self.separation <= 0 or 2 * k <= n:
+            # Seen live: three French/English translation pairs gave -9.84 (0/6), saved with
+            # no word. Few prompts that share their content make leave-one-out flip.
+            text += (
+                "; ! the direction does not hold when a prompt is left out, so it is not yet "
+                "a direction for what the sides differ in: use more prompts a side (6+), "
+                "varied in content"
+            )
+        return text
 
 
 def contrast(
@@ -897,10 +907,17 @@ def diff_trace(
             "edited units (their weights differ), by how much what they write moved: "
             + ", ".join(f"{a} {s:+.3g}" for a, s in edited[:top])
         )
+    moved = [(a, s) for a, s in moved if s != 0]
     if moved:
         lines.append(
             "most-moved units (what each writes at the last token; units downstream of an "
             "edit move too): " + ", ".join(f"{a} {s:+.2f}" for a, s in moved[:top])
+        )
+    elif not edited:
+        # seen live: it listed L0 units at +0.00 when the edited expert was not routed
+        lines.append(
+            "no unit's write at the last token moved: the edit did not reach this prompt "
+            "(an edited expert that is not routed here writes nothing)"
         )
     return Trace(
         "diff",

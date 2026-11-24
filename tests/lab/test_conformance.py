@@ -742,3 +742,83 @@ def test_what_fable_found_on_inkling_at_0_1_0(inkling: Any, tmp_path: Any) -> No
 
     grid = lab.show("L11.mlp.experts.down_proj[3]", grid=8)
     assert "map: " in str(grid)
+
+
+def test_what_fable_found_on_inkling_at_0_1_1(inkling: Any, tmp_path: Any) -> None:
+    """Seen live (Fable on Inkling, 0.1.1): orthogonalize crashed on an expert tensor and the
+    merge overlap took most of a minute; activations ranked every expert when the scope named
+    one; contrast printed a -0.44 writer as +0.44; checks compared all 128 experts for a
+    one-column edit; diff listed experts and columns apart, with rank n/a."""
+    from wspx.lab.sdk import open_lab
+    from wspx.tools.dispatch import call
+
+    (tmp_path / "work").mkdir()
+    lab = open_lab(inkling, store=tmp_path / "store", workdir=tmp_path / "work")
+
+    def vcs(**args: Any) -> str:
+        out = call(lab, "vcs", args)
+        assert out.ok, out.summary
+        return out.summary
+
+    prompt = [3, 9, 27, 81, 5]
+    one = lab.activations([prompt], scope="L9.mlp.experts.down_proj[2]", top=50)
+    assert {h.expert for h in one.result.hits} <= {2}
+    cols = lab.activations([prompt], scope="L9.self_attn.o_proj.linear[:, 4:8]", top=50)
+    assert {h.unit for h in cols.result.hits} <= {4, 5, 6, 7}
+
+    d = lab.contrast(
+        [[3, 9, 27], [5, 7, 11], [2, 4, 6]], [[81, 5, 7], [2, 8, 9], [1, 1, 3]], name="d", layer=11
+    )
+    assert "shown with its sign" in d.summary
+    signed = lab.grep("cos(dir:d)", scope=d.writers.result.scope, keep=50000)  # type: ignore[union-attr]
+    truth = {(h.param, h.expert, h.unit): h.score for h in signed.result.hits}
+    for h in d.writers.hits:  # type: ignore[union-attr]
+        assert h.score == pytest.approx(truth[(h.param, h.expert, h.unit)], abs=1e-4)
+
+    vcs(action="branch", name="ours")
+    halved = call(
+        lab,
+        "edit",
+        {"op": "scale", "args": {"targets": "L10.mlp.experts.down_proj[3]", "factor": 0.5}},
+    )
+    assert "W201" in halved.summary  # judged per expert: half of expert 3, not 1/16 of 8 experts
+    call(
+        lab,
+        "edit",
+        {"op": "scale", "args": {"targets": "L10.mlp.experts.down_proj[2, :, 1]", "factor": 0.9}},
+    )
+    call(
+        lab,
+        "edit",
+        {"op": "scale", "args": {"targets": "L10.mlp.experts.down_proj[5, :, 3]", "factor": 0.9}},
+    )
+    vcs(action="commit", message="ours", force=True)
+    shown = vcs(action="diff", a="base", b="HEAD")
+    assert "rank" in shown
+    assert "per expert" in shown
+    vcs(action="checkout", rev="base")
+    vcs(action="branch", name="theirs")
+    call(
+        lab,
+        "edit",
+        {"op": "scale", "args": {"targets": "L10.mlp.experts.down_proj[2, :, 1]", "factor": 1.2}},
+    )
+    vcs(action="commit", message="theirs", force=True)
+    two = vcs(action="diff", a="base", b="HEAD")
+    assert "L10.mlp.experts.down_proj" in two
+    assert "[2, :, 1]" in two
+    tip = lab.repo.resolve("ours")
+    for strategy in ("orthogonalize", "ties"):
+        vcs(action="branch", name=f"try-{strategy}", rev=tip)
+        merged = call(
+            lab,
+            "vcs",
+            {
+                "action": "merge",
+                "name": "theirs",
+                "strategies": {"L10.mlp.experts.down_proj": strategy},
+            },
+        )
+        assert merged.ok, merged.summary
+        assert f"L10.mlp.experts.down_proj: {strategy}" in merged.summary
+        assert "(merge of " in vcs(action="log", n=1)

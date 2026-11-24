@@ -90,11 +90,12 @@ class Report(BaseModel):
         head = f"check {verdict}: {n_err} error(s), {n_warn} warning(s) [{', '.join(self.levels)}]"
         stats = self.stats or {}
         if "canary_kl" in stats:  # the smoke numbers, warning or not
-            head += f"\nsmoke: canary KL vs base {stats['canary_kl']:.3f}"
+            # seen live: an edit that broke a fact read "0.000"; small values keep a digit
+            head += f"\nsmoke: canary KL vs base {_small(stats['canary_kl'])}"
             if "ppl_new" in stats:
                 head += f" · perplexity {stats['ppl_base']:.2f} → {stats['ppl_new']:.2f}"
             if "canary_image_kl" in stats:
-                head += f" · image canary KL {stats['canary_image_kl']:.3f}"
+                head += f" · image canary KL {_small(stats['canary_image_kl'])}"
         if not self.diagnostics:
             return head
         return head + "\n" + "\n".join(d.render() for d in self.diagnostics)
@@ -151,3 +152,10 @@ def diag(
         fixes=fixes or [],
         data=data,
     )
+
+
+def _small(value: float) -> str:
+    """A KL to three decimals, or to two significant digits when it rounds to 0.000."""
+    if value == 0 or abs(value) >= 5e-4:
+        return f"{value:.3f}"
+    return f"{value:.1e}"

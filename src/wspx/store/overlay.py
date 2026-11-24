@@ -88,28 +88,49 @@ class _OverlayObjects(ObjectStore):
         raise StoreError(f"{text!r} is ambiguous; use more digits")
 
 
+TOMBSTONE = "!deleted"
+"""What a deleted ref holds in the overlay. Seen live: an empty file stood for deleted, and
+an empty ref is an unborn branch, so a deleted branch could be checked out (at base) and
+deleted again."""
+
+
 class _OverlayRefs(RefStore):
     def __init__(self, base: RefStore, root: Path, journal: Journal) -> None:
         super().__init__(root)
         self.base = base
         self.journal = journal
 
+    def _own(self, name: str) -> str | None:
+        """This overlay's raw value for ``name`` (TOMBSTONE when deleted here), or None."""
+        if not super().exists(name):
+            return None
+        return self._path(name).read_text(encoding="utf-8").strip()
+
     def exists(self, name: str) -> bool:
-        return super().exists(name) or self.base.exists(name)
+        own = self._own(name)
+        if own is not None:
+            return own != TOMBSTONE
+        return self.base.exists(name)
 
     def read_raw(self, name: str) -> str | None:
-        if super().exists(name):
-            return super().read_raw(name)
+        own = self._own(name)
+        if own is not None:
+            return None if own in ("", TOMBSTONE) else own
         return self.base.read_raw(name)
 
     def list(self, prefix: str = "heads/") -> dict[str, str]:
         out = dict(self.base.list(prefix))
-        for name in super().list(prefix):
-            value = self.read(name)
-            if value is None:
-                out.pop(name, None)
-            else:
-                out[name] = value
+        root = self.root / prefix
+        if root.is_dir():
+            for path in sorted(root.rglob("*")):
+                if not path.is_file() or path.name.endswith(".lock") or path.name.startswith("."):
+                    continue
+                name = path.relative_to(self.root).as_posix()
+                value = self.read(name)
+                if value is None:
+                    out.pop(name, None)
+                else:
+                    out[name] = value
         return out
 
     def update(self, name: str, new: str, expected: str | _Any | None = ANY) -> None:
@@ -134,7 +155,7 @@ class _OverlayRefs(RefStore):
                 from wspx.errors import RefConflict
 
                 raise RefConflict(f"ref {name!r} moved; refusing to delete")
-            atomic_write(self._path(name), b"")  # tombstone over the base
+            atomic_write(self._path(name), f"{TOMBSTONE}\n".encode())  # over the base
         self._record({"op": "delete", "name": name, "expected": current})
 
     def _record(self, entry: dict[str, Any]) -> None:

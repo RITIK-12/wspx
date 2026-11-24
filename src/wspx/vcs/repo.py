@@ -219,6 +219,10 @@ class Repo:
         ref = HEADS + branch
         if start is not None and self.store.refs.read(ref) is None:
             self.store.refs.update(ref, self.resolve(start) or "", expected=None)
+        elif not self.store.refs.exists(ref):
+            # an unborn branch is a ref too: seen live, a session that left its first branch
+            # could not check it out again, nor see it listed
+            self.store.refs.update(ref, "", expected=None)
         self.store.refs.set_symbolic(self.head_ref(session), ref)
         return branch
 

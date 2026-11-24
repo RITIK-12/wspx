@@ -242,6 +242,14 @@ def numeric_check(ir: ModelIR, tree: WorkingTree, plan: EditPlan, cfg: CheckSect
         intended = torch.zeros(old.shape, dtype=torch.float32, device=old.device)
         for d in deltas:
             d.add_into(intended)
+        role = ir.primary_role(name)
+        if old.dim() == 3 and role is not None and role.experts is not None:
+            # One matrix per expert: judge the experts the edit touched, not all of them.
+            # Seen live: every check of a one-column expert edit compared 340 million
+            # values, and its relative change was diluted 128 times.
+            hit = torch.nonzero(intended.flatten(1).abs().sum(1)).reshape(-1)
+            if 0 < hit.numel() < old.shape[0]:
+                old, new, intended = old[hit], new[hit], intended[hit]
         if not torch.isfinite(intended).all() or not torch.isfinite(new.float()).all():
             add(
                 diag(

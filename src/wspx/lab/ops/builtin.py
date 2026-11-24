@@ -396,7 +396,13 @@ def orthogonalize(
     """
     out = []
     for delta in deltas:
-        basis = _subspace([a for a in against if a.tensor == delta.tensor], side)
+        mine = [a for a in against if a.tensor == delta.tensor]
+        if len(delta.shape) == 3:
+            # A 3-D expert tensor is one matrix per expert: project each expert's delta off what
+            # the other side wrote with that expert. Seen live: as one tensor it crashed.
+            out.append(_orthogonalize_experts(delta, mine, side))
+            continue
+        basis = _subspace(mine, side)
         if basis is None:
             out.append(delta)
             continue
@@ -431,6 +437,28 @@ def orthogonalize(
         )
     del ctx
     return out
+
+
+def _orthogonalize_experts(
+    delta: TensorDelta, against: list[TensorDelta], side: str, tol: float = 1e-6
+) -> TensorDelta:
+    if not against:
+        return delta
+    full = delta.dense()
+    other = torch.zeros(delta.shape)
+    for a in against:
+        a.add_into(other)
+    touched = torch.nonzero(full.flatten(1).abs().sum(1) * other.flatten(1).abs().sum(1))
+    for e in touched.reshape(-1).tolist():
+        mat = other[e] if side == "out" else other[e].T
+        u, sv, _ = torch.linalg.svd(mat, full_matrices=False)
+        basis = u[:, sv > tol * max(float(sv.max()), 1e-30)]
+        mine = full[e] if side == "out" else full[e].T
+        proj = mine - basis @ (basis.T @ mine)
+        full[e] = proj if side == "out" else proj.T
+    return patch.compact(
+        patch.dense(delta.tensor, delta.shape, delta.base, full, op="orthogonalize")
+    )
 
 
 def _subspace(deltas: list[TensorDelta], side: str, tol: float = 1e-6) -> torch.Tensor | None:

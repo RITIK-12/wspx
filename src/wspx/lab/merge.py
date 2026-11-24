@@ -155,13 +155,28 @@ def overlap(
     in_dim: int = 1,
     acts: torch.Tensor | None = None,
 ) -> Overlap:
-    dense_a = sum((d.dense() for d in ours), torch.zeros(ours[0].shape))
-    dense_b = sum((d.dense() for d in theirs), torch.zeros(theirs[0].shape))
-    ma, mb = _as_matrix(dense_a, out_dim, in_dim), _as_matrix(dense_b, out_dim, in_dim)
+    dense_a = torch.zeros(ours[0].shape)
+    dense_b = torch.zeros(theirs[0].shape)
+    for side, dense in ((ours, dense_a), (theirs, dense_b)):
+        for d in side:
+            d.add_into(dense)
     s = slice_overlap(ours, theirs)
-    o = subspace_overlap(ma, mb, "out")
-    i = subspace_overlap(ma, mb, "in")
-    act = activation_overlap(ma, mb, acts) if acts is not None and ma.dim() == 2 else None
+    if dense_a.dim() == 3:
+        # One matrix per expert (seen live: flattened, two SVDs of a 294,912 × 1152 matrix took
+        # most of a minute and mixed experts). Only experts both sides touched can conflict.
+        both = torch.nonzero(dense_a.flatten(1).any(1) & dense_b.flatten(1).any(1)).reshape(-1)
+        o = i = 0.0
+        for e in both.tolist():
+            ma = _as_matrix(dense_a[e], out_dim - 1, in_dim - 1)
+            mb = _as_matrix(dense_b[e], out_dim - 1, in_dim - 1)
+            o = max(o, subspace_overlap(ma, mb, "out"))
+            i = max(i, subspace_overlap(ma, mb, "in"))
+        act = None
+    else:
+        ma, mb = _as_matrix(dense_a, out_dim, in_dim), _as_matrix(dense_b, out_dim, in_dim)
+        o = subspace_overlap(ma, mb, "out")
+        i = subspace_overlap(ma, mb, "in")
+        act = activation_overlap(ma, mb, acts) if acts is not None and ma.dim() == 2 else None
     signals = [s, o, i] + ([abs(act)] if act is not None else [])
     # Disjoint slices that write the same directions still conflict, so take the max.
     score = max(signals)
@@ -188,7 +203,10 @@ def ties(ours: list[TensorDelta], theirs: list[TensorDelta], *, keep: float = 0.
     for delta in sides:
         flat = delta.abs().reshape(-1)
         k = max(1, int(flat.numel() * keep))
-        threshold = torch.topk(flat, k).values[-1]
+        # The top k of every value are the top k of the nonzero ones, or all of them and zeros
+        # (seen live: a top-k over 340 million values of a sparse expert edit took a minute).
+        nonzero = flat[flat != 0]
+        threshold = torch.topk(nonzero, k).values[-1] if nonzero.numel() > k else torch.tensor(0.0)
         trimmed.append(torch.where(delta.abs() >= threshold, delta, torch.zeros_like(delta)))
     stacked = torch.stack(trimmed)
     sign = torch.sign(stacked.sum(0))

@@ -468,7 +468,7 @@ def test_what_fable_found_at_0_1_0(lab) -> None:  # type: ignore[no-untyped-def]
     _vcs(lab, "commit", message="two columns")
 
     shown = call(lab, "vcs", {"action": "diff", "a": "HEAD~1", "b": "HEAD"})
-    assert "[:, 3:10] (only 2 cols: 3, 9)" in shown.summary
+    assert "2 slices: [:, 3], [:, 9]" in shown.summary
     row = shown.data["tensors"][0]
     assert row["rank"] == 2
     assert [h["where"] for h in row["hunks"]] == [
@@ -515,3 +515,32 @@ def test_a_branch_another_session_has_checked_out_is_not_deleted(tmp_path: Path)
     refused = call(two, "vcs", {"action": "branch", "name": "shared", "delete": True})
     assert not refused.ok
     assert f"checked out by session {one.session}" in refused.summary
+
+
+def test_what_fable_found_at_0_1_1(lab) -> None:  # type: ignore[no-untyped-def]
+    """Seen live (Fable on Inkling, 0.1.1): the session's own branch, with no commits yet, was
+    not listed and could not be checked out again; a paired 3-vs-3 contrast gave a negative
+    separation with no warning; the diff trace listed units at +0.00 when nothing moved; an
+    edit that broke a fact showed canary KL 0.000."""
+    from types import SimpleNamespace
+
+    from wspx.diagnostics import _small
+    from wspx.lab.analysis import Direction
+
+    first = lab.repo.current_branch(lab.session)
+    assert f"* {first} (base, no commits)" in _vcs(lab, "branch")
+    _vcs(lab, "branch", name="elsewhere")
+    assert _vcs(lab, "checkout", rev=first).startswith(f"checked out {first}")
+
+    flipped = SimpleNamespace(separation=-9.84, held_out=(0, 6), n_pos=3, n_neg=3)
+    assert "does not hold when a prompt is left out" in Direction.describe_separation(flipped)  # type: ignore[arg-type]
+    held = SimpleNamespace(separation=4.4, held_out=(12, 12), n_pos=6, n_neg=6)
+    assert "!" not in Direction.describe_separation(held)  # type: ignore[arg-type]
+
+    quiet = call(lab, "trace", {"prompt": [1, 9, 2, 10], "vs": "base"}).summary
+    assert "no unit's write at the last token moved" in quiet
+    assert "+0.00" not in quiet
+
+    assert _small(0.0) == "0.000"
+    assert _small(2.1e-4) == "2.1e-04"
+    assert _small(0.0123) == "0.012"
