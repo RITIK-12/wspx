@@ -232,8 +232,8 @@ def test_a_driver_session_is_starting_until_its_lab_is_up(tmp_path: Path) -> Non
     assert m.get(sid).status == "starting"  # the driver is queued, not waiting for a press
     assert m.create(model="m").status == "idle"  # no driver: nothing to start
     backend.ready.set()
-    wait(lambda: m.get(sid).status == "running")
-    assert len(backend.runners) == 1
+    # the status can read "running" a moment before the runner is registered (seen on CI)
+    wait(lambda: m.get(sid).status == "running" and len(backend.runners) == 1)
 
 
 class SilentLab(FakeLab):
