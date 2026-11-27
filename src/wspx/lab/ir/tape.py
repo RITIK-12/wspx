@@ -149,6 +149,7 @@ class Tape(TorchDispatchMode):  # type: ignore[no-untyped-call]
         track_features: bool = True,
     ) -> None:
         super().__init__()  # type: ignore[no-untyped-call]
+        self.model = model
         self.graph = OpGraph(phase)
         self.graphs: dict[str, OpGraph] = {phase: self.graph}
         self.active = True
@@ -266,6 +267,11 @@ class Tape(TorchDispatchMode):  # type: ignore[no-untyped-call]
         except (RuntimeError, NotImplementedError):
             return None
         candidates = self._params.get(ptr)
+        if not candidates:
+            # a streamed layer's weights: in a storage of their own only while it runs
+            from wspx.lab.offload import live_params
+
+            candidates = live_params(self.model, ptr)
         if not candidates:
             return None
         name, param = candidates[0]

@@ -21,7 +21,7 @@ from __future__ import annotations
 import functools
 import math
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -315,7 +315,7 @@ class Environment:
     """What functions need: vocabulary vectors, directions and folded norm scales."""
 
     ir: ModelIR
-    params: dict[str, torch.Tensor]
+    params: Mapping[str, torch.Tensor]
     token_id: Callable[[str | int], int] | None = None
     direction: Callable[[str], torch.Tensor] | None = None
     _cache: dict[str, torch.Tensor] = field(default_factory=dict)
@@ -364,7 +364,7 @@ class Environment:
 
 def unit_batches(
     ir: ModelIR,
-    params: dict[str, torch.Tensor],
+    params: Mapping[str, torch.Tensor],
     targets: list[Target],
     axis: str | None,
     prefer: str | None = None,

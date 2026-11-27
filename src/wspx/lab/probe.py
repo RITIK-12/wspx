@@ -202,6 +202,16 @@ _MATMULS = frozenset(
 )
 
 
+def _by_storage(params: dict[str, torch.Tensor]) -> dict[int, tuple[str, torch.Tensor]]:
+    """Parameters by the storage their values are in now (placeholders left out: they all
+    share one element)."""
+    from wspx.lab.weights import is_placeholder
+
+    return {
+        p.untyped_storage().data_ptr(): (n, p) for n, p in params.items() if not is_placeholder(p)
+    }
+
+
 class _ExpertInputs(TorchDispatchMode):  # type: ignore[no-untyped-call]
     """Each expert's input to a 3-D expert tensor, seen where an op multiplies by one
     expert's slice (``F.linear(x, w[e])``): the slice is a view of the parameter, and its
@@ -209,11 +219,17 @@ class _ExpertInputs(TorchDispatchMode):  # type: ignore[no-untyped-call]
 
     def __init__(self, params: dict[str, torch.Tensor], widths: dict[str, int]) -> None:
         super().__init__()  # type: ignore[no-untyped-call]
-        self.by_storage = {p.untyped_storage().data_ptr(): (n, p) for n, p in params.items()}
+        self.params = params
+        self.by_storage = _by_storage(params)
         self.widths = widths
         self.wanted: dict[str, bool] = dict.fromkeys(params, True)
         self.sums: dict[str, torch.Tensor] = {}
         self.counts: dict[str, torch.Tensor] = {}
+
+    def refresh(self) -> None:
+        """Where each parameter's values are now: a streamed layer gets its weights only
+        for its own forward pass (called as an experts module starts)."""
+        self.by_storage = _by_storage(self.params)
 
     def __torch_dispatch__(
         self,
@@ -290,6 +306,7 @@ def expert_inputs(
         module = model.get_submodule(ir.params[name].module)
 
         def count(_m: torch.nn.Module, _args: Any, key: str = name) -> None:
+            mode.refresh()
             k = result.calls.get(key, 0)
             result.calls[key] = k + 1
             passes = ir.passes_of(key)
@@ -360,6 +377,9 @@ class ExpertWrites:
     calls: dict[str, list[dict[int, tuple[torch.Tensor, float]]]] = field(default_factory=dict)
     """Writer expert tensor → one entry per call of its module: routed expert → (what it fed
     its writer at the last token, the routing weight that scaled its output)."""
+    norms: dict[tuple[str, int], torch.Tensor] = field(default_factory=dict)
+    """(writer expert tensor, expert) → ‖w_j‖ of each of its input features, read while the
+    forward pass had the weights (a streamed layer has them only then)."""
 
 
 class _ExpertWrites(TorchDispatchMode):  # type: ignore[no-untyped-call]
@@ -374,12 +394,16 @@ class _ExpertWrites(TorchDispatchMode):  # type: ignore[no-untyped-call]
         widths: dict[str, int],
         module_of: dict[str, str],
         writers: set[str],
+        norm_dims: dict[str, int] | None = None,
     ) -> None:
         super().__init__()  # type: ignore[no-untyped-call]
-        self.by_storage = {p.untyped_storage().data_ptr(): (n, p) for n, p in params.items()}
+        self.params = params
+        self.by_storage = _by_storage(params)
         self.widths = widths
         self.module_of = module_of
         self.writers = writers
+        self.norm_dims = norm_dims or {}
+        self.norms: dict[tuple[str, int], torch.Tensor] = {}
         self.last: dict[str, torch.Tensor] = {}
         self.weights: dict[str, dict[int, float]] = {}
         self.rows: dict[str, dict[int, int]] = {}
@@ -387,6 +411,7 @@ class _ExpertWrites(TorchDispatchMode):  # type: ignore[no-untyped-call]
 
     def start(self, module: str, args: tuple[Any, ...], hidden: int) -> None:
         """The experts module is called: its input's last row is the last token's state."""
+        self.by_storage = _by_storage(self.params)  # a streamed layer's weights are in now
         x = args[0] if args and isinstance(args[0], torch.Tensor) else None
         self.rows[module] = {}
         for name, owner in self.module_of.items():
@@ -450,6 +475,9 @@ class _ExpertWrites(TorchDispatchMode):  # type: ignore[no-untyped-call]
                 if row is not None and row < rows.shape[0] and self.calls.get(name):
                     weight = self.weights.get(module, {}).get(expert, 1.0)
                     self.calls[name][-1][expert] = (rows[row].float(), weight)
+                    dim = self.norm_dims.get(name)
+                    if dim is not None and (name, expert) not in self.norms:
+                        self.norms[(name, expert)] = param[expert].detach().float().norm(dim=dim)
             else:
                 hit = (rows == last.to(rows.dtype)).all(-1).nonzero()
                 if hit.numel():
@@ -480,8 +508,16 @@ def expert_writes(model: torch.nn.Module, ir: ModelIR) -> Iterator[ExpertWrites]
             assert role.in_dim is not None
             module_of[param] = module
             widths[param] = ir.params[param].shape[role.in_dim]
-    mode = _ExpertWrites({n: named[n] for n in module_of}, widths, module_of, set(writers))
+    norm_dims: dict[str, int] = {}
+    for name in writers:
+        role = ir.primary_role(name)
+        if role is not None and role.out_dim is not None:
+            norm_dims[name] = role.out_dim - 1  # one expert's slice drops the expert axis
+    mode = _ExpertWrites(
+        {n: named[n] for n in module_of}, widths, module_of, set(writers), norm_dims
+    )
     result.calls = mode.calls  # live: what has run so far is readable inside the block
+    result.norms = mode.norms
     handles = []
     for module in dict.fromkeys(module_of.values()):
 
@@ -496,6 +532,7 @@ def expert_writes(model: torch.nn.Module, ir: ModelIR) -> Iterator[ExpertWrites]
         for handle in handles:
             handle.remove()
         result.calls = {k: v for k, v in mode.calls.items() if any(v)}
+        result.norms = mode.norms
 
 
 class _Recorder(TorchDispatchMode):  # type: ignore[no-untyped-call]
@@ -549,6 +586,12 @@ class Capture:
     unit_calls: dict[str, list[torch.Tensor]] = field(default_factory=dict)
     """Writer param → its module's input on every call, in order: one per pass of a layer
     that runs more than once."""
+    unit_norms: dict[str, torch.Tensor] = field(default_factory=dict)
+    """Writer param → ‖w_j‖ of each unit (with ``unit_weights``), read while the forward
+    pass had the weights: a streamed layer has them only then."""
+    unit_sums: dict[str, torch.Tensor] = field(default_factory=dict)
+    """Writer param → each unit's column sum (with ``unit_weights``): with the norms, it
+    tells an edited unit from an unedited one."""
 
 
 class Probe:
@@ -564,8 +607,10 @@ class Probe:
         *,
         units: list[str] | None = None,
         grad_units: bool = False,
+        unit_weights: bool = False,
     ) -> Iterator[Capture]:
-        """Record the named points (default: all residual points) and writer units."""
+        """Record the named points (default: all residual points) and writer units
+        (``unit_weights``: also each unit's weight norm and sum, as the pass had them)."""
         names = names if names is not None else [n for n in self.points if n.startswith("resid.")]
         missing = [n for n in names if n not in self.points]
         if missing:
@@ -649,6 +694,15 @@ class Probe:
                 kept = x if grad_units else x.detach()
                 result.units.setdefault(key, kept)
                 result.unit_calls.setdefault(key, []).append(kept)
+                if unit_weights and key not in result.unit_norms:
+                    role = self.ir.primary_role(key)
+                    if role is not None and role.in_dim is not None:
+                        with torch.no_grad():
+                            w = self.model.get_parameter(key).detach().float()
+                            if w.dim() == 2:
+                                result.unit_norms[key] = w.norm(dim=1 - role.in_dim)
+                                result.unit_sums[key] = w.sum(dim=1 - role.in_dim)
+                            del w
 
             handles.append(module.register_forward_pre_hook(grab))
         try:

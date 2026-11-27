@@ -14,6 +14,7 @@ entries of the tensors it touched.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -182,7 +183,7 @@ class ModelIndex:
 
 def build_index(
     ir: ModelIR,
-    params: dict[str, torch.Tensor],
+    params: Mapping[str, torch.Tensor],
     *,
     names: list[str] | None = None,
     vocab: bool = True,

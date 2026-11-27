@@ -10,9 +10,11 @@ weights; a forward pass costs one trip of the stacks over PCIe.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+import gc
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 from torch import nn
@@ -57,6 +59,14 @@ class Streamed:
     device: torch.device
     blocks: list[nn.Module]
     handles: list[Any] = field(default_factory=list)
+    weights: Any = None
+    """The :class:`wspx.lab.weights.LiveWeights` the blocks are read from (``None``: they
+    are held in host memory)."""
+    live: dict[int, list[tuple[int, str]]] = field(default_factory=dict)
+    """Storage of a block's parameter values while the block runs → (block, parameter) of
+    each parameter in it (several when a conversion splits one tensor into views)."""
+    fetch: Callable[[int], dict[str, torch.Tensor]] | None = None
+    """A block's parameter values on the GPU, by name, as its forward pass gets them."""
 
     @property
     def resident_bytes(self) -> int:
@@ -121,25 +131,36 @@ def stream(
                     p.data = host.pin_memory() if pin and torch.cuda.is_available() else host
     if torch.cuda.is_available():
         torch.cuda.empty_cache()  # what moved off is free for vLLM
-    out = Streamed(model, device, blocks)
+    out = Streamed(model, device, blocks, weights=weights)
+    index = {id(b): i for i, b in enumerate(blocks)}
 
     held: dict[int, torch.Tensor] = {}  # a block's parameter → what it held before its turn
 
-    def bring(block: nn.Module, *_: Any, **__: Any) -> None:
-        from wspx.lab.weights import fill, is_placeholder
+    def fetch(i: int) -> dict[str, torch.Tensor]:
+        from wspx.lab.weights import is_placeholder
 
-        params = _params(block)
+        params = _params(blocks[i])
         if weights is not None:
             wanted = [names[id(p)] for p in params if is_placeholder(p)]
             values = weights.layer(wanted, device)
-            for p in params:
-                v = values.get(names[id(p)])
-                if v is not None:
-                    held[id(p)] = fill(p, v if v.dtype == p.dtype else v.to(p.dtype))
-            return
-        for p in params:
-            if p.device.type == "cpu":
-                held[id(p)] = fill(p, p.data.to(device, non_blocking=True))
+            dtypes = {names[id(p)]: p.dtype for p in params}
+            return {n: v if v.dtype == dtypes[n] else v.to(dtypes[n]) for n, v in values.items()}
+        return {
+            names[id(p)]: p.data.to(device, non_blocking=True)
+            for p in params
+            if p.device.type == "cpu"
+        }
+
+    def bring(block: nn.Module, *_: Any, **__: Any) -> None:
+        from wspx.lab.weights import fill
+
+        i = index[id(block)]
+        values = fetch(i)
+        for p in _params(block):
+            v = values.get(names[id(p)])
+            if v is not None:
+                held[id(p)] = fill(p, v)
+                out.live.setdefault(v.untyped_storage().data_ptr(), []).append((i, names[id(p)]))
 
     def drop(block: nn.Module, *_: Any, **__: Any) -> None:
         from wspx.lab.weights import fill
@@ -147,7 +168,10 @@ def stream(
         for p in _params(block):
             before = held.pop(id(p), None)
             if before is not None:
+                out.live.pop(p.data.untyped_storage().data_ptr(), None)
                 fill(p, before)
+
+    out.fetch = fetch
 
     for block in blocks:
         out.handles.append(block.register_forward_pre_hook(bring, with_kwargs=True))
@@ -186,3 +210,87 @@ def device_of(model: nn.Module) -> torch.device:
     if streamed is not None:
         return torch.device(streamed.device)
     return next(model.parameters()).device
+
+
+def release_gpu() -> None:
+    """Give back the GPU memory torch's allocator keeps cached: vLLM shares the GPU, and
+    what a probe left cached is not there for its next push."""
+    if torch.cuda.is_available():
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+class _Saved(NamedTuple):
+    """A weight autograd saved for backward, by reference: read again when it is needed."""
+
+    block: int
+    name: str
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+    offset: int
+    dtype: torch.dtype
+    nbytes: int
+
+
+@contextmanager
+def refetch_weights(model: nn.Module) -> Iterator[None]:
+    """Backward through a streamed model. Autograd saves the weights an op used, and a
+    streamed block's weights are gone once its forward pass is done (its parameters hold
+    placeholders or host copies again). Saved weights are kept as references instead, and
+    read again a block at a time when backward reaches them."""
+    streamed: Streamed | None = getattr(model, "_wspx_streamed", None)
+    if streamed is None or streamed.fetch is None:
+        yield
+        return
+    fetch = streamed.fetch
+    cache: dict[int, dict[str, torch.Tensor]] = {}
+
+    def pack(t: torch.Tensor) -> Any:
+        try:
+            ptr = t.untyped_storage().data_ptr()
+        except (RuntimeError, NotImplementedError):  # a tensor without plain storage
+            return t
+        hits = streamed.live.get(ptr) if ptr else None
+        if not hits:
+            return t
+        return _Saved(
+            hits[0][0],
+            hits[0][1],
+            tuple(t.shape),
+            tuple(t.stride()),
+            int(t.storage_offset()),
+            t.dtype,
+            t.untyped_storage().nbytes(),
+        )
+
+    def unpack(saved: Any) -> torch.Tensor:
+        if not isinstance(saved, _Saved):
+            return saved  # type: ignore[no-any-return]
+        values = cache.get(saved.block)
+        if values is None:
+            cache.clear()  # one block at a time, as forward had them
+            values = cache[saved.block] = fetch(saved.block)
+        v = values[saved.name]
+        if v.dtype != saved.dtype or v.untyped_storage().nbytes() != saved.nbytes:
+            from wspx.errors import WspxError
+
+            raise WspxError(
+                f"{saved.name}: read again for backward, its values are laid out differently "
+                "than in the forward pass"
+            )
+        return v.as_strided(saved.shape, saved.stride, saved.offset)
+
+    try:
+        with torch.autograd.graph.saved_tensors_hooks(pack, unpack):
+            yield
+    finally:
+        cache.clear()
+
+
+def live_params(model: nn.Module, ptr: int) -> list[tuple[str, torch.Tensor]]:
+    """The parameters of a streamed model whose values are in the storage at ``ptr`` now
+    (a block's weights are there only while the block runs)."""
+    streamed: Streamed | None = getattr(model, "_wspx_streamed", None)
+    if streamed is None or not ptr:
+        return []
+    return [(name, model.get_parameter(name)) for _, name in streamed.live.get(ptr, [])]

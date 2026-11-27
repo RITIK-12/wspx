@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 import re
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -19,8 +19,9 @@ from wspx.errors import WspxError
 from wspx.lab.index import tensor_stats
 from wspx.lab.ir.model_ir import ModelIR, Target
 from wspx.lab.media import is_media
-from wspx.lab.offload import device_of
+from wspx.lab.offload import device_of, refetch_weights
 from wspx.lab.probe import (
+    Capture,
     ExpertWrites,
     Probe,
     expert_writers,
@@ -43,7 +44,7 @@ BARS = " ▏▎▍▌▋▊▉█"
 
 def show(
     ir: ModelIR,
-    params: dict[str, torch.Tensor],
+    params: Mapping[str, torch.Tensor],
     target: Target,
     *,
     text: Text | None = None,
@@ -147,7 +148,7 @@ def magnitude_map(view: torch.Tensor, cells: int = 48) -> dict[str, Any]:
 
 def _vocab_of_vector(
     ir: ModelIR,
-    params: dict[str, torch.Tensor],
+    params: Mapping[str, torch.Tensor],
     vec: torch.Tensor,
     kind: str,
     final_scale: torch.Tensor | None,
@@ -530,7 +531,7 @@ def forward_trace(
     units = writer_units(ir)
     with (
         torch.no_grad(),
-        probe.capture(list(dict.fromkeys(wanted)), units=units) as cap,
+        probe.capture(list(dict.fromkeys(wanted)), units=units, unit_weights=True) as cap,
         expert_writes(model, ir) as expert_out,
     ):
         logits = forward(model, ir, ids, mask, batch.extra)
@@ -563,7 +564,9 @@ def forward_trace(
             lens = torch.log_softmax(unembed(norm(last[:, -1:])).float()[0, -1], dim=-1)
             real = final[-1].clamp_min(1e-30)
             lens_kl = float((real * (real.log() - lens)).sum())
-    writers = _top_writers(model, ir, cap.unit_calls, tuple(ids.shape), top=top)
+    writers = _top_writers(
+        model, ir, cap.unit_calls, tuple(ids.shape), top=top, norms=cap.unit_norms
+    )
     writers = sorted(
         [*writers, *_top_expert_writers(model, ir, expert_out, top=top)], key=lambda x: -abs(x[1])
     )[: top * 4]
@@ -678,20 +681,26 @@ def _top_writers(
     *,
     top: int,
     position: int = -1,
+    norms: dict[str, torch.Tensor] | None = None,
 ) -> list[tuple[str, float]]:
     """Units whose contribution ``a_j · ‖w_j‖`` to the residual is largest at ``position``,
-    on every call of their module over the prompt (a pass of a looped layer is tagged ``@k``)."""
+    on every call of their module over the prompt (a pass of a looped layer is tagged ``@k``).
+    ``norms``: each writer's ‖w_j‖ as the forward pass had its weights."""
     scored: list[tuple[str, float]] = []
-    params = dict(model.named_parameters())
     for param, every in unit_calls.items():
         role = ir.primary_role(param)
         calls = token_calls(every, tokens)
         if role is None or role.in_dim is None:
             continue
-        norms = _unit_norms(params[param], role.in_dim)
+        found = (norms or {}).get(param)
+        unit = found if found is not None else _unit_norms(current_value(model, param), role.in_dim)
         for k, acts in enumerate(calls, start=1):
             a = acts[0, position].float()
-            scored.extend(_unit_scores(role, a * norms, top, pass_suffix(ir, param, len(calls), k)))
+            scored.extend(
+                _unit_scores(
+                    role, a * unit.to(a.device), top, pass_suffix(ir, param, len(calls), k)
+                )
+            )
     scored.sort(key=lambda x: -abs(x[1]))
     return scored[: top * 4]
 
@@ -721,15 +730,12 @@ def _top_expert_writers(
     """Expert units by what they wrote at the last token, ``weight · a_j · ‖w_j‖`` (the routing
     weight scales the expert's output), on every call of their module (``@k`` on a pass).
     Seen live: on Inkling every MLP write is an expert's, and the trace ranked attention only."""
-    params = dict(model.named_parameters())
     scored: list[tuple[str, float]] = []
     for param, calls in routed.calls.items():
         for k, experts in enumerate(calls, start=1):
             suffix = pass_suffix(ir, param, len(calls), k)
             for e, (a, weight) in experts.items():
-                score = (
-                    weight * a.to(params[param].device) * _expert_norms(params[param], ir, param, e)
-                )
+                score = weight * a.float() * _routed_norms(model, ir, routed, param, e).to(a.device)
                 n = min(top, score.numel())
                 for j in torch.topk(score.abs(), k=n).indices.tolist():
                     scored.append((_expert_unit(ir, param, e, j) + suffix, float(score[j])))
@@ -738,25 +744,55 @@ def _top_expert_writers(
 
 
 def _write_norms(
-    model: torch.nn.Module, ir: ModelIR, units: list[str], routed: ExpertWrites
+    model: torch.nn.Module,
+    ir: ModelIR,
+    units: list[str],
+    routed: ExpertWrites,
+    cap: Capture | None = None,
 ) -> dict[Any, Any]:
     """‖w_j‖ of every writer unit under the weights loaded now: 2-D writers by tensor, and
-    each expert routed in ``routed`` by ``(tensor, expert)``."""
-    params = dict(model.named_parameters())
+    each expert routed in ``routed`` by ``(tensor, expert)``; as the forward pass had them
+    (``cap`` with ``unit_weights``), else read now."""
     norms: dict[Any, Any] = {}
     sums: dict[str, torch.Tensor] = {}
     for param in units:
         role = ir.primary_role(param)
-        if role is not None and role.in_dim is not None:
-            norms[param] = _unit_norms(params[param], role.in_dim)
-            w = params[param].detach().float()
-            # with the norms, a unit's column sum tells an edited unit from an unedited one
-            sums[param] = w.sum(dim=1 - role.in_dim) if w.dim() == 2 else norms[param]
+        if role is None or role.in_dim is None:
+            continue
+        if cap is not None and param in cap.unit_norms:
+            norms[param], sums[param] = cap.unit_norms[param], cap.unit_sums[param]
+            continue
+        w = current_value(model, param).detach().float()
+        norms[param] = _unit_norms(w, role.in_dim)
+        # with the norms, a unit's column sum tells an edited unit from an unedited one
+        sums[param] = w.sum(dim=1 - role.in_dim) if w.dim() == 2 else norms[param]
     norms["sums"] = sums
     for param, calls in routed.calls.items():
         for e in {e for experts in calls for e in experts}:
-            norms[(param, e)] = _expert_norms(params[param], ir, param, e)
+            norms[(param, e)] = _routed_norms(model, ir, routed, param, e)
     return norms
+
+
+def current_value(model: torch.nn.Module, name: str) -> torch.Tensor:
+    """A parameter's value now. A streamed model's layers hold their weights only during
+    their own forward pass (placeholders or host copies otherwise): read from the working
+    tree's live weights, or from the host copy."""
+    streamed = getattr(model, "_wspx_streamed", None)
+    weights = getattr(streamed, "weights", None)
+    if weights is not None:
+        value: torch.Tensor = weights[name]
+        return value
+    return model.get_parameter(name)
+
+
+def _routed_norms(
+    model: torch.nn.Module, ir: ModelIR, routed: ExpertWrites, param: str, expert: int
+) -> torch.Tensor:
+    """‖w_j‖ of one expert's writer, as the forward pass had it (else read now)."""
+    found = routed.norms.get((param, expert))
+    if found is not None:
+        return found
+    return _expert_norms(current_value(model, param), ir, param, expert)
 
 
 def _moved_expert_units(
@@ -836,17 +872,20 @@ def diff_trace(
     points = [point for _, point in calls]
     units = writer_units(ir)
     with torch.no_grad():
-        with probe.capture(points, units=units) as here, expert_writes(model, ir) as routed_here:
+        with (
+            probe.capture(points, units=units, unit_weights=True) as here,
+            expert_writes(model, ir) as routed_here,
+        ):
             logits_here = forward(model, ir, ids, mask, batch.extra)
-        norms_here = _write_norms(model, ir, units, routed_here)
+        norms_here = _write_norms(model, ir, units, routed_here, here)
         with (
             switch,
-            probe.capture(points, units=units) as there,
+            probe.capture(points, units=units, unit_weights=True) as there,
             expert_writes(model, ir) as routed_there,
         ):
             logits_there = forward(model, ir, ids, mask, batch.extra)
             # each side's own weights: an edited unit writes differently on the same input
-            norms_there = _write_norms(model, ir, units, routed_there)
+            norms_there = _write_norms(model, ir, units, routed_there, there)
     labels, divergence = [], []
     for label, p in calls:
         if p not in here.points or p not in there.points:
@@ -957,7 +996,11 @@ def attribution_trace(
     for p in model.parameters():
         p.requires_grad_(False)
     try:
-        with torch.enable_grad(), probe.capture([], units=units, grad_units=True) as fail:
+        with (
+            torch.enable_grad(),
+            refetch_weights(model),  # a streamed layer's weights, read again for backward
+            probe.capture([], units=units, grad_units=True) as fail,
+        ):
             logits = _forward_with_grad(model, ir, ids_f, mask_f, batch_f.extra)
             logp = torch.log_softmax(logits[0, -1].float(), dim=-1)
             tid = text.token_id(target) if target is not None else int(logp.argmax())

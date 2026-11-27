@@ -437,7 +437,7 @@ class Lab:
         if scope is None:
             scope = _default_scope(expression)
         env = Environment(
-            self.ir, dict(self.params), token_id=self._token_or_id, direction=self.direction
+            self.ir, self.params, token_id=self._token_or_id, direction=self.direction
         )
         result = grep(env, expression, self.resolve(scope), axis=axis, keep=keep)
         return self._register_hits(result, ("grep", _scope_label(scope)), name, top)
@@ -739,7 +739,7 @@ class Lab:
         infos = [
             analysis.show(
                 self.ir,
-                dict(self.params),
+                self.params,
                 t,
                 text=self.text,
                 values=values,
@@ -1432,7 +1432,7 @@ class Lab:
         touched = sorted({t for r in self.staged for t in r.tensors})
         self.staged = []
         if self.index is not None:
-            self.index = build_index(self.ir, dict(self.params), names=touched, existing=self.index)
+            self.index = build_index(self.ir, self.params, names=touched, existing=self.index)
         self._save()
         warn = f" ({len(report.warnings)} warning(s))" if report.warnings else ""
         return ToolResult(
