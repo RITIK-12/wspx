@@ -3985,6 +3985,7 @@ driver = [
     { name = "anthropic" },
     { name = "google-genai" },
     { name = "openai" },
+    { name = "pillow" },
 ]
 gateway = [
     { name = "starlette" },
@@ -4046,6 +4047,7 @@ requires-dist = [
     { name = "peft", marker = "extra == 'all'", specifier = ">=0.22" },
     { name = "peft", marker = "extra == 'peft'", specifier = ">=0.22" },
     { name = "pillow", marker = "extra == 'all'", specifier = ">=11" },
+    { name = "pillow", marker = "extra == 'driver'", specifier = ">=11" },
     { name = "pillow", marker = "extra == 'lab'", specifier = ">=11" },
     { name = "pyarrow", marker = "extra == 'all'", specifier = ">=26" },
     { name = "pyarrow", marker = "extra == 'control'", specifier = ">=26" },
