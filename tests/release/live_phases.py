@@ -134,9 +134,9 @@ def run(model: str, edits: list[dict[str, Any]], out: str) -> None:
 
 QWEN_EDITS = [
     {"label": "scale an MLP writer (L14 down_proj) by 0.9", "op": "scale",
-     "args": {"targets": "L14.mlp.down", "factor": 0.9}},
+     "args": {"targets": "L14.mlp.down_proj", "factor": 0.9}},
     {"label": "scale attention output (L3 o_proj) by 1.2", "op": "scale",
-     "args": {"targets": "L3.attn.o", "factor": 1.2}},
+     "args": {"targets": "L3.self_attn.o_proj", "factor": 1.2}},
 ]  # fmt: skip
 INKLING_EDITS = [
     {"label": "nvfp4 scale, experts 0-15 of L5", "op": "scale",

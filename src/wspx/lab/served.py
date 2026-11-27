@@ -81,7 +81,7 @@ class Served:
         qc = src.path / "hf_quant_config.json"
         if qc.is_file():
             rules = quant.rules_from(json.loads(qc.read_text()))
-        formats = quant.formats(src.tensors, rules)
+        formats = quant.formats(src.tensors, rules, src.quantization)
         if not formats:
             return None
         return cls(model, src, keep_scales, formats)
@@ -124,23 +124,28 @@ class Served:
         """``value`` written in the stored format (changing nothing here): the checkpoint
         tensors, how much of ``value - base`` survived, and what loading them gives.
         ``None`` when ``value`` equals ``base``."""
-        # re-encoding runs on the GPU when there is one (the lab's values may be on the host)
-        device = torch.device("cuda") if torch.cuda.is_available() else value.device
-        delta = value.to(device).float() - base.to(device).float()
+        # the full tensors stay where the lab keeps its values (the host, when vLLM holds the
+        # model); decoding and encoding run on the GPU, an expert at a time
+        compute = torch.device("cuda") if torch.cuda.is_available() else value.device
+        home = value.device
+        delta = value.float() - base.to(home).float()
         if not bool(delta.ne(0).any()):
             return None
         ck_delta = checkpoint.to_checkpoint(self.model, {name: delta})
-        plain = checkpoint.to_checkpoint(self.model, {name: value.to(device)})
+        del delta
         parts: dict[str, torch.Tensor] = {}
         blocks = values = clipped = rescaled = 0
         kinds = set()
+        plain_values: dict[str, torch.Tensor] | None = None
         for ck, d in ck_delta.items():
             fmt = self.formats.get(ck)
-            if fmt is None:
-                parts[ck] = plain[ck]
+            if fmt is None:  # a fused tensor's unquantized part
+                if plain_values is None:
+                    plain_values = checkpoint.to_checkpoint(self.model, {name: value})
+                parts[ck] = plain_values[ck]
                 continue
-            stored = self._read(fmt.parts, device)
-            done = quant.requantize(fmt, stored, d, keep_scales=self.keep_scales)
+            stored = self._read(fmt.parts, home)
+            done = quant.requantize(fmt, stored, d, keep_scales=self.keep_scales, compute=compute)
             parts.update(done.parts)
             blocks, values, clipped = (
                 blocks + done.blocks,
@@ -149,16 +154,20 @@ class Served:
             )
             rescaled += done.rescaled
             kinds.add(fmt.kind.upper())
-        live = checkpoint.from_checkpoint(self.model, parts)[name].to(base.dtype)
-        served = live.float() - base.to(device).float()
-        norm = float(delta.norm())
+        on_gpu = {k: v.to(compute) for k, v in parts.items()}
+        live = checkpoint.from_checkpoint(self.model, quant.plain(self.formats, on_gpu))[name]
+        del on_gpu
+        live = live.to(device=home, dtype=base.dtype)
+        intended = value.float() - base.to(home).float()
+        served = live.float() - base.to(home).float()
+        norm = float(intended.norm())
         ratio = float(served.norm()) / norm if norm else 0.0
         cos = float(
-            (served.flatten() @ delta.flatten()) / (served.norm() * delta.norm()).clamp_min(1e-30)
+            (served.flatten() @ intended.flatten())
+            / (served.norm() * intended.norm()).clamp_min(1e-30)
         )
+        del served, intended
         cos = 0.0 if math.isnan(cos) else cos
-        live = live.to(base.device)
-        parts = {k: v.to(base.device) for k, v in parts.items()}  # kept beside the lab's values
         survival = Survival(
             name,
             "/".join(sorted(kinds)),
@@ -200,12 +209,15 @@ def unwritable(src: checkpoint.Source | None) -> str:
     qc = src.path / "hf_quant_config.json"
     if qc.is_file():
         rules = quant.rules_from(json.loads(qc.read_text()))
-    formats = quant.formats(src.tensors, rules)
+    formats = quant.formats(src.tensors, rules, src.quantization)
     covered = {part for fmt in formats.values() for part in fmt.parts}
+    from wspx.lab.codecs import ACTIVATION_AUX
+
     stray = sorted(
         name
         for name, (dtype, _) in src.tensors.items()
         if name not in covered
+        and name.rsplit(".", 1)[-1] not in ACTIVATION_AUX
         and (dtype in QUANTIZED_DTYPES or checkpoint.QUANT_AUX.search(name) is not None)
     )
     if not stray:

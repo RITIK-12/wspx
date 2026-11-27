@@ -121,6 +121,10 @@ class CheckpointReader:
         checkpoint tensors see all of them), converted and dequantized on ``device``."""
         keys = sorted({k for n in names for k in self.checkpoint_names(n)})
         raw = self._read(keys, device)
+        if self.served is not None:  # formats transformers does not decode: wspx does
+            from wspx.lab import quant
+
+            raw = quant.plain(self.served.formats, raw)
         loaded = checkpoint.from_checkpoint(self.model, raw)
         out: dict[str, torch.Tensor] = {}
         for n in names:

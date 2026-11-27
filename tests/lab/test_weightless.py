@@ -140,3 +140,89 @@ def test_edits_reach_vllm_from_a_lab_without_weights(tmp_path: Path) -> None:
     light.generate(PROMPTS, max_tokens=3)
     for n, p in worker.model.named_parameters():
         assert torch.equal(p.detach(), light.params[n].detach().cpu()), n
+
+
+def _quantized_checkpoint(path: Path, kind: str) -> dict[str, torch.Tensor]:
+    """tiny_llama written as a GPTQ or FP8-tiled checkpoint, as those quantizers write it."""
+    import json
+
+    from safetensors.torch import save_file
+
+    from tests.lab.test_codecs import _fp8_block, _gptq
+
+    model = tiny_llama()
+    path.mkdir()
+    model.config.architectures = ["LlamaForCausalLM"]
+    model.config.save_pretrained(path)
+    out: dict[str, torch.Tensor] = {}
+    for name, p in model.named_parameters():
+        w = p.detach().float()
+        stem = name.removesuffix(".weight")
+        if ".layers." in name and w.dim() == 2 and "norm" not in name:
+            if kind == "gptq":
+                t = _gptq(w, 4, 16, torch.randperm(w.shape[1]))
+                t.pop("_q")
+                out.update({f"{stem}.{k.removeprefix('m.')}": v for k, v in t.items()})
+            else:
+                codes, s = _fp8_block(w, 16)
+                out[name], out[f"{stem}.weight_scale_inv"] = codes, s
+                out[f"{stem}.input_scale"] = torch.ones(1)
+        else:
+            out[name] = p.detach().to(torch.bfloat16)
+    save_file(out, str(path / "model.safetensors"))
+    cfg = json.loads((path / "config.json").read_text())
+    cfg["quantization_config"] = (
+        {"quant_method": "gptq", "bits": 4, "group_size": 16, "sym": True, "desc_act": True}
+        if kind == "gptq"
+        else {"quant_method": "fp8", "weight_block_size": [16, 16], "activation_scheme": "dynamic"}
+    )
+    (path / "config.json").write_text(json.dumps(cfg))
+    return out
+
+
+@pytest.mark.parametrize("kind", ["gptq", "fp8"])
+def test_a_quantized_checkpoint_is_read_edited_and_written_in_its_format(
+    tmp_path: Path, kind: str
+) -> None:
+    from safetensors.torch import load_file
+
+    from wspx.lab import quant
+
+    ckpt = tmp_path / "ckpt"
+    stored = _quantized_checkpoint(ckpt, kind)
+    (tmp_path / "w").mkdir()
+    lab = open_lab(str(ckpt), store=tmp_path / "s", workdir=tmp_path / "w", weights="checkpoint")
+    served = lab.tree.served
+    assert served is not None
+    name = "model.layers.1.mlp.down_proj.weight"
+    fmt = served.formats[name]
+    assert fmt.kind == kind
+    expected = quant.decode(fmt, {k: stored[k] for k in fmt.parts}).to(torch.bfloat16)
+    assert torch.equal(lab.params[name].cpu(), expected)
+    assert torch.isfinite(logits(lab)).all()
+    ref = lab.edit.scale("L1.mlp.down_proj", factor=1.1)
+    (survival,) = [d for d in ref.report.diagnostics if d.code == "W205"]
+    assert f"survives {kind.upper()}" in survival.message
+    parts = served.stored(name)
+    assert parts is not None
+    assert set(parts) == set(fmt.parts)
+    assert torch.equal(lab.params[name].cpu(), quant.decode(fmt, parts).to(torch.bfloat16))
+    lab.export("merged", "../out")
+    written = load_file(str(tmp_path / "out" / "model.safetensors"))
+
+    def raw(t: torch.Tensor) -> torch.Tensor:
+        return t.contiguous().view(torch.uint8)
+
+    edited = [k for k in fmt.parts if not torch.equal(raw(written[k]), raw(stored[k]))]
+    # GPTQ moves codes, and groups pushed past their range get larger scales (zeros and the
+    # group map stay); FP8 grows each tile's scale by 1.1, leaving every code as it was
+    stem = "model.layers.1.mlp.down_proj"
+    expect = (
+        [f"{stem}.qweight", f"{stem}.scales"] if kind == "gptq" else [f"{stem}.weight_scale_inv"]
+    )
+    assert edited == expect, edited
+    for k, v in stored.items():
+        if ".layers.0." in k or ".layers.2." in k:
+            assert torch.equal(raw(written[k]), raw(v)), k
+    if kind == "fp8":
+        assert "model.layers.0.mlp.down_proj.input_scale" in written

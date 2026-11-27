@@ -1,4 +1,5 @@
-"""Block-quantized weight formats wspx writes edits in: NVFP4 and MXFP8.
+"""Block-quantized weight formats wspx writes edits in: NVFP4 and MXFP8 (the rest of the
+formats vLLM serves are in :mod:`wspx.lab.codecs`).
 
 A checkpoint stored quantized is dequantized when transformers loads it, so the lab edits
 bf16 values; what a runtime serves is the checkpoint's codes. To write an edit in the
@@ -152,28 +153,66 @@ class Format:
     """How one checkpoint tensor is stored, and the tensors that carry its scales."""
 
     kind: str
-    """``nvfp4`` or ``mxfp8``."""
+    """``nvfp4``, ``mxfp8``, or one of :mod:`wspx.lab.codecs`' (``fp8``, ``int8``,
+    ``intpack``, ``gptq``, ``awq``, ``mxfp4``)."""
     weight: str
     scale: str
     amax: str | None = None
     denominator: str | None = None
     rule: str = "fouroversix_mae"
+    plain: str = ""
+    """The float tensor's name in an unquantized checkpoint ("": ``weight``'s)."""
+    native: bool = False
+    """transformers' own conversion decodes it when it loads (Inkling's experts); otherwise
+    wspx decodes it before converting."""
+    global_scale: str | None = None
+    """NVFP4 (ModelOpt): the per-tensor ``weight_scale_2``."""
+    zeros: str | None = None
+    g_idx: str | None = None
+    shape_name: str | None = None
+    bits: int = 0
+    tile: tuple[int, int] | None = None
+    """FP8 scales per tile of the weight (``weight_block_size``)."""
+    transposed: bool = False
+    sym: bool = True
+    v1: bool = True
+    """GPTQ's v1 checkpoint format: zeros stored minus one."""
+
+    @property
+    def name(self) -> str:
+        return self.plain or self.weight
 
     @property
     def parts(self) -> list[str]:
-        return [n for n in (self.weight, self.scale, self.amax, self.denominator) if n]
+        names = (
+            self.weight,
+            self.scale,
+            self.amax,
+            self.denominator,
+            self.global_scale,
+            self.zeros,
+            self.g_idx,
+            self.shape_name,
+        )
+        return [n for n in names if n]
 
     def block(self) -> int:
         return NVFP4_BLOCK if self.kind == "nvfp4" else MXFP8_BLOCK
 
 
 def formats(
-    tensors: dict[str, tuple[str, tuple[int, ...]]], rules: dict[str, str] | None = None
+    tensors: dict[str, tuple[str, tuple[int, ...]]],
+    rules: dict[str, str] | None = None,
+    config: dict[str, object] | None = None,
 ) -> dict[str, Format]:
-    """Quantized checkpoint tensors, recognized by their scale tensors' names and dtypes:
-    ``<w>_scale`` (float8) with ``<w>_amax`` is NVFP4; ``<w>_scale`` (uint8) beside a
-    float8 ``<w>`` is MXFP8."""
-    out: dict[str, Format] = {}
+    """Quantized checkpoint tensors by plain name, recognized by their scale tensors' names
+    and dtypes: Inkling's ``<w>_scale`` (float8) with ``<w>_amax`` is NVFP4 and
+    ``<w>_scale`` (uint8) beside a float8 ``<w>`` is MXFP8 (both decoded by transformers'
+    own conversion); the rest are :func:`wspx.lab.codecs.detect`'s (``config``: the
+    checkpoint's ``quantization_config``)."""
+    from wspx.lab import codecs
+
+    out: dict[str, Format] = codecs.detect(tensors, config)
     for name, (dtype, _) in tensors.items():
         scale = tensors.get(f"{name}_scale")
         if scale is None:
@@ -188,9 +227,10 @@ def formats(
                 if f"{name}_outer_scale_denominator" in tensors
                 else None,
                 (rules or {}).get(name, "fouroversix_mae"),
+                native=True,
             )
         elif scale[0] == "U8" and dtype.startswith("F8"):
-            out[name] = Format("mxfp8", name, f"{name}_scale")
+            out[name] = Format("mxfp8", name, f"{name}_scale", native=True)
     return out
 
 
@@ -207,13 +247,33 @@ def rules_from(config: dict[str, object] | None) -> dict[str, str]:
 
 
 def decode(fmt: Format, parts: dict[str, torch.Tensor]) -> torch.Tensor:
-    """The fp32 values a format's tensors hold."""
+    """The fp32 values a format's tensors hold (in the plain checkpoint's layout)."""
     if fmt.kind == "nvfp4":
         return nvfp4_decode(parts[fmt.weight], parts[fmt.scale], _factor(fmt, parts))
-    return mxfp8_decode(parts[fmt.weight], parts[fmt.scale])
+    if fmt.kind == "mxfp8":
+        return mxfp8_decode(parts[fmt.weight], parts[fmt.scale])
+    from wspx.lab import codecs
+
+    return codecs.decode(fmt, parts)
+
+
+def plain(formats: dict[str, Format], tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Checkpoint tensors with every wspx-decoded format's parts replaced by the float
+    tensor an unquantized checkpoint holds (what transformers' conversion then takes)."""
+    out = dict(tensors)
+    for fmt in formats.values():
+        if fmt.native or fmt.weight not in tensors:
+            continue
+        value = decode(fmt, {k: tensors[k] for k in fmt.parts if k in tensors})
+        for k in fmt.parts:
+            out.pop(k, None)
+        out[fmt.name] = value
+    return out
 
 
 def _factor(fmt: Format, parts: dict[str, torch.Tensor]) -> torch.Tensor:
+    if fmt.global_scale:
+        return parts[fmt.global_scale].float().reshape(-1)[:1]
     amax = parts[fmt.amax].float() if fmt.amax else torch.ones(1)
     den = parts[fmt.denominator].float() if fmt.denominator else torch.ones(1)
     return amax / den
@@ -241,22 +301,38 @@ def requantize(
     delta: torch.Tensor,
     *,
     keep_scales: bool = False,
+    compute: torch.device | None = None,
 ) -> Requantized:
     """``quantize(dequantize(W) + Δ)`` on the blocks where ``Δ`` is nonzero.
 
     ``delta`` is in the checkpoint's layout (``to_checkpoint`` of the in-memory delta).
     Only experts (leading index) with a nonzero delta are decoded. ``keep_scales`` keeps
-    each touched block's scale and changes only its codes.
+    each touched block's scale and changes only its codes. ``compute``: where the decoding
+    and encoding run (one expert at a time; the result stays on ``parts``' device).
     """
+    home = parts[fmt.weight].device
+    if fmt.kind not in ("nvfp4", "mxfp8"):
+        from wspx.lab import codecs
+
+        dev = compute or home
+        done = codecs.requantize(
+            fmt,
+            {k: v.to(dev) for k, v in parts.items()},
+            delta.to(dev),
+            keep_scales=keep_scales,
+        )
+        done.parts = {k: v.to(home) for k, v in done.parts.items()}
+        return done
     weight, scale = parts[fmt.weight], parts[fmt.scale]
+    dev = compute or home
     n = fmt.block()
-    d = delta.float().to(weight.device)
+    d = delta.float().to(home)
     if d.dim() == 2:
         d, weight, scale = d.unsqueeze(0), weight.unsqueeze(0), scale.unsqueeze(0)
         squeeze = True
     else:
         squeeze = False
-    factor = _factor(fmt, parts).to(weight.device).reshape(-1)
+    factor = _factor(fmt, parts).to(home).reshape(-1)
     new_w, new_s = weight.clone(), scale.clone()
     amax = parts[fmt.amax].float().reshape(-1).clone() if fmt.amax else None
     den = parts[fmt.denominator].float().reshape(-1)[0] if fmt.denominator else torch.tensor(1.0)
@@ -264,15 +340,17 @@ def requantize(
     blocks = values = clipped = rescaled = 0
     touched_experts = d.flatten(1).ne(0).any(1).nonzero().flatten().tolist()
     for e in touched_experts:
-        w_e, s_e = weight[e], scale[e]
-        f = factor[e] if factor.numel() > 1 else factor[0]
-        x = (nvfp4_decode(w_e, s_e, f) if fmt.kind == "nvfp4" else mxfp8_decode(w_e, s_e)) + d[e]
-        hit = _blocks(d[e], n).ne(0).any(-1)  # (rows, blocks)
+        w_e, s_e, d_e = weight[e].to(dev), scale[e].to(dev), d[e].to(dev)
+        f = (factor[e] if factor.numel() > 1 else factor[0]).to(dev)
+        x = (nvfp4_decode(w_e, s_e, f) if fmt.kind == "nvfp4" else mxfp8_decode(w_e, s_e)) + d_e
+        hit = _blocks(d_e, n).ne(0).any(-1)  # (rows, blocks)
         if fmt.kind == "nvfp4" and not keep_scales and per_expert and amax is not None:
-            peak = x.abs().max()
-            if peak > amax[e] * (1 + 1e-6):  # a block scale cannot exceed 448 at the old factor
+            peak = float(x.abs().max())
+            if peak > float(amax[e]) * (
+                1 + 1e-6
+            ):  # a block scale cannot exceed 448 at the old factor
                 amax[e] = peak
-                f = peak.to(den.device) / den
+                f = torch.tensor(peak / float(den), device=dev)
                 hit = torch.ones_like(hit)
                 rescaled += 1
         if fmt.kind == "nvfp4":
@@ -281,20 +359,22 @@ def requantize(
             limit = 7.0 * sc.float().unsqueeze(-1) * f
             over = (_blocks(x, n).abs() > limit * (1 + 1e-6)) & hit.unsqueeze(-1)
             mask_bytes = hit.repeat_interleave(n // 2, dim=-1)
-            new_w[e] = torch.where(mask_bytes, codes, w_e)
+            out_w = torch.where(mask_bytes, codes, w_e)
         else:
             vals, sc = mxfp8_encode(x, scale=s_e if keep_scales else None)
             # past 464 (448 plus half E4M3's top step of 32) is saturation, not rounding
             limit = (FP8_MAX + 16.0) * torch.exp2(sc.float() - 127).unsqueeze(-1)
             over = (_blocks(x, n).abs() > limit * (1 + 1e-6)) & hit.unsqueeze(-1)
             mask_vals = hit.repeat_interleave(n, dim=-1)
-            new_w[e] = torch.where(mask_vals, vals.view(torch.uint8), w_e.view(torch.uint8)).view(
+            out_w = torch.where(mask_vals, vals.view(torch.uint8), w_e.view(torch.uint8)).view(
                 w_e.dtype
             )
-        new_s[e] = torch.where(hit, sc.view(torch.uint8), s_e.view(torch.uint8)).view(s_e.dtype)
+        out_s = torch.where(hit, sc.view(torch.uint8), s_e.view(torch.uint8)).view(s_e.dtype)
         blocks += int(hit.sum())
-        values += int((new_w[e].view(torch.uint8) != w_e.view(torch.uint8)).sum())
+        values += int((out_w.view(torch.uint8) != w_e.view(torch.uint8)).sum())
         clipped += int(over.sum())
+        new_w[e] = out_w.to(home)
+        new_s[e] = out_s.to(home)
     out = dict(parts)
     out[fmt.weight] = new_w.squeeze(0) if squeeze else new_w
     out[fmt.scale] = new_s.squeeze(0) if squeeze else new_s

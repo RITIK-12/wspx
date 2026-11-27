@@ -117,6 +117,11 @@ def export_merged(
             size += nbytes
             total += nbytes
             written[name] = (checkpoint.st_dtype(t), tuple(t.shape))
+    carried = _activation_scales(src, written) if served is not None else {}
+    for name, t in carried.items():  # never edited: as the source stores them
+        pending[name] = t
+        total += t.numel() * t.element_size()
+        written[name] = (checkpoint.st_dtype(t), tuple(t.shape))
     flush()
     files = []
     for i, names in enumerate(shards):
@@ -184,6 +189,27 @@ def export_merged(
         "notes": notes,
         "names": "checkpoint" if src and src.tensors else "loaded",
     }
+
+
+def _activation_scales(
+    src: checkpoint.Source | None, written: dict[str, tuple[str, tuple[int, ...]]]
+) -> dict[str, torch.Tensor]:
+    """The source's activation and KV-cache scales (not weights, so not in the lab)."""
+    from safetensors import safe_open
+
+    from wspx.lab.codecs import ACTIVATION_AUX
+
+    if src is None:
+        return {}
+    wanted = [k for k in src.tensors if k not in written and k.rsplit(".", 1)[-1] in ACTIVATION_AUX]
+    out: dict[str, torch.Tensor] = {}
+    for fname in sorted(src.weight_files):
+        with safe_open(str(src.path / fname), framework="pt") as fh:
+            keys = set(fh.keys())
+            for k in wanted:
+                if k in keys:
+                    out[k] = fh.get_tensor(k)
+    return out
 
 
 class _Live(MutableMapping[str, torch.Tensor]):

@@ -22,7 +22,8 @@ import torch
 _LAYER = re.compile(r"^(.*?\.(?:layers|h|blocks|block)\.\d+)\.")
 QUANT_AUX = re.compile(
     r"(_scale|_scale_inv|_scale_2|_amax|_outer_scale_denominator|\.scales|\.qzeros|\.g_idx"
-    r"|_zero_point|\.absmax|\.quant_map|\.quant_state\..*|\.SCB)$"
+    r"|_zero_point|\.absmax|\.quant_map|\.quant_state\..*|\.SCB|\.qweight|_packed"
+    r"|_shape|_g_idx|_blocks|_scales)$"
 )
 """Checkpoint tensors that only carry a quantized tensor's scales or packing metadata."""
 
