@@ -56,6 +56,39 @@ class _JSON(JSONResponse):
         ).encode()
 
 
+class JobCancelled(BaseException):
+    """Raised inside a background job's thread to stop it (a BaseException, so no tool's
+    ``except Exception`` swallows it; ``finally`` blocks, such as restoring weights, run)."""
+
+
+@dataclasses.dataclass
+class Job:
+    id: str
+    tool: str
+    args: dict[str, Any]
+    call_id: str
+    context: dict[str, Any]
+    status: str = "queued"
+    """queued · running · done · failed · cancelled"""
+    started: float = 0.0
+    finished: float | None = None
+    result: dict[str, Any] | None = None
+    thread: threading.Thread | None = None
+
+    def view(self, progress: Any = None) -> dict[str, Any]:
+        out = {
+            "job": self.id,
+            "tool": self.tool,
+            "status": self.status,
+            "started": self.started,
+            "finished": self.finished,
+            "seconds": (self.finished or time.time()) - self.started if self.started else 0.0,
+        }
+        if self.status == "running" and progress is not None:
+            out["progress"] = progress
+        return out
+
+
 class LabServer:
     def __init__(
         self,
@@ -74,6 +107,8 @@ class LabServer:
         self.calls = 0
         self.network = ""
         """What the startup check found: ``blocked`` when nothing outside answers."""
+        self.jobs: dict[str, Job] = {}
+        """Background jobs: one tool call each, run behind the same lock as any call."""
 
     # ------------------------------------------------------------------ lease
 
@@ -95,6 +130,87 @@ class LabServer:
         return thread
 
     # ------------------------------------------------------------------ handlers
+
+    def run_call(self, name: str, body: dict[str, Any]) -> dict[str, Any]:
+        """One tool call, with the lab's lock held by the caller."""
+        self.lab.context = dict(body.get("context") or {})
+        self.lab.context["call_id"] = body.get("call_id")
+        self.lab.io.begin(name)
+        try:
+            result = call(self.lab, name, body.get("args") or {})
+        finally:
+            model_io = self.lab.io.drain()
+            attachments = self.lab.take_attachments()
+        self.calls += 1
+        return {
+            "summary": result.budgeted(),
+            "data": result.data,
+            "handles": result.handles,
+            "ok": result.ok,
+            "attachments": attachments,
+            "journal": self.journal(),
+            "workspace": self.workspace(),
+            "fingerprint": self.lab.ir.fingerprint,
+            # the open model's trace: for the user only, never the driver
+            "model_io": model_io,
+        }
+
+    # ------------------------------------------------------------------ jobs
+
+    def start_job(self, tool: str, body: dict[str, Any]) -> Job:
+        """Run one tool call in the background; its result waits until it is collected."""
+        import secrets
+
+        job = Job(
+            "j_" + secrets.token_hex(5),
+            tool,
+            dict(body.get("args") or {}),
+            str(body.get("call_id") or ""),
+            dict(body.get("context") or {}),
+        )
+
+        def work() -> None:
+            with self._lock:
+                job.status, job.started = "running", time.time()
+                try:
+                    job.result = self.run_call(
+                        tool, {"args": job.args, "call_id": job.call_id, "context": job.context}
+                    )
+                    job.status = "done" if job.result.get("ok", True) else "failed"
+                except JobCancelled:
+                    job.status = "cancelled"
+                    job.result = {
+                        "summary": f"{tool}: cancelled",
+                        "ok": False,
+                        "data": {},
+                        "handles": [],
+                        "journal": self.journal(),
+                    }
+                finally:
+                    job.finished = time.time()
+                    self.lab.progress = None
+
+        job.thread = threading.Thread(target=work, name=f"wspx-job-{job.id}", daemon=True)
+        self.jobs[job.id] = job
+        job.thread.start()
+        return job
+
+    def cancel_job(self, job: Job) -> None:
+        """Stop a running job by raising :class:`JobCancelled` in its thread."""
+        import ctypes
+
+        if job.status not in ("queued", "running") or job.thread is None:
+            return
+        if job.status == "queued":
+            job.status = "cancelled"
+        ident = job.thread.ident
+        if ident is not None:
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_ulong(ident), ctypes.py_object(JobCancelled)
+            )
+
+    def job_states(self) -> dict[str, str]:
+        return {j.id: j.status for j in self.jobs.values()}
 
     def journal(self) -> dict[str, Any]:
         store = self.lab.store
@@ -146,6 +262,7 @@ class LabServer:
                         "lease_expires": self.lease_expires,
                         "busy": True,
                         "progress": self.lab.progress,
+                        "jobs": self.job_states(),
                     }
                 )
             try:
@@ -155,6 +272,7 @@ class LabServer:
             return _JSON(
                 {
                     "lease_expires": self.lease_expires,
+                    "jobs": self.job_states(),
                     "journal": journal,
                     "workspace": workspace,
                     "fingerprint": self.lab.ir.fingerprint,
@@ -170,35 +288,62 @@ class LabServer:
 
             def run() -> dict[str, Any]:
                 with self._lock:
-                    self.lab.context = dict(body.get("context") or {})
-                    self.lab.context["call_id"] = body.get("call_id")
-                    self.lab.io.begin(name)
-                    try:
-                        result = call(self.lab, name, body.get("args") or {})
-                    finally:
-                        model_io = self.lab.io.drain()
-                        attachments = self.lab.take_attachments()
-                    self.calls += 1
-                    return {
-                        "summary": result.budgeted(),
-                        "data": result.data,
-                        "handles": result.handles,
-                        "ok": result.ok,
-                        "attachments": attachments,
-                        "journal": self.journal(),
-                        "workspace": self.workspace(),
-                        "fingerprint": self.lab.ir.fingerprint,
-                        # the open model's trace: for the user only, never the driver
-                        "model_io": model_io,
-                    }
+                    return self.run_call(name, body)
 
             return _JSON(await run_in_threadpool(run))
+
+        async def start_job(request: Request) -> Response:
+            if not self._authorized(request):
+                return _JSON({"error": "unauthorized"}, status_code=401)
+            body = await request.json()
+            job = self.start_job(str(body["tool"]), body)
+            return _JSON(job.view())
+
+        async def jobs(request: Request) -> Response:
+            if not self._authorized(request):
+                return _JSON({"error": "unauthorized"}, status_code=401)
+            return _JSON({"jobs": self.job_states()})
+
+        async def job(request: Request) -> Response:
+            if not self._authorized(request):
+                return _JSON({"error": "unauthorized"}, status_code=401)
+            found = self.jobs.get(request.path_params["job"])
+            if found is None:
+                return _JSON({"error": "no such job (the lab may have restarted)"}, status_code=404)
+            out = found.view(self.lab.progress)
+            if found.result is not None:
+                out["result"] = found.result  # its journal stays until the control plane acks
+            return _JSON(out)
+
+        async def ack_job(request: Request) -> Response:
+            """The control plane applied a finished job's journal: never send it again (a
+            replayed journal could move a branch back)."""
+            if not self._authorized(request):
+                return _JSON({"error": "unauthorized"}, status_code=401)
+            found = self.jobs.get(request.path_params["job"])
+            if found is not None and found.result is not None:
+                found.result = {k: v for k, v in found.result.items() if k != "journal"}
+            return _JSON({"ok": True})
+
+        async def cancel_job(request: Request) -> Response:
+            if not self._authorized(request):
+                return _JSON({"error": "unauthorized"}, status_code=401)
+            found = self.jobs.get(request.path_params["job"])
+            if found is None:
+                return _JSON({"error": "no such job"}, status_code=404)
+            self.cancel_job(found)
+            return _JSON(found.view())
 
         return Starlette(
             routes=[
                 Route("/health", health),
                 Route("/heartbeat", heartbeat, methods=["POST"]),
                 Route("/tool/{name:str}", tool, methods=["POST"]),
+                Route("/jobs", start_job, methods=["POST"]),
+                Route("/jobs", jobs, methods=["GET"]),
+                Route("/jobs/{job:str}", job, methods=["GET"]),
+                Route("/jobs/{job:str}/cancel", cancel_job, methods=["POST"]),
+                Route("/jobs/{job:str}/ack", ack_job, methods=["POST"]),
             ]
         )
 
@@ -278,6 +423,8 @@ def main(argv: list[str] | None = None) -> None:
         trust_remote_code=args.trust_remote_code,
         local_only=True,
         device=engine_plan.hf_device if engine_plan else None,
+        attn_implementation=config.model.attn_implementation,
+        experts_implementation=config.model.experts_implementation,
     )
     ir = _cached_ir(store, loaded.fingerprint)
     if ir is None:

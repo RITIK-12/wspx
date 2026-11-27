@@ -182,6 +182,7 @@ exclude = ["data/raw"]      # kept out of the upload, on top of .git, venvs, cac
 id = "Qwen/Qwen3-0.6B"
 dtype = "bfloat16"
 quant_scales = "refit"      # stored NVFP4/MXFP8: edits are written in that format; or "keep"
+experts_implementation = "grouped_mm"   # and attn_implementation, passed to transformers
 
 [driver]
 model = "anthropic:claude-opus-5-5"
@@ -204,6 +205,9 @@ gpu = "L4"
 grace = "15m"               # keep the lab warm this long after the session goes idle
 max_gpu_time = "2h"         # then the session's agent and lab stop
 engine = "hf"               # or "vllm": generation (generate, tests, check, run batches) by vLLM
+cpu = 8                     # cores for the lab (default 4 with a GPU)
+memory = 65536              # MiB
+packages = ["scikit-learn==1.8.0"]   # built into the lab image; the lab stays offline
 
 [lab.vllm]                  # with engine = "vllm"; each edit reaches vLLM before it generates
 memory = 0.45               # share of its GPU; unset, planned from what transformers holds

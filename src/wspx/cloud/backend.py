@@ -103,8 +103,10 @@ class ModalBackend:
         sandbox = self.modal.Sandbox.create(
             *args,
             app=app,
-            image=vllm_lab_image if record.engine == "vllm" else lab_image,
+            image=_with_packages(vllm_lab_image if record.engine == "vllm" else lab_image, record),
             gpu=record.gpu,
+            cpu=record.cpu or (LAB_GPU_CPUS if record.gpu else None),
+            memory=record.memory,
             timeout=SANDBOX_MAX_S,
             idle_timeout=int(record.grace_s) + 120,  # a backstop: the control plane stops it first
             volumes={"/models": models_volume.read_only(), "/store": self.store_volume.read_only()},
@@ -148,3 +150,13 @@ class ModalBackend:
             n += 1
         self.labs.clear()
         return n
+
+
+LAB_GPU_CPUS = 4.0
+"""A GPU lab's CPU reservation when ``[lab] cpu`` is unset: Modal's default (0.125 cores)
+starves transformers' decoding, which launches thousands of kernels per token."""
+
+
+def _with_packages(image: Any, record: SessionRecord) -> Any:
+    """The lab image plus ``[lab] packages``, installed at build time (cached per list)."""
+    return image.uv_pip_install(*record.packages) if record.packages else image

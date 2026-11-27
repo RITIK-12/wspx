@@ -125,6 +125,8 @@ class Lab:
         """A long call's progress, reported with the heartbeat."""
         self._attachments: list[dict[str, Any]] = []
         """Images and files the current call returns to its caller (:meth:`attach`)."""
+        self._returned: Any = None
+        """A ``run`` script's data for its caller (:meth:`returns`)."""
         self.source_dir = source_dir
         """The checkpoint folder the model was loaded from (exports copy its non-weight files)."""
         self.ir = ir
@@ -2242,11 +2244,23 @@ class Lab:
         oid = self.store.objects.put(output.encode())
         tail = output.splitlines()[-RUN_TAIL_LINES:]
         text = "\n".join(tail)[-RUN_TAIL_BYTES:]
+        data: dict[str, Any] = {"output": oid, "script": digest, "ok": ok}
+        returned, self._returned = self._returned, None
+        if returned is not None:  # the script's own data: callers no longer parse printed ids
+            data["result"] = returned
+            shown = json.dumps(returned, default=str)
+            text += f"\nresult: {shown[:2000]}" + (" …" if len(shown) > 2000 else "")
         return ToolResult(
             f"{text}\n[{'ok' if ok else 'failed'} · script {digest[7:19]} · full output {short(oid, 12)}]",
-            {"output": oid, "script": digest, "ok": ok},
+            data,
             ok=ok,
         )
+
+    def returns(self, value: Any) -> None:
+        """What a ``run`` script returns to its caller, as JSON-ready data (``data.result``
+        of the tool result); files go with :meth:`attach`."""
+        json.dumps(value, default=str)  # refuse now what cannot be sent
+        self._returned = value
 
 
 # --------------------------------------------------------------------------- SDK objects

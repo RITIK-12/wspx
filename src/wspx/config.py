@@ -78,6 +78,11 @@ class ModelSection(_Section):
     revision: str | None = None
     dtype: Literal["bfloat16", "float16", "float32", "auto"] = "bfloat16"
     trust_remote_code: bool = False
+    attn_implementation: str | None = None
+    """transformers' attention kernel, e.g. ``"sdpa"``, ``"eager"``, ``"flash_attention_2"``."""
+    experts_implementation: str | None = None
+    """transformers' mixture-of-experts kernel, e.g. ``"grouped_mm"`` or ``"eager"`` (on
+    Inkling the default ran about 3x faster than the per-expert loop)."""
     quant_scales: Literal["refit", "keep"] = "refit"
     """For a checkpoint stored quantized: edits re-fit the scales of the blocks they touch,
     or keep each block's scale and change only its codes."""
@@ -149,6 +154,14 @@ class LabSection(_Section):
     tested is what vLLM serves. Probes (trace, activations, contrast, grep) always use
     transformers."""
     vllm: VllmSection = Field(default_factory=VllmSection)
+    cpu: float | None = Field(default=None, gt=0)
+    """CPU cores reserved for the lab (transformers decoding is CPU-bound: one kernel launch
+    per op per token). Unset: 4 with a GPU, Modal's default without."""
+    memory: int | None = Field(default=None, gt=0)
+    """Memory reserved for the lab, in MiB. Unset: Modal's default."""
+    packages: list[str] = Field(default_factory=list)
+    """Python packages installed into the lab image when it is built (the lab itself stays
+    offline), e.g. ``["scikit-learn==1.8.0"]``."""
     gpu: str | None = None
     """``None`` runs on CPU; otherwise a Modal GPU spec such as ``"H100"`` or ``"H100:8"``."""
     grace: Duration = 15 * 60

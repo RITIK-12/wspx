@@ -46,6 +46,7 @@ from wspx.control.sessions import SessionManager
 from wspx.control.tracedb import TraceDB
 from wspx.errors import WspxError
 from wspx.store import Store
+from wspx.store.objects import is_oid, oid_of
 
 PROVIDER_CAPS = {
     "anthropic": "https://platform.claude.com/settings/limits",
@@ -90,6 +91,9 @@ class NewSession(BaseModel):
     trust_remote_code: bool = False
     engine: Literal["hf", "vllm"] = "hf"
     driver_images: Literal["auto", "off"] = "auto"
+    cpu: float | None = Field(None, gt=0, le=64)
+    memory: int | None = Field(None, gt=0, le=1_048_576)
+    packages: list[str] = Field(default_factory=list, max_length=64)
     grace_s: float = Field(900.0, ge=0)
     keep_warm: str = "auto"
     project: str = ""
@@ -262,6 +266,40 @@ def create_app(
             raise HTTPException(413, "project snapshot too large")
         infos = await offload(lambda: project_snapshot.members(data))
         return {"snapshot": await offload(lambda: store.objects.put(data)), "files": len(infos)}
+
+    @app.post("/api/objects/missing", dependencies=[Depends(user)])
+    async def missing_objects(request: Request) -> dict[str, Any]:
+        """Which of these content ids the store lacks (for chunked project uploads)."""
+        oids = (await request.json()).get("oids") or []
+        if not isinstance(oids, list) or len(oids) > 20_000:
+            raise HTTPException(400, "oids: a list of at most 20,000 ids")
+        return {
+            "missing": [o for o in dict.fromkeys(oids) if not (is_oid(o) and store.objects.has(o))]
+        }
+
+    @app.put("/api/objects/{oid}", dependencies=[Depends(user)])
+    async def put_object(oid: str, request: Request) -> dict[str, Any]:
+        """One chunk, stored under its content id (which the body must hash to)."""
+        data = await request.body()
+        if len(data) > project_snapshot.CHUNK:
+            raise HTTPException(413, f"chunks are at most {project_snapshot.CHUNK // 2**20} MB")
+        if oid_of(data) != oid:
+            raise HTTPException(400, "the body does not hash to this id")
+        await offload(lambda: store.objects.put(data))
+        return {"oid": oid}
+
+    @app.post("/api/projects/manifest", dependencies=[Depends(user)])
+    async def project_from_manifest(request: Request) -> dict[str, Any]:
+        """A project snapshot from chunks already in the store (``wspx new`` uploads only the
+        chunks the store lacks)."""
+        files = (await request.json()).get("files") or []
+        missing = sorted(
+            {c for f in files for c in f.get("chunks", []) if not store.objects.has(c)}
+        )
+        if missing:
+            raise HTTPException(409, f"{len(missing)} chunk(s) not uploaded yet: {missing[:3]}")
+        data = await offload(lambda: project_snapshot.assemble(files, store.objects.get))
+        return {"snapshot": await offload(lambda: store.objects.put(data)), "files": len(files)}
 
     @app.get("/api/sessions/{sid}", dependencies=[Depends(user)])
     def get_session(sid: str) -> dict[str, Any]:

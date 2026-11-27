@@ -263,6 +263,23 @@ class RunArgs(_Args):
     args: list[str] = Field(default_factory=list)
 
 
+JOB_TOOLS = ("test", "run", "export", "generate", "check", "trace")
+"""Tools a background job may run."""
+
+
+class JobsArgs(_Args):
+    action: Literal["start", "status", "collect", "cancel"] = Field(
+        description="start a job; status of every job; collect a finished one's result; cancel one"
+    )
+    tool: Literal["test", "run", "export", "generate", "check", "trace"] | None = Field(
+        None, description="For start: the tool to run in the background."
+    )
+    args: dict[str, Any] = Field(
+        default_factory=dict, description="For start: that tool's arguments, as for a direct call."
+    )
+    job: str | None = Field(None, description="For collect and cancel: the job id (j_…).")
+
+
 @dataclass(frozen=True)
 class ToolSpec:
     name: str
@@ -364,6 +381,17 @@ TOOLS: dict[str, ToolSpec] = {
             RunArgs,
             "[keep] Run a Python script in the lab with the SDK preloaded (no network, no "
             "secrets). Output is capped; the full log is saved.",
+            mutates=True,
+        ),
+        ToolSpec(
+            "jobs",
+            JobsArgs,
+            "[keep] Run a long call (test, run, export, generate, check, trace) in the "
+            "background: start returns a job id at once; status shows each job's progress; "
+            "collect returns a finished job's result as the call itself would; cancel stops "
+            "one. A direct call stops after an hour; a job does not. Other calls wait while a "
+            "job runs, since the lab runs one call at a time.",
+            lab=False,
             mutates=True,
         ),
     ]

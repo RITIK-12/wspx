@@ -41,6 +41,10 @@ class FakeControl:
         self.uploads = [*getattr(self, "uploads", []), snapshot]
         return "sha256:" + "a" * 64
 
+    def upload_files(self, project: Any) -> tuple[str, int, int]:
+        self.uploads = [*getattr(self, "uploads", []), project.pack()]
+        return "sha256:" + "a" * 64, 1, 10
+
     def new(self, **body: Any) -> dict[str, Any]:
         self.created = [*getattr(self, "created", []), body]
         return {"id": "s_new", **body}

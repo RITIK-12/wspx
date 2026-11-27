@@ -29,6 +29,7 @@ from wspx.store import Store, short
 from wspx.store.overlay import apply_journal
 from wspx.tools import TOOLS
 from wspx.tools.dispatch import PROJECT_TOOL
+from wspx.tools.schemas import JOB_TOOLS
 
 LEASE_S = 300.0
 MISSED_HEARTBEATS = 3
@@ -124,6 +125,9 @@ class SessionManager:
         trust_remote_code: bool = False,
         engine: str = "hf",
         driver_images: str = "auto",
+        cpu: float | None = None,
+        memory: int | None = None,
+        packages: list[str] | None = None,
         grace_s: float = 900.0,
         keep_warm: str = "auto",
         project: str = "",
@@ -166,6 +170,9 @@ class SessionManager:
             max_lab_s=max_lab_s,
             engine=engine,
             driver_images=driver_images,
+            cpu=cpu,
+            memory=memory,
+            packages=_packages(packages or []),
         )
         self.records[sid] = record
         if attachments:
@@ -306,7 +313,7 @@ class SessionManager:
             return handle
 
     def stop_lab(self, sid: str, reason: str, *, now: float | None = None) -> None:
-        self._lab_why[sid] = f"{sid}'s lab was stopped"
+        self._lab_why[sid] = f"{sid}'s lab was stopped: {reason}"
         self._lab_gen[sid] += 1  # before the lock: a start in progress holds it until it gives up
         with self._lab_locks[sid]:
             handle = self.labs.pop(sid, None)
@@ -436,7 +443,10 @@ class SessionManager:
             ctx = {"caller": source, "driver": record.driver, **(context or {})}
             tool = self.extra_tools(record).get(name) if name not in TOOLS else None
             try:
-                if tool is not None and tool.kind == "mcp":
+                if name == "jobs":
+                    result = self._jobs(record, args, call_id, ctx)
+                    note = ""
+                elif tool is not None and tool.kind == "mcp":
                     result = self._remote(record, tool, args)
                     note = ""
                 elif tool is not None:  # the project's own: run in the lab like a script
@@ -445,7 +455,12 @@ class SessionManager:
                 else:
                     result = self.lab(sid).call(name, args, call_id, ctx)
             except WspxError as exc:  # recorded like any other failed call, never dropped
-                result = {"summary": f"{name}: {exc}", "ok": False, "handles": [], "data": {}}
+                why = str(exc)
+                if sid not in self.labs and sid in self._lab_why:
+                    # seen live: the GPU cap stopped the lab mid-call and the call said only
+                    # "Server disconnected"
+                    why = f"{self._lab_why[sid]} (while this call ran)"
+                result = {"summary": f"{name}: {why}", "ok": False, "handles": [], "data": {}}
                 note = ""
             else:
                 self._persist(sid, result)
@@ -592,6 +607,115 @@ class SessionManager:
             entry["attachments"] = attachments
         self.commands[sid].append(entry)
         self.trace.event(sid, "command", entry, source=source)
+
+    # ------------------------------------------------------------------ background jobs
+
+    def _jobs(
+        self, record: SessionRecord, args: dict[str, Any], call_id: str, ctx: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Start, list, collect or cancel a session's background jobs. Their state lives in
+        the session's record, so it survives a control-plane restart; a job's result waits in
+        the lab until collected, and here after."""
+        jobs = record.extra.setdefault("jobs", {})
+        action = args.get("action")
+
+        def reply(summary: str, ok: bool = True, **extra: Any) -> dict[str, Any]:
+            return {"summary": summary, "ok": ok, "handles": [], "data": {}, **extra}
+
+        if action == "start":
+            tool = args.get("tool")
+            if tool not in JOB_TOOLS:
+                return reply(f"jobs: start runs one of {', '.join(JOB_TOOLS)}", ok=False)
+            view = self.lab(record.id).job(
+                "POST",
+                "/jobs",
+                {"tool": tool, "args": args.get("args") or {}, "call_id": call_id, "context": ctx},
+            )
+            jobs[view["job"]] = {
+                "tool": tool,
+                "args": args.get("args") or {},
+                "status": view["status"],
+                "started": time.time(),
+            }
+            self._save(record)
+            return reply(
+                f"started job {view['job']}: {tool}; `jobs` status shows progress, collect returns the result",
+                data={"job": view["job"]},
+            )
+        if action == "status":
+            self._refresh_jobs(record)
+            if not jobs:
+                return reply("no background jobs")
+            lines = []
+            for jid, j in jobs.items():
+                progress = j.get("progress") or {}
+                done = (
+                    f" ({progress.get('done')}/{progress.get('of')})" if progress.get("of") else ""
+                )
+                lines.append(f"{jid}  {j['tool']}  {j['status']}{done}")
+            return reply("\n".join(lines), data={"jobs": jobs})
+        jid = str(args.get("job") or "")
+        if jid not in jobs:
+            return reply(f"jobs: no job {jid!r}; `jobs` status lists them", ok=False)
+        if action == "cancel":
+            if jobs[jid]["status"] in ("queued", "running") and record.id in self.labs:
+                self.labs[record.id].job("POST", f"/jobs/{jid}/cancel")
+                jobs[jid]["status"] = "cancelling"
+                self._save(record)
+            return reply(f"{jid}: {jobs[jid]['status']}")
+        if action == "collect":
+            self._refresh_jobs(record, collect=jid)
+            j = jobs[jid]
+            if "result" in j:
+                return dict(j["result"])
+            return reply(f"{jid}: still {j['status']}; collect again later", ok=False)
+        return reply("jobs: action is start, status, collect or cancel", ok=False)
+
+    def _refresh_jobs(self, record: SessionRecord, *, collect: str | None = None) -> None:
+        """Ask the lab how its jobs are doing; take a finished job's result (once) when asked."""
+        jobs = record.extra.get("jobs", {})
+        handle = self.labs.get(record.id)
+        for jid, j in jobs.items():
+            if "result" in j or j["status"] in ("lost",):
+                continue
+            if handle is None:
+                j["status"] = "lost (the lab stopped before it finished)"
+                continue
+            try:
+                view = handle.job("GET", f"/jobs/{jid}")
+            except WspxError:
+                j["status"] = "lost (the lab restarted)"
+                continue
+            j["status"], j["progress"] = view["status"], view.get("progress")
+            if view.get("result") is not None and (collect == jid or view["status"] != "running"):
+                result = dict(view["result"])
+                self._persist(record.id, result)
+                handle.job("POST", f"/jobs/{jid}/ack")
+                result.pop("journal", None)
+                result.pop("model_io", None)
+                if result.get("attachments"):
+                    self.allow(record, result["attachments"])
+                j["result"] = {
+                    k: result.get(k) for k in ("summary", "ok", "handles", "data", "attachments")
+                }
+        self._save(record)
+
+    def _job_states(self, record: SessionRecord, states: dict[str, str]) -> None:
+        """Job states from a heartbeat, so a job that finished unwatched lets its lab go idle."""
+        jobs = record.extra.get("jobs", {})
+        changed = False
+        for jid, state in states.items():
+            if jid in jobs and "result" not in jobs[jid] and jobs[jid].get("status") != state:
+                jobs[jid]["status"] = state
+                changed = True
+        if changed:
+            self._save(record)
+
+    def _running_jobs(self, record: SessionRecord) -> bool:
+        return any(
+            j.get("status") in ("queued", "running", "cancelling")
+            for j in record.extra.get("jobs", {}).values()
+        )
 
     # ------------------------------------------------------------------ extra tools
 
@@ -816,7 +940,7 @@ class SessionManager:
                 record.lab_seconds = max(record.lab_seconds, record.max_lab_s)
                 self._save(record)
                 continue
-            if self.active(sid, now) or record.keep_warm == "always":
+            if self.active(sid, now) or record.keep_warm == "always" or self._running_jobs(record):
                 self.idle_since.pop(sid, None)
                 record.tier = "hot"
             else:
@@ -827,7 +951,9 @@ class SessionManager:
                 record.tier = "grace"
             self._save(record)
             try:
-                self._persist(sid, self.labs[sid].heartbeat(LEASE_S))
+                beat = self.labs[sid].heartbeat(LEASE_S)
+                self._persist(sid, beat)
+                self._job_states(record, beat.get("jobs") or {})
                 self._missed.pop(sid, None)
             except Exception as exc:
                 self._missed[sid] += 1
@@ -879,3 +1005,18 @@ def check_engine_gpu(engine: str, gpu: str | None) -> None:
             f"engine = 'vllm' needs compute capability {VLLM_MIN_CAPABILITY} or newer, and a "
             f"{kind} has {capability}; use an L4, A100, L40S, H100 or newer"
         )
+
+
+_PACKAGE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9,._-]+\])?([<>=!~]=?[A-Za-z0-9.*+!_-]+(,[<>=!~]=?[A-Za-z0-9.*+!_-]+)*)?$"
+)
+
+
+def _packages(specs: list[str]) -> list[str]:
+    """Requirement specifiers only: a name, extras and versions (no URLs, paths or flags)."""
+    for spec in specs:
+        if not _PACKAGE.match(spec.replace(" ", "")):
+            raise WspxError(
+                f"[lab] packages: {spec!r} is not a package requirement (e.g. 'scikit-learn==1.8.0')"
+            )
+    return sorted({p.replace(" ", "") for p in specs})

@@ -11,7 +11,7 @@ from typing import Any, Protocol
 
 import httpx
 
-from wspx.errors import LabCancelled, LabUnavailable
+from wspx.errors import LabCancelled, LabUnavailable, WspxError
 
 
 @dataclass
@@ -29,6 +29,11 @@ class SessionRecord:
     """What generates in the lab: ``hf`` (transformers) or ``vllm`` (beside it)."""
     driver_images: str = "auto"
     """``off`` when the driver model takes no images."""
+    cpu: float | None = None
+    memory: int | None = None
+    """The lab's CPU cores and MiB (``[lab] cpu``, ``memory``)."""
+    packages: list[str] = field(default_factory=list)
+    """Python packages built into the lab image (``[lab] packages``)."""
     status: str = "idle"
     """starting (driver queued until the lab is up) · idle · running · paused · stopped · done · error"""
     tier: str = "cold"
@@ -64,6 +69,10 @@ class LabHandle(Protocol):
         self, tool: str, args: dict[str, Any], call_id: str, context: dict[str, Any]
     ) -> dict[str, Any]: ...
 
+    def job(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        """A background-job request (``POST /jobs``, ``GET /jobs/<id>``, …)."""
+        ...
+
     def heartbeat(self, lease_s: float) -> dict[str, Any]: ...
 
     def stop(self) -> None: ...
@@ -97,6 +106,11 @@ def _post_tool(
         r = client.post(
             f"/tool/{tool}", json={"args": args, "call_id": call_id, "context": context}
         )
+    except httpx.TimeoutException as exc:
+        raise LabUnavailable(
+            f"{tool} ran past the hour a direct call may take; run it as a background job: "
+            f"jobs action=start tool={tool}"
+        ) from exc
     except httpx.HTTPError as exc:
         raise LabUnavailable(f"the lab did not answer: {exc}") from exc
     if r.status_code >= 400:
@@ -106,6 +120,19 @@ def _post_tool(
             "handles": [],
             "data": {},
         }
+    data: dict[str, Any] = r.json()
+    return data
+
+
+def _job(
+    client: Any, method: str, path: str, body: dict[str, Any] | None, **kw: Any
+) -> dict[str, Any]:
+    try:
+        r = client.request(method, path, json=body, **kw)
+    except httpx.HTTPError as exc:
+        raise LabUnavailable(f"the lab did not answer: {exc}") from exc
+    if r.status_code >= 400:
+        raise WspxError(f"lab {path}: {r.json().get('error', r.text[:200])}")
     data: dict[str, Any] = r.json()
     return data
 
@@ -133,6 +160,9 @@ class HttpLab:
     ) -> dict[str, Any]:
         return _post_tool(self.client, tool, args, call_id, context)
 
+    def job(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        return _job(self.client, method, path, body, timeout=60)
+
     def heartbeat(self, lease_s: float) -> dict[str, Any]:
         r = self.client.post("/heartbeat", json={"lease_s": lease_s}, timeout=30)
         r.raise_for_status()
@@ -158,6 +188,9 @@ class InProcessLab:
         self, tool: str, args: dict[str, Any], call_id: str, context: dict[str, Any]
     ) -> dict[str, Any]:
         return _post_tool(self.client, tool, args, call_id, context)
+
+    def job(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
+        return _job(self.client, method, path, body)
 
     def heartbeat(self, lease_s: float) -> dict[str, Any]:
         data: dict[str, Any] = self.client.post("/heartbeat", json={"lease_s": lease_s}).json()

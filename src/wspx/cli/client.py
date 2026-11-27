@@ -67,6 +67,41 @@ class Control:
         )
         return str(data["snapshot"])
 
+    def upload_files(
+        self, project: Any, *, retries: int = 3, report: Any = None
+    ) -> tuple[str, int, int]:
+        """A project uploaded chunk by chunk: only chunks the store lacks are sent, each
+        retried on its own, so a stall resumes where it stopped. Returns the snapshot id,
+        chunks sent and bytes sent."""
+        import time as _time
+
+        manifest = project.manifest()
+        where = {c: (f["path"], i) for f in manifest for i, c in enumerate(f["chunks"])}
+        missing: list[str] = self._req("POST", "/api/objects/missing", json={"oids": list(where)})[
+            "missing"
+        ]
+        sent = 0
+        for n, oid in enumerate(missing):
+            chunk = project.chunk(*where[oid])
+            for attempt in range(retries + 1):
+                try:
+                    self._req(
+                        "PUT",
+                        f"/api/objects/{oid}",
+                        content=chunk,
+                        headers={"content-type": "application/octet-stream"},
+                    )
+                    break
+                except WspxError:
+                    if attempt == retries:
+                        raise
+                    _time.sleep(2**attempt)
+            sent += len(chunk)
+            if report is not None:
+                report(n + 1, len(missing), sent)
+        made: dict[str, Any] = self._req("POST", "/api/projects/manifest", json={"files": manifest})
+        return str(made["snapshot"]), len(missing), sent
+
     def new(self, **body: Any) -> dict[str, Any]:
         data: dict[str, Any] = self._req("POST", "/api/sessions", json=body)
         return data

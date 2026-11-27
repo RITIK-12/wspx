@@ -22,8 +22,9 @@ def test_tools_come_in_groups_map_first() -> None:
         "vcs",
         "export",
         "run",
+        "jobs",
     ]
-    assert groups == ["map"] + ["inspect"] * 2 + ["probe"] * 4 + ["edit"] * 2 + ["keep"] * 4
+    assert groups == ["map"] + ["inspect"] * 2 + ["probe"] * 4 + ["edit"] * 2 + ["keep"] * 5
 
 
 @pytest.mark.parametrize("export", [mcp_tools, anthropic_tools, openai_tools, gemini_tools])

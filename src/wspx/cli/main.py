@@ -317,7 +317,13 @@ def new(
         if not model:
             raise typer.BadParameter("pass --model, or set [model] id in wspx.toml (`wspx init`)")
         control = _control()
-        snapshot = control.upload_project(project.pack()) if project else None
+        snapshot = None
+        if project:
+            snapshot, chunks, sent = control.upload_files(project)
+            if chunks:
+                typer.echo(
+                    f"uploaded {chunks} changed chunk(s), {sent / 2**20:.1f} MB; the rest is unchanged"
+                )
         given = [control.upload(Path(f)) for f in attach or []]
         record = control.new(
             model=model,
@@ -333,6 +339,9 @@ def new(
             attachments=given,
             tools=[t.model_dump() for t in cfg.driver.tools],
             mcp=[m.model_dump() for m in cfg.driver.mcp],
+            cpu=cfg.lab.cpu,
+            memory=cfg.lab.memory,
+            packages=cfg.lab.packages,
             grace_s=_duration(grace, "--grace") if grace else cfg.lab.grace,
             keep_warm=cfg.lab.keep_warm,
             project=project.name if project else "",
@@ -725,6 +734,38 @@ def run(
 ) -> None:
     """Run a script in the lab with the SDK preloaded."""
     _tool(session, "run", {"script": script, "args": args or []})
+
+
+@app.command()
+def jobs(
+    action: Annotated[str, typer.Argument(help="start, status, collect or cancel")] = "status",
+    tool: Annotated[
+        str | None,
+        typer.Option("--tool", help="For start: test, run, export, generate, check or trace."),
+    ] = None,
+    args: Annotated[
+        str | None,
+        typer.Option(
+            "--args", help='For start: the tool\'s arguments as JSON, e.g. \'{"suite": "dev"}\'.'
+        ),
+    ] = None,
+    job: Annotated[
+        str | None, typer.Option("--job", help="For collect and cancel: the job id.")
+    ] = None,
+    session: Session = None,
+) -> None:
+    """Run a long call in the background, and see, collect or cancel it."""
+    try:
+        parsed = json.loads(args) if args else {}
+    except json.JSONDecodeError as exc:
+        _fail(WspxError(f"--args is not JSON: {exc}"))
+        return
+    body: dict[str, Any] = {"action": action, "args": parsed}
+    if tool:
+        body["tool"] = tool
+    if job:
+        body["job"] = job
+    _tool(session, "jobs", body)
 
 
 # ---------------------------------------------------------------------- spend and safety

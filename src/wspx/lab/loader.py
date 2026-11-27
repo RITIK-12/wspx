@@ -88,6 +88,8 @@ def load_hf(
     trust_remote_code: bool = False,
     device: str | None = None,
     local_only: bool = False,
+    attn_implementation: str | None = None,
+    experts_implementation: str | None = None,
 ) -> Loaded:
     """Load a causal LM, a vision-language model or any AutoModel, and fingerprint it."""
     from transformers import AutoConfig, AutoTokenizer
@@ -106,6 +108,10 @@ def load_hf(
             trust_remote_code=trust_remote_code,
             device_map=device or ("auto" if torch.cuda.is_available() else None),
             output_loading_info=True,
+            **({"attn_implementation": attn_implementation} if attn_implementation else {}),
+            **(
+                {"experts_implementation": experts_implementation} if experts_implementation else {}
+            ),
         )
         model, info = loaded
     except Exception as exc:

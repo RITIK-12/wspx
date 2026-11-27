@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import torch
 
 pytest.importorskip("torch")
 from starlette.testclient import TestClient
@@ -876,3 +877,111 @@ def test_remote_mcp_tools_are_offered_only_as_allowed(tmp_path: Path) -> None:
         assert got.content.startswith(b"\x89PNG")
         assert not manager.tool(sid, "papers__delete_all", {"q": "x"})["ok"]
         assert calls == ["search"]  # the disallowed tool never reached the server
+
+
+def test_background_jobs_start_report_collect_and_cancel(tmp_path: Path) -> None:
+    (tmp_path / "slow.py").write_text(
+        "import sys, time, wspx\n"
+        "lab = wspx.session()\n"
+        "n = int(sys.argv[1])\n"
+        "for i in range(n):\n"
+        "    lab.progress = {'task': 'slow', 'done': i, 'of': n}\n"
+        "    time.sleep(0.05)\n"
+        "lab.returns({'steps': n})\n"
+    )
+    client, manager = make(tmp_path)
+    with client:
+        sid = client.post("/api/sessions", json={"model": "tiny"}, headers=USER).json()["id"]
+        started = manager.tool(
+            sid,
+            "jobs",
+            {"action": "start", "tool": "run", "args": {"script": "slow.py", "args": ["4"]}},
+        )
+        assert started["ok"], started["summary"]
+        jid = started["data"]["job"]
+        wait(
+            lambda: (
+                manager.tool(sid, "jobs", {"action": "status"})["data"]["jobs"][jid]["status"]
+                == "done"
+            ),
+            timeout=30,
+        )
+        got = manager.tool(sid, "jobs", {"action": "collect", "job": jid})
+        assert got["ok"], got["summary"]
+        assert got["data"]["result"] == {"steps": 4}
+        assert manager.tool(sid, "jobs", {"action": "collect", "job": jid})["data"]["result"] == {
+            "steps": 4
+        }
+
+        before = {n: p.clone() for n, p in manager.labs[sid].server.lab.model.named_parameters()}
+        long = manager.tool(
+            sid,
+            "jobs",
+            {"action": "start", "tool": "run", "args": {"script": "slow.py", "args": ["400"]}},
+        )
+        lid = long["data"]["job"]
+        wait(
+            lambda: manager.tool(sid, "jobs", {"action": "status"})["data"]["jobs"][lid].get(
+                "progress"
+            ),
+            timeout=30,
+        )
+        assert "/400)" in manager.tool(sid, "jobs", {"action": "status"})["summary"]
+        manager.tool(sid, "jobs", {"action": "cancel", "job": lid})
+        wait(
+            lambda: (
+                manager.tool(sid, "jobs", {"action": "status"})["data"]["jobs"][lid]["status"]
+                == "cancelled"
+            ),
+            timeout=30,
+        )
+        cancelled = manager.tool(sid, "jobs", {"action": "collect", "job": lid})
+        assert not cancelled["ok"]
+        assert "cancelled" in cancelled["summary"]
+        after = dict(manager.labs[sid].server.lab.model.named_parameters())
+        assert all(torch.equal(before[n], after[n]) for n in before)
+        assert manager.tool(sid, "arch", {})["ok"]  # the lab is free again
+        bad = manager.tool(sid, "jobs", {"action": "start", "tool": "vcs", "args": {}})
+        assert not bad["ok"]
+
+
+def test_project_uploads_send_only_what_changed(tmp_path: Path) -> None:
+    """Seen live: changing one script re-sent the whole snapshot, and an 86 MB upload stalled
+    for 15 minutes. Chunks the store has are not sent again; the snapshot is identical."""
+    import os
+
+    from wspx.cli.client import Control
+    from wspx.project import CHUNK, Project
+
+    root = tmp_path / "proj"
+    (root / "data").mkdir(parents=True)
+    (root / "wspx.toml").write_text('[project]\nname = "demo"\n')
+    (root / "edit.py").write_text("print('v1')\n")
+    (root / "data" / "items.jsonl").write_bytes(
+        os.urandom(CHUNK + 1000).hex().encode()[: CHUNK + 1000]
+    )
+    project = Project.find(root)
+    assert project is not None
+    client, _ = make(tmp_path)
+    with client:
+        control = Control("http://testserver", TOKEN)
+        control.client = client
+        client.headers.update(USER)
+        first, chunks, _ = control.upload_files(project)
+        assert chunks == 4  # wspx.toml, edit.py and the data file in two chunks
+        assert (
+            first
+            == client.post(
+                "/api/projects",
+                content=project.pack(),
+                headers=USER | {"content-type": "application/gzip"},
+            ).json()["snapshot"]
+        )
+        again, chunks, sent = control.upload_files(project)
+        assert (again, chunks, sent) == (first, 0, 0)
+        (root / "edit.py").write_text("print('v2')\n")
+        changed, chunks, sent = control.upload_files(project)
+        assert changed != first
+        assert (chunks, sent) == (1, len("print('v2')\n"))
+        bad = client.put(f"/api/objects/sha256:{'0' * 64}", content=b"x", headers=USER)
+        assert bad.status_code == 400

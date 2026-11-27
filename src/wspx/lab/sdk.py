@@ -76,7 +76,15 @@ def open_lab(
     if isinstance(model, str):
         from wspx.lab.loader import load_hf
 
-        loaded = load_hf(model, revision=revision, dtype=dtype, trust_remote_code=trust_remote_code)
+        cfg = config or WspxConfig.discover(workdir)
+        loaded = load_hf(
+            model,
+            revision=revision,
+            dtype=dtype,
+            trust_remote_code=trust_remote_code,
+            attn_implementation=cfg.model.attn_implementation,
+            experts_implementation=cfg.model.experts_implementation,
+        )
         module, tokenizer = loaded.model, tokenizer or loaded.tokenizer
         processor = processor or loaded.processor
         fingerprint = loaded.fingerprint
