@@ -17,6 +17,7 @@ import importlib.metadata
 import json
 import os
 import re
+from collections.abc import Callable
 from pathlib import Path
 
 import modal
@@ -94,7 +95,7 @@ def _deps_for(requires: list[str], extra: str) -> list[str]:
     return deps
 
 
-def _image(extra: str) -> modal.Image:
+def _image(extra: str, *, below: Callable[[modal.Image], modal.Image] | None = None) -> modal.Image:
     """The same wspx version as the CLI, with the extras that role runs.
 
     Dependencies get a layer of their own, below wspx itself, so a new wspx
@@ -108,6 +109,8 @@ def _image(extra: str) -> modal.Image:
     deps = _deps_for(requires, extra)
     image = modal.Image.debian_slim(python_version="3.12")
     image = image.uv_pip_install(*deps) if deps else image
+    if below is not None:  # layers that change less often than wspx itself (vLLM's venv)
+        image = below(image)
     if source is None:
         return image.uv_pip_install(f"wspx=={__version__}", extra_options="--no-deps")
     image = image.env({_DEV_REQUIRES: _pack_requires(source)})
@@ -126,11 +129,15 @@ VLLM_WHEEL = (
 """A vLLM build pinned by commit: Inkling-2-Mini (Inkling2Loop) is served from vLLM's main
 branch after 0.34.0, and no release has it yet."""
 # vLLM pins its own torch and transformers, so it gets an environment of its own; the lab's
-# vLLM worker runs with /opt/vllm/bin/python and talks to the lab over localhost
-vllm_lab_image = lab_image.run_commands(
-    "python -m venv /opt/vllm",
-    f"/opt/vllm/bin/pip install --no-cache-dir '{VLLM_WHEEL}'",
-).env({"WSPX_VLLM_PYTHON": "/opt/vllm/bin/python"})
+# vLLM worker runs with /opt/vllm/bin/python and talks to the lab over localhost. It sits
+# below wspx, so a new wspx release does not rebuild it.
+vllm_lab_image = _image(
+    "lab",
+    below=lambda image: image.run_commands(
+        "python -m venv /opt/vllm",
+        f"/opt/vllm/bin/pip install --no-cache-dir '{VLLM_WHEEL}'",
+    ).env({"WSPX_VLLM_PYTHON": "/opt/vllm/bin/python"}),
+)
 
 
 @app.function(
