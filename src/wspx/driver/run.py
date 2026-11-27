@@ -169,6 +169,7 @@ def run_from_env(
         deny=deny,
         attachments=json.loads(env.get("WSPX_ATTACHMENTS") or "[]"),
         vision=env.get("WSPX_DRIVER_IMAGES", "auto") != "off",
+        extra_tools=json.loads(env.get("WSPX_EXTRA_TOOLS") or "[]"),
     )
     return Runner(provider, hooks.hooks(), config).run()
 

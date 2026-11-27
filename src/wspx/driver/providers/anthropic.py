@@ -58,6 +58,14 @@ class AnthropicProvider:
         self.model = model
         self.fallbacks = fallbacks and model in FALLBACK_MODELS
 
+    def format_tool(self, spec: dict[str, Any]) -> dict[str, Any]:
+        """A project or remote MCP tool (name, description, JSON Schema) in this API's form."""
+        return {
+            "name": spec["name"],
+            "description": spec["description"],
+            "input_schema": spec["schema"],
+        }
+
     def tools(self) -> list[dict[str, Any]]:
         return anthropic_tools()
 

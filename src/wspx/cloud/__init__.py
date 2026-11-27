@@ -17,4 +17,7 @@ KEY_SECRETS = {
     "hf": ("wspx-key-hf", "HF_TOKEN"),
 }
 """One secret per provider, so setting one key never touches the others."""
+MCP_TOKENS = "wspx-mcp-tokens"
+"""Remote MCP servers' tokens (a Modal Dict): read by the control plane, out of reach of
+labs (no network) and runners (no Modal access)."""
 LAB_PORT = 8080

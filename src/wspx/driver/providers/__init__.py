@@ -39,6 +39,8 @@ class Provider(Protocol):
 
     def tools(self) -> list[dict[str, Any]]: ...
 
+    def format_tool(self, spec: dict[str, Any]) -> dict[str, Any]: ...
+
 
 def parse_driver(spec: str) -> tuple[str, str]:
     kind, sep, model = spec.partition(":")

@@ -188,6 +188,17 @@ model = "anthropic:claude-opus-5-5"
 deny_tools = ["run"]        # tools the agent is not offered
 images = "auto"             # "off" for a model without image input
 
+[[driver.tools]]            # the project's own tool, run in the lab
+name = "score"
+call = "tools/score.py:score"
+description = "Score answers against the held-out labels"
+
+[[driver.mcp]]              # a remote MCP server; only the tools in `allow` are offered
+name = "papers"
+url = "https://example.com/mcp"
+allow = ["search"]
+token = true                # `wspx keys set mcp:papers`; the control plane holds it
+
 [lab]
 gpu = "L4"
 grace = "15m"               # keep the lab warm this long after the session goes idle

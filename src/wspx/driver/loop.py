@@ -82,6 +82,8 @@ class RunnerConfig:
     """Images and files given with the task."""
     vision: bool = True
     """``False`` for a model without image input: images become placeholders."""
+    extra_tools: list[dict[str, Any]] = field(default_factory=list)
+    """The project's tools and allowed remote MCP tools: name, description, JSON Schema."""
 
 
 @dataclass
@@ -102,6 +104,11 @@ class Runner:
         self.turns = 0
         self._recent: list[tuple[str, tuple[str, ...]]] = []
         self._tools = [t for t in provider.tools() if _tool_name(t) not in config.deny]
+        format_tool = getattr(provider, "format_tool", None)
+        if format_tool is not None:
+            self._tools += [
+                format_tool(t) for t in config.extra_tools if t["name"] not in config.deny
+            ]
         kind = provider.name.split(":")[0]
         provider.media = Media(
             hooks.blob,
@@ -127,7 +134,9 @@ class Runner:
                 "effort": self.config.effort,
                 "max_tokens": self.config.max_tokens,
                 "compact_at": self.config.compact_at,
-                "tools": sorted(n for n in TOOLS if n not in self.config.deny),
+                "tools": sorted(
+                    {*TOOLS, *(t["name"] for t in self.config.extra_tools)} - self.config.deny
+                ),
                 "system": self.config.system,
                 "message": first,
                 "attachments": self.config.attachments,

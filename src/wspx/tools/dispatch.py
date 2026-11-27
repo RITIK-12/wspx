@@ -15,6 +15,11 @@ if TYPE_CHECKING:
     from wspx.lab.session import Lab, ToolResult
 
 
+PROJECT_TOOL = "__project_tool__"
+"""Runs one of the project's own tools (``[[driver.tools]]``); only the control plane calls
+it, with the tool's ``call`` from the session's record, never a driver."""
+
+
 def call(
     lab: Lab,
     name: str,
@@ -22,6 +27,14 @@ def call(
 ) -> ToolResult:
     from wspx.lab.session import ToolResult
 
+    if name == PROJECT_TOOL:
+        a = arguments or {}
+        try:
+            return lab.project_tool(
+                str(a.get("call", "")), dict(a.get("args") or {}), name=str(a.get("name", ""))
+            )
+        except WspxError as exc:
+            return ToolResult(f"{a.get('name')}: {exc}", ok=False)
     spec = TOOLS.get(name)
     if spec is None:
         return ToolResult(f"unknown tool {name!r}; tools: {', '.join(TOOLS)}", ok=False)

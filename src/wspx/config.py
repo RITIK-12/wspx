@@ -85,12 +85,43 @@ class ModelSection(_Section):
     """Custom architecture, e.g. ``"git+https://…#pkg.module:Class"`` or ``"pkg.module:Class"``."""
 
 
+_TOOL_NAME = r"^[a-zA-Z][a-zA-Z0-9_-]{0,47}$"
+
+
+class ProjectTool(_Section):
+    """A tool of the project's own for the driver: a Python function run in the lab."""
+
+    name: str = Field(pattern=_TOOL_NAME)
+    call: str = Field(pattern=r"^[^:]+\.py:[A-Za-z_][A-Za-z0-9_]*$")
+    """``path/to/file.py:function``, relative to the project. The function takes the
+    arguments as a dict and returns text or a JSON-ready dict; ``wspx.session()`` is the lab."""
+    description: str = ""
+    parameters: dict[str, Any] = Field(default_factory=lambda: {"type": "object"})
+    """JSON Schema of the arguments."""
+
+
+class McpServer(_Section):
+    """A remote MCP server whose listed tools the driver may call (through the control plane,
+    which holds its token: the driver never does)."""
+
+    name: str = Field(pattern=r"^[a-zA-Z][a-zA-Z0-9-]{0,23}$")
+    url: str = Field(pattern=r"^https?://")
+    allow: list[str] = Field(min_length=1)
+    """The server's tools offered to the driver; nothing else is."""
+    token: bool = False
+    """Send ``Authorization: Bearer`` with the token stored by ``wspx keys set mcp:<name>``."""
+
+
 class DriverSection(_Section):
     model: str | None = None
     deny_tools: list[str] = Field(default_factory=list)
     """Tools the driver is not offered and may not call, e.g. ``["run", "export"]``."""
     images: Literal["auto", "off"] = "auto"
     """``off`` for a driver model without image input: images reach it as placeholders."""
+    tools: list[ProjectTool] = Field(default_factory=list)
+    """The project's own tools (``[[driver.tools]]``): an evaluator, a data browser, a scorer."""
+    mcp: list[McpServer] = Field(default_factory=list)
+    """Remote MCP servers (``[[driver.mcp]]``) and the tools of theirs the driver may call."""
 
 
 class VllmSection(_Section):

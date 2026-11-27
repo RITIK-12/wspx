@@ -779,3 +779,100 @@ def test_mcp_results_carry_images_and_files() -> None:
     assert image.mime_type == "image/png"
     assert isinstance(resource, types.EmbeddedResource)
     assert resource.resource.uri.endswith("/attachments/sha256:b")
+
+
+def test_a_projects_own_tool_runs_in_the_lab_for_the_driver(tmp_path: Path) -> None:
+    (tmp_path / "tools").mkdir()
+    (tmp_path / "tools" / "score.py").write_text(
+        "import wspx\n"
+        "def score(args):\n"
+        "    lab = wspx.session()\n"
+        "    print('scored', len(args['answers']))\n"
+        "    return {'accuracy': sum(args['answers']) / len(args['answers']), 'arch': lab.ir.arch}\n"
+    )
+    spec = {
+        "name": "score",
+        "call": "tools/score.py:score",
+        "description": "Score answers against the project's labels",
+        "parameters": {"type": "object", "properties": {"answers": {"type": "array"}}},
+    }
+    script = [call("score", {"answers": [1, 0, 1, 1]}), done("scored")]
+    port = free_port()
+    client, manager = make(tmp_path, script, port=port)
+    with LiveServer(client.app, port):
+        bad = client.post(
+            "/api/sessions",
+            json={"model": "tiny", "tools": [{**spec, "name": "grep"}]},
+            headers=USER,
+        )
+        assert bad.status_code == 400
+        assert "name of a wspx tool" in bad.text
+        sid = client.post(
+            "/api/sessions",
+            json={
+                "model": "tiny",
+                "driver": "anthropic:claude-opus-5-5",
+                "task": "t",
+                "tools": [spec],
+            },
+            headers=USER,
+        ).json()["id"]
+        wait(lambda: manager.get(sid).status == "done", timeout=60)
+        events = client.get(f"/api/sessions/{sid}/timeline", headers=USER).json()["events"]
+        (start,) = [e["payload"] for e in events if e["kind"] == "start"]
+        assert "score" in start["tools"]
+        (scored,) = [e["payload"] for e in events if e["kind"] == "tool_call"]
+        assert scored["tool"] == "score"
+        assert '"accuracy": 0.75' in scored["summary"]
+        assert "scored 4" in scored["summary"]
+        # only the control plane routes to the lab's runner of project tools
+        direct = manager.tool(sid, "__project_tool__", {"call": "tools/score.py:score"})
+        assert not direct["ok"]
+
+
+def test_remote_mcp_tools_are_offered_only_as_allowed(tmp_path: Path) -> None:
+    import base64
+
+    from mcp import types
+    from mcp.server.lowlevel import Server
+
+    calls: list[str] = []
+
+    async def list_tools(_ctx: Any, _params: Any) -> types.ListToolsResult:
+        schema = {"type": "object", "properties": {"q": {"type": "string"}}}
+        return types.ListToolsResult(
+            tools=[
+                types.Tool(name="search", description="Search papers", input_schema=schema),
+                types.Tool(name="delete_all", description="Delete everything", input_schema=schema),
+            ]
+        )
+
+    async def call_tool(_ctx: Any, params: types.CallToolRequestParams) -> types.CallToolResult:
+        calls.append(params.name)
+        figure = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\0" * 8).decode()
+        return types.CallToolResult(
+            content=[
+                types.TextContent(type="text", text=f"3 papers on {params.arguments['q']}"),
+                types.ImageContent(type="image", data=figure, mime_type="image/png"),
+            ]
+        )
+
+    server = Server("papers", on_list_tools=list_tools, on_call_tool=call_tool)
+    client, manager = make(tmp_path)
+    manager.mcp_connect = lambda spec: server
+    with client:
+        spec = {"name": "papers", "url": "https://papers.example/mcp", "allow": ["search"]}
+        sid = client.post(
+            "/api/sessions", json={"model": "tiny", "mcp": [spec]}, headers=USER
+        ).json()["id"]
+        offered = manager.extra_tools(manager.get(sid))
+        assert list(offered) == ["papers__search"]
+        out = manager.tool(sid, "papers__search", {"q": "logit lens"})
+        assert out["ok"]
+        assert out["summary"] == "3 papers on logit lens"
+        (figure,) = out["attachments"]
+        own = {"authorization": f"Bearer {mint(SECRET, sid, scope='runner')}"}
+        got = client.get(f"/api/sessions/{sid}/attachments/{figure['oid']}", headers=own)
+        assert got.content.startswith(b"\x89PNG")
+        assert not manager.tool(sid, "papers__delete_all", {"q": "x"})["ok"]
+        assert calls == ["search"]  # the disallowed tool never reached the server

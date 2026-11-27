@@ -35,6 +35,17 @@ class ChatProvider:
         self.model = model
         self.name = name
 
+    def format_tool(self, spec: dict[str, Any]) -> dict[str, Any]:
+        """A project or remote MCP tool (name, description, JSON Schema) in this API's form."""
+        return {
+            "type": "function",
+            "function": {
+                "name": spec["name"],
+                "description": spec["description"],
+                "parameters": spec["schema"],
+            },
+        }
+
     def tools(self) -> list[dict[str, Any]]:
         return [
             {

@@ -54,6 +54,29 @@ def ensure_secrets(api_token: str | None = None) -> str:
     return api_token
 
 
+def set_mcp_token(server: str, value: str) -> None:
+    """Store a remote MCP server's token for the control plane (``[[driver.mcp]] token``)."""
+    import modal
+
+    from wspx.cloud import MCP_TOKENS
+
+    value = value.strip()
+    if not value:
+        raise ValueError("the token is empty")
+    ensure_environment()
+    tokens = modal.Dict.from_name(MCP_TOKENS, environment_name=ENVIRONMENT, create_if_missing=True)
+    tokens[server] = value
+
+
+def remove_mcp_token(server: str) -> None:
+    import modal
+
+    from wspx.cloud import MCP_TOKENS
+
+    tokens = modal.Dict.from_name(MCP_TOKENS, environment_name=ENVIRONMENT, create_if_missing=True)
+    tokens.pop(server, None)
+
+
 def set_key(provider: str, value: str) -> None:
     """Store a provider key as that provider's secret, overwriting it in place.
 

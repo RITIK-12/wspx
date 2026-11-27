@@ -98,6 +98,10 @@ class NewSession(BaseModel):
     max_lab_s: float | None = Field(None, gt=0)
     attachments: list[dict[str, Any]] = Field(default_factory=list)
     """Images and files for the task, from ``POST /api/attachments``."""
+    tools: list[dict[str, Any]] = Field(default_factory=list)
+    """The project's own tools (``[[driver.tools]]``)."""
+    mcp: list[dict[str, Any]] = Field(default_factory=list)
+    """Remote MCP servers and the tools of theirs allowed (``[[driver.mcp]]``)."""
 
 
 class ToolCall(BaseModel):

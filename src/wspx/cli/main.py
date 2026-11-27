@@ -130,6 +130,16 @@ def keys_set(provider: Annotated[str, typer.Argument(help=PROVIDERS)]) -> None:
 
     from wspx.cloud.deploy import set_key
 
+    if provider.startswith("mcp:"):  # a remote MCP server's token, for the control plane
+        from wspx.cloud.deploy import set_mcp_token
+
+        value = typer.prompt(f"{provider} token", hide_input=True)
+        try:
+            set_mcp_token(provider.split(":", 1)[1], value)
+        except (ValueError, ModalError) as exc:
+            _fail(exc)
+        typer.echo(f"stored the token for MCP server {provider[4:]} in your Modal account")
+        return
     value = typer.prompt(f"{provider} key", hide_input=True)
     try:
         set_key(provider, value)
@@ -148,7 +158,12 @@ def keys_rm(provider: Annotated[str, typer.Argument(help=PROVIDERS)]) -> None:
     from wspx.cloud.deploy import remove_key
 
     try:
-        remove_key(provider)
+        if provider.startswith("mcp:"):
+            from wspx.cloud.deploy import remove_mcp_token
+
+            remove_mcp_token(provider.split(":", 1)[1])
+        else:
+            remove_key(provider)
     except (ValueError, subprocess.CalledProcessError, ModalError) as exc:
         _fail(exc)
     typer.echo(f"removed the {provider} key; {_reload_keys()}")
@@ -316,6 +331,8 @@ def new(
             engine=cfg.lab.engine,
             driver_images=cfg.driver.images,
             attachments=given,
+            tools=[t.model_dump() for t in cfg.driver.tools],
+            mcp=[m.model_dump() for m in cfg.driver.mcp],
             grace_s=_duration(grace, "--grace") if grace else cfg.lab.grace,
             keep_warm=cfg.lab.keep_warm,
             project=project.name if project else "",

@@ -21,12 +21,14 @@ from typing import Any
 
 from wspx.auth import mint
 from wspx.control.backend import Backend, LabHandle, RunnerHandle, SessionRecord
+from wspx.control.extra_tools import Extra, Remote, project_tools
 from wspx.control.gateway_client import GatewayAdmin
 from wspx.control.tracedb import TraceDB
 from wspx.errors import LabCancelled, LabUnavailable, WspxError
 from wspx.store import Store, short
 from wspx.store.overlay import apply_journal
 from wspx.tools import TOOLS
+from wspx.tools.dispatch import PROJECT_TOOL
 
 LEASE_S = 300.0
 MISSED_HEARTBEATS = 3
@@ -78,6 +80,8 @@ class SessionManager:
         self.last_activity: dict[str, float] = {}
         self.idle_since: dict[str, float] = {}
         self.workspace: dict[str, str] = {}
+        self.mcp_connect: Any = None
+        """How remote MCP servers are reached (tests connect in-process); ``None``: over HTTP."""
         self.halted = False
         self._halt_epoch = 0
         """Bumped by every kill --all and resume, so a stale halt read cannot undo them."""
@@ -127,9 +131,12 @@ class SessionManager:
         tools_deny: list[str] | None = None,
         max_lab_s: float | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        mcp: list[dict[str, Any]] | None = None,
     ) -> SessionRecord:
         if self.halted:
             raise WspxError("wspx is halted; `wspx resume` first")
+        project_tools(tools or [])  # names are checked before anything is created
         check_engine_gpu(engine, gpu)
         if snapshot is not None and not self.store.objects.has(snapshot):
             raise WspxError(f"project snapshot {snapshot[:12]} was not uploaded")
@@ -164,6 +171,10 @@ class SessionManager:
         if attachments:
             self.allow(record, attachments)
             record.extra["task_attachments"] = [a["oid"] for a in attachments]
+        if tools:
+            record.extra["project_tools"] = tools
+        if mcp:
+            record.extra["mcp"] = mcp
         self._save(record)
         self.trace.event(
             sid,
@@ -222,6 +233,9 @@ class SessionManager:
             "WSPX_TOOLS_DENY": ",".join(record.tools_deny),
             "WSPX_ATTACHMENTS": json.dumps(self.task_attachments(record)),
             "WSPX_DRIVER_IMAGES": record.driver_images,
+            "WSPX_EXTRA_TOOLS": json.dumps(
+                [t.offered() for t in self.extra_tools(record).values()]
+            ),
             # a cloud runner restarted on this same input resumes from its checkpoint
             "WSPX_RUNNER_ID": "r_" + secrets.token_hex(6),
         }
@@ -336,7 +350,8 @@ class SessionManager:
         context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         record = self.get(sid)
-        if name not in TOOLS:
+        extra = self.extra_tools(record) if name not in TOOLS else {}
+        if name not in TOOLS and name not in extra:
             return {"summary": f"unknown tool {name!r}", "ok": False, "handles": [], "data": {}}
         if self.halted:
             return {
@@ -419,8 +434,16 @@ class SessionManager:
             if sid not in self.labs:
                 note = "(lab cold start {:.0f} s)"
             ctx = {"caller": source, "driver": record.driver, **(context or {})}
+            tool = self.extra_tools(record).get(name) if name not in TOOLS else None
             try:
-                result = self.lab(sid).call(name, args, call_id, ctx)
+                if tool is not None and tool.kind == "mcp":
+                    result = self._remote(record, tool, args)
+                    note = ""
+                elif tool is not None:  # the project's own: run in the lab like a script
+                    inner = {"call": tool.call, "args": args, "name": tool.name}
+                    result = self.lab(sid).call(PROJECT_TOOL, inner, call_id, ctx)
+                else:
+                    result = self.lab(sid).call(name, args, call_id, ctx)
             except WspxError as exc:  # recorded like any other failed call, never dropped
                 result = {"summary": f"{name}: {exc}", "ok": False, "handles": [], "data": {}}
                 note = ""
@@ -569,6 +592,48 @@ class SessionManager:
             entry["attachments"] = attachments
         self.commands[sid].append(entry)
         self.trace.event(sid, "command", entry, source=source)
+
+    # ------------------------------------------------------------------ extra tools
+
+    def extra_tools(self, record: SessionRecord) -> dict[str, Extra]:
+        """The project's tools and the allowed tools of its remote MCP servers (listed once
+        per session; a server that cannot be reached offers nothing, and the trace says so)."""
+        found = {t.name: t for t in project_tools(record.extra.get("project_tools") or [])}
+        servers = record.extra.get("mcp") or []
+        if servers:
+            if "mcp_tools" not in record.extra:
+                listed: list[dict[str, Any]] = []
+                for spec in servers:
+                    try:
+                        remote = Remote(
+                            [spec], **({"connect": self.mcp_connect} if self.mcp_connect else {})
+                        )
+                        listed += [t.to_dict() for t in remote.discover()]
+                    except Exception as exc:
+                        self.trace.event(
+                            record.id,
+                            "mcp",
+                            {"server": spec.get("name"), "error": f"{type(exc).__name__}: {exc}"},
+                        )
+                record.extra["mcp_tools"] = listed
+                self._save(record)
+            found.update({t["name"]: Extra(**t) for t in record.extra["mcp_tools"]})
+        return found
+
+    def _remote(self, record: SessionRecord, tool: Extra, args: dict[str, Any]) -> dict[str, Any]:
+        """A remote MCP tool, called from here: its images become this session's attachments."""
+        servers = record.extra.get("mcp") or []
+        remote = Remote(servers, **({"connect": self.mcp_connect} if self.mcp_connect else {}))
+        try:
+            text, images, failed = remote.call(tool, args)
+        except Exception as exc:
+            raise WspxError(f"MCP server {tool.server}: {type(exc).__name__}: {exc}") from exc
+        metas = [
+            self.upload(data, name=f"{tool.remote}-{i + 1}.{kind.split('/')[-1]}", media_type=kind)
+            for i, (data, kind) in enumerate(images)
+        ]
+        cut = text if len(text) <= REMOTE_CHARS else text[:REMOTE_CHARS] + "\n… (cut)"
+        return {"summary": cut, "ok": not failed, "handles": [], "data": {}, "attachments": metas}
 
     # ------------------------------------------------------------------ attachments
 
@@ -778,6 +843,8 @@ def _minutes(seconds: float) -> str:
 
 
 MAX_ATTACHMENT = 20 * 2**20
+REMOTE_CHARS = 12_000
+"""A remote MCP tool's text, as much as a wspx tool's summary may hold."""
 
 GPU_CAPABILITY = {
     "T4": 7.5,

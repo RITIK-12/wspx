@@ -132,3 +132,21 @@ def test_the_transcript_keeps_ids_not_bytes() -> None:
     assert saved["oid"] == "sha256:img"
     assert set(saved) <= {"oid", "media_type", "name", "size", "width", "height", "caption"}
     assert load_message(dumped).outputs[0].attachments[0] == IMG
+
+
+def test_each_provider_formats_a_project_tool_its_own_way() -> None:
+    from wspx.driver.providers.anthropic import AnthropicProvider
+    from wspx.driver.providers.compat import ChatProvider
+    from wspx.driver.providers.google import GoogleProvider
+    from wspx.driver.providers.openai import OpenAIProvider
+
+    spec = {"name": "score", "description": "Score answers", "schema": {"type": "object"}}
+    assert (
+        AnthropicProvider("m", client=object()).format_tool(spec)["input_schema"] == spec["schema"]
+    )
+    assert OpenAIProvider("m", client=object()).format_tool(spec)["parameters"] == spec["schema"]
+    assert "parameters_json_schema" in GoogleProvider("m", client=object()).format_tool(spec)
+    assert (
+        ChatProvider("m", name="hf:m", client=object()).format_tool(spec)["function"]["name"]
+        == "score"
+    )

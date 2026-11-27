@@ -2167,6 +2167,47 @@ class Lab:
         }
         return export.export_bundle(objects, manifest, out)
 
+    def project_tool(self, call: str, args: dict[str, Any], *, name: str) -> ToolResult:
+        """One of the project's own tools (``[[driver.tools]]``): ``path.py:function`` called
+        with the arguments as a dict; it returns text or a JSON-ready value."""
+        from wspx.lab import sdk
+
+        rel, _, func = call.rpartition(":")
+        path = (self.workdir / rel).resolve()
+        if not rel or not path.is_relative_to(self.workdir.resolve()) or not path.is_file():
+            raise WspxError(f"{call}: no such file in the project")
+        buf = io.StringIO()
+        previous = sdk.activate(self)
+        try:
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+                try:
+                    namespace = runpy.run_path(str(path), run_name=f"wspx_tool_{name}")
+                    fn = namespace.get(func)
+                    if not callable(fn):
+                        raise WspxError(f"{call}: {path.name} has no function {func}")
+                    out = fn(args)
+                    ok = True
+                except WspxError:
+                    raise
+                except Exception:
+                    ok, out = False, None
+                    traceback.print_exc()
+        finally:
+            sdk.activate(previous)
+        printed = buf.getvalue().strip()
+        data: dict[str, Any] = {}
+        if isinstance(out, str):
+            text = out
+        elif out is None:
+            text = ""
+        else:
+            text = json.dumps(out, indent=1, default=str)
+            if isinstance(out, dict | list):
+                data = {"result": out}
+        if printed:
+            text = (text + "\n" if text else "") + printed[-4000:]
+        return ToolResult(text or f"{name} returned nothing", data, ok=ok)
+
     def run(self, script: str, *, args: Sequence[str] = ()) -> ToolResult:
         from wspx.lab import sdk
 
