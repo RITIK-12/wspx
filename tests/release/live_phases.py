@@ -1,5 +1,6 @@
-"""Edits reaching a running vLLM, no reload: the phases ``live_h100.py`` runs, one model per
-process. Imports no Modal (a plain process cannot import the Modal app)."""
+"""Edits reaching a running vLLM, no reload, from a lab that holds no copy of the model: the
+phases ``live_h100.py`` runs, one model per process. Imports no Modal (a plain process
+cannot import the Modal app)."""
 
 from __future__ import annotations
 
@@ -19,36 +20,29 @@ TOKENS = 64
 
 
 def _lab(model: str, work: Path) -> tuple[Any, Any, Any]:
-    """A lab with vLLM beside it, planned the way the lab server plans it."""
+    """A lab with no copy of the model beside vLLM, planned the way the lab server plans it."""
+    import resource
+
     import torch
 
     from wspx.config import VllmSection
     from wspx.lab.engines.vllm import VLLMEngine, can_serve, plan
     from wspx.lab.loader import float_sizes, resolve_source
-    from wspx.lab.offload import stream
     from wspx.lab.sdk import open_lab
 
     source = resolve_source(model, local_only=True)
     ok, why = can_serve(source)
     assert ok, why
     on_disk = sum(f.stat().st_size for f in source.glob("*.safetensors"))
-    total, outside, largest = float_sizes(model, local_only=True)
+    _, _, largest = float_sizes(model, local_only=True)
     settings = VllmSection(agreement_prompts=len(PROMPTS), max_model_len=4096)
-    first = plan(
-        settings, checkpoint_bytes=on_disk, hf_bytes=total, resident_bytes=outside + 2 * largest
-    )
     (work / "proj").mkdir(parents=True, exist_ok=True)
-    lab = open_lab(model, store=work / "store", workdir=work / "proj")
-    streamed = None
-    if first.stream:
-        streamed = stream(lab.model, "cuda:0").describe()
+    t = time.perf_counter()
+    lab = open_lab(model, store=work / "store", workdir=work / "proj", weights="checkpoint")
+    lab_s = time.perf_counter() - t
     held = torch.cuda.memory_allocated(0)
-    p = plan(
-        settings,
-        checkpoint_bytes=on_disk,
-        hf_bytes=total if first.stream else held,
-        resident_bytes=held if first.stream else None,
-    )
+    p = plan(settings, checkpoint_bytes=on_disk, resident_bytes=held + 2 * largest, weightless=True)
+    t = time.perf_counter()
     engine = VLLMEngine(
         lab.model,
         tree=lab.tree,
@@ -60,7 +54,16 @@ def _lab(model: str, work: Path) -> tuple[Any, Any, Any]:
         log=work / "vllm.log",
     )
     lab.engine = engine
-    return lab, engine, {"plan": p.describe(), "streamed": streamed, "info": engine.info}
+    setup = {
+        "plan": p.describe(),
+        "lab_open_s": round(lab_s, 1),
+        "vllm_start_s": round(time.perf_counter() - t, 1),
+        "lab_gpu_gb": round(held / 2**30, 2),
+        "lab_host_peak_gb": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20, 1),
+        "checkpoint_gb": round(on_disk / 2**30, 1),
+        "info": engine.info,
+    }
+    return lab, engine, setup
 
 
 def _answers(engine: Any, lab: Any) -> tuple[list[list[int]], float]:

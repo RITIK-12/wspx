@@ -84,15 +84,22 @@ class WorkingTree:
         load_delta: DeltaLoader,
         base_reader: BaseReader | None = None,
         cache_bytes: int | None = None,
+        weights: Any = None,
     ) -> None:
         self.model = model
         self.ir = ir
         self.load_delta = load_delta
         self.base_reader = base_reader
         self.cache_bytes = cache_bytes
-        self.params: dict[str, torch.nn.Parameter] = dict(model.named_parameters())
+        self.meta: dict[str, torch.nn.Parameter] = dict(model.named_parameters())
+        """The model's own parameters: shapes and dtypes (on the meta device without
+        resident weights)."""
+        self.weights = weights
+        """:class:`wspx.lab.weights.LiveWeights` when the lab holds no copy of the model
+        (vLLM does): values are the checkpoint's plus the edits, read when asked for."""
+        self.params: Any = weights if weights is not None else self.meta
         self.state = TreeState()
-        self._dtype = {name: p.dtype for name, p in self.params.items()}
+        self._dtype = {name: p.dtype for name, p in self.meta.items()}
         self._cache: OrderedDict[str, torch.Tensor] = OrderedDict()
         self._cache_used = 0
         self._pinned: set[str] = set()
@@ -119,14 +126,33 @@ class WorkingTree:
 
     # ------------------------------------------------------------------ base
 
+    @property
+    def virtual(self) -> bool:
+        return self.weights is not None
+
+    def shape(self, name: str) -> tuple[int, ...]:
+        return tuple(self.meta[name].shape)
+
+    def device(self, name: str) -> torch.device:
+        """Where ``name``'s value lives: host memory for a tensor read from the checkpoint."""
+        p = self.meta[name]
+        return torch.device("cpu") if self.virtual and not self.weights.resident(name) else p.device
+
     def base(self, name: str) -> torch.Tensor:
         """The base tensor (unedited), in its stored dtype, on the parameter's device."""
-        device = self.params[name].device
+        device = self.device(name)
+        if self.virtual:  # always re-readable from the checkpoint
+            if self.weights.resident(name) and self._live_is_base(name):
+                held: torch.Tensor = self.weights.params[name].detach()
+                return held
+            base: torch.Tensor = self.weights.base(name)
+            return base.to(device)
         if name in self._cache:
             self._cache.move_to_end(name)
             return self._cache[name].to(device)
         if self._live_is_base(name):
-            return self.params[name].detach()
+            live: torch.Tensor = self.params[name].detach()
+            return live
         if self.base_reader is None:  # pragma: no cover - snapshots are pinned
             raise PatchError(f"base of {name} was not kept and there is no reader")
         tensor = self.base_reader(name)
@@ -139,7 +165,7 @@ class WorkingTree:
 
     def _snapshot(self, name: str) -> None:
         """Keep a copy of the base before its first edit."""
-        if name in self._cache or not self._live_is_base(name):
+        if self.virtual or name in self._cache or not self._live_is_base(name):
             return
         copy = self.params[name].detach().to("cpu", copy=True)
         self._remember_base(name, copy, pinned=self.base_reader is None)
@@ -202,21 +228,19 @@ class WorkingTree:
             self._snapshot(name)
             deltas = [self.delta(o) for o in state.merged.get(name, ())]
             for d in deltas:
-                if tuple(d.shape) != tuple(self.params[name].shape):
-                    raise PatchError(
-                        f"{name}: delta shape {d.shape} != {tuple(self.params[name].shape)}"
-                    )
+                if tuple(d.shape) != self.shape(name):
+                    raise PatchError(f"{name}: delta shape {d.shape} != {self.shape(name)}")
             promote = name in state.promote
             dtype = torch.float32 if promote else self._dtype[name]
             new = materialize(self.base(name), deltas, dtype=dtype)
-            shape = tuple(self.params[name].shape)
+            shape = self.shape(name)
             if self.served is not None and self.served.quantized(name, shape):
                 if promote:  # kept exact in bf16; the stored format no longer applies
                     self.served.parts.pop(name, None)
                     self.served.last.pop(name, None)
                 else:
                     new = self.served.apply(name, self.base(name), new)
-            self._write(name, new, promote=promote)
+            self._write(name, new, promote=promote, edited=bool(deltas) or promote)
             self._hashes.pop(name, None)
             changed.append(name)
         self._sync_adapters(state)
@@ -228,7 +252,12 @@ class WorkingTree:
             self.remember(d)
         return self.checkout(self.state.with_deltas(deltas, precision))
 
-    def _write(self, name: str, value: torch.Tensor, *, promote: bool) -> None:
+    def _write(self, name: str, value: torch.Tensor, *, promote: bool, edited: bool = True) -> None:
+        if self.virtual:
+            if self.meta[name].dtype != value.dtype:
+                self._promote_module(name, enable=promote)
+            self.weights.write(name, value, edited=edited)
+            return
         param = self.params[name]
         with torch.no_grad():
             if param.dtype != value.dtype:
@@ -265,15 +294,23 @@ class WorkingTree:
         for handle in self._hooks.pop(key, []):
             handle.remove()
         if not enable:
+            from wspx.lab.weights import is_placeholder, placeholder
+
             for pname, p in module.named_parameters(recurse=False):
                 full = f"{module_path}.{pname}" if module_path else pname
                 if full in self._dtype and p.dtype != self._dtype[full]:
-                    p.data = p.data.to(self._dtype[full])
+                    dtype = self._dtype[full]
+                    p.data = placeholder(p.shape, dtype) if is_placeholder(p) else p.data.to(dtype)
             return
         out_dtype = self._dtype[name]
+        from wspx.lab.weights import is_placeholder, placeholder
+
         for p in module.parameters(recurse=False):
             if p.is_floating_point() and p.dtype != torch.float32:
-                p.data = p.data.float()
+                # a placeholder stays one (its value comes from the checkpoint, in fp32)
+                p.data = (
+                    placeholder(p.shape, torch.float32) if is_placeholder(p) else p.data.float()
+                )
 
         def pre(_m: torch.nn.Module, args: tuple[Any, ...]) -> tuple[Any, ...]:
             return tuple(

@@ -118,6 +118,8 @@ class Lab:
         scratch: bool = False,
         source_dir: Path | None = None,
         engine: Engine | None = None,
+        weights: Any = None,
+        served: Any = None,
     ) -> None:
         self.model = model
         self.engine = engine or Engine(model)
@@ -152,9 +154,14 @@ class Lab:
         """The open model's trace: what it was given and what it said, per tool call."""
         self.text.io = self.io
         self.tree = WorkingTree(
-            model, ir, load_delta=self._load_delta, base_reader=base_reader, cache_bytes=cache_bytes
+            model,
+            ir,
+            load_delta=self._load_delta,
+            base_reader=base_reader,
+            cache_bytes=cache_bytes,
+            weights=weights,
         )
-        self.tree.served = Served.open(
+        self.tree.served = served or Served.open(
             model, source_dir, keep_scales=self.config.model.quant_scales == "keep"
         )
         self.probe = Probe(model, ir)
@@ -179,7 +186,9 @@ class Lab:
         return device_of(self.model)
 
     @property
-    def params(self) -> dict[str, torch.nn.Parameter]:
+    def params(self) -> Any:
+        """Name → current value (the model's parameters, or values read from the checkpoint
+        when vLLM holds the model)."""
         return self.tree.params
 
     def _state_path(self) -> str:
@@ -2121,14 +2130,16 @@ class Lab:
             "served": self.tree.served,
         }
         if kind == "merged":
-            info = export.export_merged(self.model, self.ir, out, **files)
+            info = export.export_merged(
+                self.model, self.ir, out, weights=self.tree.weights, **files
+            )
         elif kind == "peft":
             info = export.export_peft(
                 self.model, self.ir, self.tree, out, base_model=base_model, max_rank=max_rank
             )
         elif kind == "gguf":
             tmp = out.with_suffix(".merged")
-            export.export_merged(self.model, self.ir, tmp, **files)
+            export.export_merged(self.model, self.ir, tmp, weights=self.tree.weights, **files)
             info = export.export_gguf(tmp, out)
         elif kind == "bundle":
             info = self._bundle(out)

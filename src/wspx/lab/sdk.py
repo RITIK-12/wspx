@@ -62,12 +62,31 @@ def open_lab(
     workdir: str | Path | None = None,
     processor: Any = None,
     source_dir: str | Path | None = None,
+    weights: str = "resident",
+    device: str | None = None,
 ) -> Lab:
     """Load (or take) a model, build or reuse its IR from the store, and open a session.
 
     ``processor`` (image and video inputs) is loaded with a vision-language checkpoint; pass
-    one with a model object.
+    one with a model object. ``weights="checkpoint"`` holds no copy of the model (vLLM does):
+    values are read from the checkpoint as needed and forward passes run a layer at a time
+    on ``device`` (the GPU when there is one).
     """
+    if weights == "checkpoint":
+        if not isinstance(model, str):
+            raise ValueError('weights="checkpoint" needs a checkpoint, not a model object')
+        return _open_from_checkpoint(
+            model,
+            store=store,
+            session=session,
+            branch=branch,
+            config=config,
+            revision=revision,
+            dtype=dtype,
+            trust_remote_code=trust_remote_code,
+            workdir=workdir,
+            device=device,
+        )
     st = Store(store)
     base_reader = None
     hashes = None
@@ -117,6 +136,72 @@ def open_lab(
         workdir=Path(workdir) if workdir else None,
         processor=processor,
         source_dir=source_dir,
+    )
+
+
+def _open_from_checkpoint(
+    model: str,
+    *,
+    store: str | Path,
+    session: str,
+    branch: str | None,
+    config: WspxConfig | None,
+    revision: str | None,
+    dtype: str,
+    trust_remote_code: bool,
+    workdir: str | Path | None,
+    device: str | None,
+) -> Lab:
+    """A lab over a skeleton: the working tree's values come from the checkpoint."""
+    from wspx.lab.loader import load_skeleton
+    from wspx.lab.offload import stream
+    from wspx.lab.served import Served
+    from wspx.lab.weights import CheckpointReader, LiveWeights, load_buffers
+
+    cfg = config or WspxConfig.discover(workdir)
+    loaded = load_skeleton(
+        model,
+        revision=revision,
+        dtype=dtype,
+        trust_remote_code=trust_remote_code,
+        attn_implementation=cfg.model.attn_implementation,
+        experts_implementation=cfg.model.experts_implementation,
+    )
+    assert loaded.path is not None
+    where = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+    served = Served.open(loaded.model, loaded.path, keep_scales=cfg.model.quant_scales == "keep")
+    reader = CheckpointReader(
+        loaded.model,
+        loaded.path,
+        served=served,
+        dtypes={n: p.dtype for n, p in loaded.model.named_parameters()},
+    )
+    live = LiveWeights(loaded.model, reader)
+    load_buffers(loaded.model, reader, where)
+    stream(loaded.model, where, weights=live)
+    st = Store(store)
+    ir = _cached_ir(st, loaded.fingerprint)
+    if ir is None:
+        ir = build_ir(
+            loaded.model,
+            fingerprint=loaded.fingerprint,
+            hash_params=False,
+            vision_inputs=probe_inputs(loaded.processor, torch.device(where)),
+        )
+        _save_ir(st, ir)
+    return Lab(
+        loaded.model,
+        ir,
+        st,
+        session=session,
+        branch=branch,
+        tokenizer=loaded.tokenizer,
+        config=cfg,
+        workdir=Path(workdir) if workdir else None,
+        processor=loaded.processor,
+        source_dir=loaded.path,
+        weights=live,
+        served=served,
     )
 
 

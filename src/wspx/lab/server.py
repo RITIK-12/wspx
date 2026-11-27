@@ -409,20 +409,19 @@ def main(argv: list[str] | None = None) -> None:
         extract(store.objects.get(args.snapshot), workdir)
     config = WspxConfig.discover(workdir)
     engine_plan, why_not, sizes, on_disk = _plan_engines(config, args)
-    loaded = load_hf(
-        args.model,
-        dtype=args.dtype,
-        trust_remote_code=args.trust_remote_code,
-        local_only=True,
-        device=engine_plan.hf_device if engine_plan else None,
-        attn_implementation=config.model.attn_implementation,
-        experts_implementation=config.model.experts_implementation,
-    )
-    if engine_plan is not None and engine_plan.stream:
-        from wspx.lab.offload import stream
-
-        streamed = stream(loaded.model, "cuda:0")
-        print(f"wspx lab: {streamed.describe()}", file=sys.stderr, flush=True)
+    weights = served = None
+    if engine_plan is not None:
+        # vLLM holds the model: the lab keeps a skeleton and reads values from the checkpoint
+        loaded, weights, served = _skeleton(args, config, engine_plan)
+    else:
+        loaded = load_hf(
+            args.model,
+            dtype=args.dtype,
+            trust_remote_code=args.trust_remote_code,
+            local_only=True,
+            attn_implementation=config.model.attn_implementation,
+            experts_implementation=config.model.experts_implementation,
+        )
     ir = _cached_ir(store, loaded.fingerprint)
     if ir is None:
         ir = build_ir(
@@ -445,6 +444,8 @@ def main(argv: list[str] | None = None) -> None:
         processor=loaded.processor,
         scratch=bool(args.snapshot),
         source_dir=loaded.path,
+        weights=weights,
+        served=served,
     )
     if engine_plan is not None and loaded.path is not None:
         try:
@@ -452,10 +453,11 @@ def main(argv: list[str] | None = None) -> None:
         except Exception as exc:
             if config.lab.engine == "vllm":
                 raise
-            why_not = f"vLLM did not start ({type(exc).__name__}: {str(exc)[:300]})"
-            from wspx.lab.offload import unstream
-
-            unstream(loaded.model)
+            why_not = (
+                f"vLLM did not start ({type(exc).__name__}: {str(exc)[:300]}); transformers "
+                "generates from the checkpoint a layer at a time, slowly; restart the lab "
+                "with engine = 'hf' to hold the model in memory"
+            )
     if why_not:
         lab.engine.notes.append(why_not)
         print(f"wspx lab: transformers generates: {why_not}", file=sys.stderr, flush=True)
@@ -464,6 +466,38 @@ def main(argv: list[str] | None = None) -> None:
     print(f"wspx lab: outbound network {server.network}", file=sys.stderr, flush=True)
     server.watchdog()
     uvicorn.run(server.app(), host="0.0.0.0", port=args.port, log_level="warning")
+
+
+def _skeleton(args: Any, config: Any, engine_plan: Any) -> tuple[Any, Any, Any]:
+    """The model without its weights, values read from the checkpoint, and layers run on the
+    GPU one at a time: vLLM holds the only copy."""
+    from wspx.lab.loader import load_skeleton
+    from wspx.lab.offload import stream
+    from wspx.lab.served import Served
+    from wspx.lab.weights import CheckpointReader, LiveWeights, load_buffers
+
+    loaded = load_skeleton(
+        args.model,
+        dtype=args.dtype,
+        trust_remote_code=args.trust_remote_code,
+        local_only=True,
+        attn_implementation=config.model.attn_implementation,
+        experts_implementation=config.model.experts_implementation,
+    )
+    device = "cuda:0"  # one GPU, or the first of several (vLLM takes the last)
+    assert loaded.path is not None  # a checkpoint folder: vLLM serves it
+    served = Served.open(loaded.model, loaded.path, keep_scales=config.model.quant_scales == "keep")
+    reader = CheckpointReader(
+        loaded.model,
+        loaded.path,
+        served=served,
+        dtypes={n: p.dtype for n, p in loaded.model.named_parameters()},
+    )
+    weights = LiveWeights(loaded.model, reader)
+    load_buffers(loaded.model, reader, device)
+    streamed = stream(loaded.model, device, weights=weights)
+    print(f"wspx lab: {streamed.describe()}", file=sys.stderr, flush=True)
+    return loaded, weights, served
 
 
 def _plan_engines(config: Any, args: Any) -> tuple[Any, str, tuple[int, int, int], int]:
@@ -486,13 +520,15 @@ def _plan_engines(config: Any, args: Any) -> tuple[Any, str, tuple[int, int, int
     sizes = float_sizes(
         args.model, dtype=args.dtype, trust_remote_code=args.trust_remote_code, local_only=True
     )
-    total, outside, largest = sizes
+    _, outside, largest = sizes
     try:
+        # the lab holds no copy: what lies outside the layer stacks, and a layer in flight
         engine_plan = plan_engine(
             config.lab.vllm,
             checkpoint_bytes=on_disk,
-            hf_bytes=total,
+            hf_bytes=None,
             resident_bytes=outside + 2 * largest,
+            weightless=True,
         )
     except WspxError as exc:
         if config.lab.engine == "vllm":
@@ -517,13 +553,13 @@ def _start_vllm(
 
     from wspx.lab.engines.vllm import VLLMEngine, plan
 
-    if engine_plan.vllm_gpu == 0:  # one GPU: plan again with what transformers took
-        held = torch.cuda.memory_allocated(0)
+    if engine_plan.vllm_gpu == 0:  # one GPU: plan again with what the lab holds
         engine_plan = plan(
             config.lab.vllm,
             checkpoint_bytes=on_disk,
-            hf_bytes=sizes[0] if engine_plan.stream else held,
-            resident_bytes=held if engine_plan.stream else None,
+            hf_bytes=None,
+            resident_bytes=torch.cuda.memory_allocated(0) + 2 * sizes[2],
+            weightless=True,
         )
     print(engine_plan.describe(), file=sys.stderr, flush=True)
     engine = VLLMEngine(

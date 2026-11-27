@@ -136,6 +136,65 @@ def load_hf(
     )
 
 
+def load_skeleton(
+    source: str,
+    *,
+    revision: str | None = None,
+    dtype: str = "bfloat16",
+    trust_remote_code: bool = False,
+    local_only: bool = False,
+    attn_implementation: str | None = None,
+    experts_implementation: str | None = None,
+) -> Loaded:
+    """The model without its weights: parameters on the meta device (in the dtypes loading
+    gives them), buffers real. For a lab whose weights vLLM holds; values are read from the
+    checkpoint as they are needed (:mod:`wspx.lab.weights`)."""
+    import re
+
+    from accelerate import init_empty_weights
+    from transformers import AutoConfig, AutoTokenizer
+
+    path = resolve_source(source, revision=revision, local_only=local_only)
+    config = AutoConfig.from_pretrained(str(path), trust_remote_code=trust_remote_code)
+    auto = _auto_class(config)
+    kwargs: dict[str, Any] = {}
+    if attn_implementation:
+        kwargs["attn_implementation"] = attn_implementation
+    if experts_implementation:
+        kwargs["experts_implementation"] = experts_implementation
+    try:
+        with init_empty_weights(include_buffers=False):
+            model = auto.from_config(
+                config,
+                trust_remote_code=trust_remote_code,
+                dtype=DTYPES.get(dtype, torch.bfloat16),
+                **kwargs,
+            )
+    except Exception as exc:
+        raise ModelLoadError(f"cannot build {source}: {exc}") from exc
+    keep = [
+        *(getattr(model, "_keep_in_fp32_modules", None) or []),
+        *(getattr(model, "_keep_in_fp32_modules_strict", None) or []),
+    ]
+    if keep:  # as from_pretrained keeps them
+        pattern = re.compile("|".join(rf"((^|\.){re.escape(m)}($|\.))" for m in keep))
+        for name, p in model.named_parameters():
+            if pattern.search(name) and p.is_floating_point():
+                p.data = p.data.float()
+    from wspx.lab.weights import hollow
+
+    hollow(model)
+    model.eval()
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(str(path), trust_remote_code=trust_remote_code)
+    except Exception:
+        tokenizer = None
+    processor = _processor(path, auto, trust_remote_code) if tokenizer is not None else None
+    return Loaded(
+        model, tokenizer, fingerprint(path, source, revision), source, path, {}, processor
+    )
+
+
 def float_sizes(
     source: str,
     *,

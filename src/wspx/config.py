@@ -145,7 +145,11 @@ class VllmSection(_Section):
     args: list[str] = Field(default_factory=list)
     """Further engine arguments, as on the ``vllm serve`` command line."""
     agreement_prompts: int = Field(default=4, ge=0, le=32)
-    """Greedy prompts compared between transformers and vLLM at start and after each sync."""
+    """Greedy prompts compared between transformers and vLLM when the lab starts."""
+    check_pushes: bool = False
+    """Compare the two again after every push of edited weights. The lab holds no copy of the
+    model (vLLM does), so transformers' side streams the checkpoint a layer at a time:
+    seconds per check on a large model."""
 
 
 class LabSection(_Section):

@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+from collections.abc import Iterator, Mapping, MutableMapping
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,7 @@ def export_merged(
     processor: Any = None,
     served: Any = None,
     shard_bytes: int = SHARD_BYTES,
+    weights: Mapping[str, torch.Tensor] | None = None,
 ) -> dict[str, Any]:
     """Sharded safetensors of the live weights under the checkpoint's own names and layouts
     (what transformers renamed or fused on load is turned back), plus every non-weight file
@@ -47,16 +49,22 @@ def export_merged(
     With ``served`` (a checkpoint stored quantized, :mod:`wspx.lab.served`), tensors stored
     quantized are written in their format: edited ones as the lab requantized them, the
     rest as the source's own bytes. A tensor kept in promote mode is written in its loaded
-    dtype, and ``hf_quant_config.json`` lists it so."""
+    dtype, and ``hf_quant_config.json`` lists it so. ``weights``: the working tree's values
+    when the lab holds no copy of the model (read a layer at a time as they are written)."""
     out.mkdir(parents=True, exist_ok=True)
     for stale in out.glob("*.safetensors"):
         stale.unlink()
     persistent = _persistent_buffers(model)
-    live: dict[str, torch.Tensor] = dict(model.named_parameters())
-    live.update({n: b for n, b in model.named_buffers() if n in persistent})
-    promoted = [
+    meta = dict(model.named_parameters())
+    live: MutableMapping[str, torch.Tensor] = _Live(
+        weights if weights is not None else meta,
+        {n: b for n, b in model.named_buffers() if n in persistent},
+    )
+    shapes = {n: tuple(p.shape) for n, p in meta.items()}
+    shapes.update({n: tuple(b.shape) for n, b in model.named_buffers() if n in persistent})
+    promoted = [  # the parameter's own dtype says so, without reading its value
         n
-        for n, t in live.items()
+        for n, t in meta.items()
         if t.dtype == torch.float32 and ir.params.get(n) and ir.params[n].dtype != "float32"
     ]
     src = checkpoint.read_source(source)
@@ -67,7 +75,7 @@ def export_merged(
     kept_bf16: list[str] = []
     if served is not None:
         for name in sorted(live):
-            shape = tuple(live[name].shape)
+            shape = shapes[name]
             if not served.quantized(name, shape):
                 continue
             if name in promoted:  # exact in fp32 here: written in the loaded dtype instead
@@ -95,7 +103,7 @@ def export_merged(
         c
         for n in promoted
         if n in live
-        for c in checkpoint.names_in_checkpoint(model, n, tuple(live[n].shape))
+        for c in checkpoint.names_in_checkpoint(model, n, shapes[n])
     }
     cast = 0
     for raw in [*stored, *checkpoint.stream(model, live)]:
@@ -176,6 +184,42 @@ def export_merged(
         "notes": notes,
         "names": "checkpoint" if src and src.tensors else "loaded",
     }
+
+
+class _Live(MutableMapping[str, torch.Tensor]):
+    """Name → value, read from ``values`` when asked for (a lab without a copy of the model
+    reads them from the checkpoint), with entries replaced or dropped as export goes."""
+
+    def __init__(self, values: Mapping[str, torch.Tensor], extra: dict[str, torch.Tensor]) -> None:
+        self.source = values
+        self.names = [*values, *(n for n in extra if n not in values)]
+        self.extra = dict(extra)
+        self.set: dict[str, torch.Tensor] = {}
+        self.gone: set[str] = set()
+
+    def __getitem__(self, name: str) -> torch.Tensor:
+        if name in self.gone:
+            raise KeyError(name)
+        if name in self.set:
+            return self.set[name]
+        if name in self.extra:
+            return self.extra[name]
+        value: torch.Tensor = self.source[name]
+        return value
+
+    def __setitem__(self, name: str, value: torch.Tensor) -> None:
+        self.set[name] = value
+        self.gone.discard(name)
+
+    def __delitem__(self, name: str) -> None:
+        self.gone.add(name)
+        self.set.pop(name, None)
+
+    def __iter__(self) -> Iterator[str]:
+        return (n for n in self.names if n not in self.gone)
+
+    def __len__(self) -> int:
+        return len(self.names) - len(self.gone)
 
 
 def _dtype(name: str) -> torch.dtype:

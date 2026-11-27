@@ -48,7 +48,8 @@ class OpContext:
 
     def weight(self, name: str) -> torch.Tensor:
         """The live tensor (current working tree), as fp32."""
-        return self.tree.params[name].detach().float()
+        live: torch.Tensor = self.tree.params[name]
+        return live.detach().float()
 
     def base_hash(self, name: str) -> str:
         info = self.ir.params[name]

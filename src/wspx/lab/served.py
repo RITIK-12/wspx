@@ -124,11 +124,13 @@ class Served:
         """``value`` written in the stored format (changing nothing here): the checkpoint
         tensors, how much of ``value - base`` survived, and what loading them gives.
         ``None`` when ``value`` equals ``base``."""
-        delta = value.float() - base.float()
+        # re-encoding runs on the GPU when there is one (the lab's values may be on the host)
+        device = torch.device("cuda") if torch.cuda.is_available() else value.device
+        delta = value.to(device).float() - base.to(device).float()
         if not bool(delta.ne(0).any()):
             return None
         ck_delta = checkpoint.to_checkpoint(self.model, {name: delta})
-        plain = checkpoint.to_checkpoint(self.model, {name: value})
+        plain = checkpoint.to_checkpoint(self.model, {name: value.to(device)})
         parts: dict[str, torch.Tensor] = {}
         blocks = values = clipped = rescaled = 0
         kinds = set()
@@ -137,7 +139,7 @@ class Served:
             if fmt is None:
                 parts[ck] = plain[ck]
                 continue
-            stored = self._read(fmt.parts, d.device)
+            stored = self._read(fmt.parts, device)
             done = quant.requantize(fmt, stored, d, keep_scales=self.keep_scales)
             parts.update(done.parts)
             blocks, values, clipped = (
@@ -148,13 +150,15 @@ class Served:
             rescaled += done.rescaled
             kinds.add(fmt.kind.upper())
         live = checkpoint.from_checkpoint(self.model, parts)[name].to(base.dtype)
-        served = live.float() - base.float()
+        served = live.float() - base.to(device).float()
         norm = float(delta.norm())
         ratio = float(served.norm()) / norm if norm else 0.0
         cos = float(
             (served.flatten() @ delta.flatten()) / (served.norm() * delta.norm()).clamp_min(1e-30)
         )
         cos = 0.0 if math.isnan(cos) else cos
+        live = live.to(base.device)
+        parts = {k: v.to(base.device) for k, v in parts.items()}  # kept beside the lab's values
         survival = Survival(
             name,
             "/".join(sorted(kinds)),

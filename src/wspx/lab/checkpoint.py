@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Collection, Iterator
+from collections.abc import Collection, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -112,7 +112,7 @@ def _natural(s: str) -> list[Any]:
 
 
 def stream(
-    model: torch.nn.Module, live: dict[str, torch.Tensor]
+    model: torch.nn.Module, live: Mapping[str, torch.Tensor]
 ) -> Iterator[dict[str, torch.Tensor]]:
     """``to_checkpoint`` one layer at a time, on the CPU, so a large model is never held twice
     (on the GPU or off it). A layer whose conversion needs tensors from elsewhere is kept

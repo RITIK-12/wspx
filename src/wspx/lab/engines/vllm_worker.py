@@ -13,7 +13,9 @@ talks to it on localhost only:
 - ``GET /ready``, ``GET /info`` and ``GET /checksums`` say what it is serving.
 """
 
-from __future__ import annotations
+# No ``from __future__ import annotations``: FastAPI reads the endpoints' annotations, and
+# ``Request`` is imported inside build_app, so as strings they would not resolve and
+# ``request`` would be taken for a query parameter (every POST answered 422).
 
 import argparse
 import asyncio

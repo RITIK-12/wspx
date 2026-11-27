@@ -1,7 +1,7 @@
-"""Edits reaching a running vLLM on one H100, without a reload: Qwen3-0.6B (both engines
-on the GPU) and Inkling-2-Mini (NVFP4 and MXFP8 experts; transformers' copy streamed from
-host memory). Each push is timed, both engines are compared after it, and going back to
-the base must give the base's answers exactly.
+"""Edits reaching a running vLLM on one H100, without a reload: Qwen3-0.6B and
+Inkling-2-Mini (NVFP4 and MXFP8 experts). vLLM holds the only copy of the model; the lab
+holds a skeleton and reads the checkpoint as needed. Each push is timed, both engines are
+compared after it, and going back to the base must give the base's answers exactly.
 
     modal run --env wspx tests/release/live_h100.py
 """
@@ -45,7 +45,9 @@ def live() -> list[dict]:  # type: ignore[type-arg]
             "import json, sys; sys.path.insert(0, '/root'); import live_phases as m\n"
             f"m.run({model!r}, json.loads({json.dumps(edits)!r}), {path!r})\n"
         )
-        done = subprocess.run([sys.executable, "-c", child], capture_output=True, text=True)
+        done = subprocess.run(
+            [sys.executable, "-c", child], capture_output=True, text=True, check=False
+        )
         try:
             out.append(json.loads(Path(path).read_text()))
         except (OSError, ValueError):

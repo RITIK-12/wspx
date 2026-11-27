@@ -161,13 +161,15 @@ def plan(
     gpus: list[tuple[str, int]] | None = None,
     hf_bytes: int | None = None,
     resident_bytes: int | None = None,
+    weightless: bool = False,
 ) -> Plan:
     """Decide where vLLM runs before transformers loads (``gpus``: name and memory per GPU).
 
     With two or more GPUs, transformers keeps the first and vLLM the last. With one, both
     share it when transformers' copy (``hf_bytes``) leaves vLLM room for a useful KV cache;
     otherwise transformers' copy stays in host memory and only ``resident_bytes`` (what lies
-    outside its layer stacks, and a layer in flight) sit on the GPU."""
+    outside its layer stacks, and a layer in flight) sit on the GPU. ``weightless``: the lab
+    holds no copy at all (it reads the checkpoint), so vLLM gets all but ``resident_bytes``."""
     if gpus is None:
         if not torch.cuda.is_available():
             raise WspxError("the vLLM engine needs a GPU; set [lab] gpu, or use engine = 'hf'")
@@ -193,12 +195,31 @@ def plan(
             )
         return p
     name, total = gpus[0]
-    hf = hf_bytes if hf_bytes is not None else checkpoint_bytes
     headroom = 0.08 * total + 3 * gb  # activations for probes, allocator slack
+    if weightless:
+        lab = resident_bytes or 0
+        room = (total - lab - headroom) / total
+        memory = settings.memory or _floor(room)
+        if memory * total < need or memory > room + 1e-6:
+            raise WspxError(
+                f"vLLM needs about {need / gb:.0f} GB of the {total / gb:.0f} GB {name} and may "
+                f"use {memory * total / gb:.0f} GB beside the lab's {lab / gb:.1f} GB; use a "
+                "larger GPU or two ([lab] gpu = 'H100:2')"
+            )
+        p = Plan(None, 0, memory, stream=True)
+        p.lines = [
+            f"one GPU ({name}, {total / gb:.0f} GB): vLLM holds the model, and may use "
+            f"{memory:.0%} ({memory * total / gb:.0f} GB) for a {checkpoint_bytes / gb:.1f} GB "
+            "checkpoint",
+            f"the lab holds no copy: {lab / gb:.1f} GB on the GPU (what lies outside the layer "
+            "stacks, a layer in flight); it reads the checkpoint a layer at a time for probes",
+        ]
+        return p
+    hf = hf_bytes if hf_bytes is not None else checkpoint_bytes
     useful = need + max(0.0, 0.15 * total - 4 * gb)  # a KV cache for batched evals
     room = (total - hf - headroom) / total
     if room * total >= useful or (resident_bytes is None and room * total >= need):
-        memory = settings.memory or round(max(room, 0.0), 2)
+        memory = settings.memory or _floor(room)
         p = Plan(None, 0, memory)
         p.lines = [
             f"one GPU ({name}, {total / gb:.0f} GB) shared by both engines",
@@ -214,7 +235,7 @@ def plan(
         return p
     if resident_bytes is not None:
         streamed = (total - resident_bytes - headroom) / total
-        memory = settings.memory or round(max(streamed, 0.0), 2)
+        memory = settings.memory or _floor(streamed)
         if memory * total >= need and memory <= streamed + 1e-6:
             p = Plan("cpu", 0, memory, stream=True)
             p.lines = [
@@ -230,6 +251,11 @@ def plan(
         f"{(resident_bytes or hf) / gb:.0f} GB streamed from host memory); use two GPUs "
         "([lab] gpu = 'H100:2'), a larger GPU, or engine = 'hf'"
     )
+
+
+def _floor(share: float) -> float:
+    """A share of the GPU in hundredths, never above ``share`` (rounding up overcommits)."""
+    return max(math.floor(share * 100) / 100, 0.0)
 
 
 def supported_archs(python: str = VLLM_PYTHON) -> set[str] | None:
@@ -328,6 +354,7 @@ class VLLMEngine(Engine):
         layer."""
         self.survival: dict[str, Any] = {}
         """Adapter edits on tensors stored quantized, as vLLM serves them (merged)."""
+        self._by_layer: dict[str, list[str]] | None = None
         self.agreement: dict[str, Any] | None = None
         self.proc: subprocess.Popen[bytes] | None = None
         self.log = log
@@ -341,8 +368,9 @@ class VLLMEngine(Engine):
             torch.device("cuda", plan.vllm_gpu if plan else 0)
         )
         self.info = self._ready()
+        self._buffer_names = set(self._buffers())
         self._names = sorted(
-            [n for n, _ in model.named_parameters()] + sorted(self._buffers()),
+            [n for n, _ in model.named_parameters()] + sorted(self._buffer_names),
             key=checkpoint._natural,
         )
         self._groups = checkpoint.groups(self._names)
@@ -484,25 +512,59 @@ class VLLMEngine(Engine):
                 out.append(name)
         return out
 
-    def _value(self, name: str, state: TreeState, live: dict[str, torch.Tensor]) -> torch.Tensor:
+    def _value(self, name: str, state: TreeState) -> torch.Tensor:
         """What vLLM should hold for ``name``: the live tensor, plus adapter deltas (which
         transformers runs as a side path) and rounded back from promote mode's fp32."""
+        if name in self._buffer_names:
+            buffer: torch.Tensor = self.model.get_buffer(name)
+            return buffer
         if name in state.adapter or name in state.promote:
             extra = [self.tree.delta(o) for o in state.adapter.get(name, ())]
             return self.tree.preview(
-                name, extra, dtype=self.tree.dtype_of(name), device=live[name].device
+                name, extra, dtype=self.tree.dtype_of(name), device=self.tree.device(name)
             )
-        return live[name]
+        live: torch.Tensor = self.tree.params[name]
+        return live
 
-    def _stored_value(
-        self, name: str, state: TreeState, live: dict[str, torch.Tensor]
-    ) -> dict[str, torch.Tensor] | None:
+    def _rest_of_layers(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """The checkpoint tensors of the layers in ``batch`` that the lab does not hold
+        (static activation scales, KV-cache scales and the like), as the source stores them:
+        vLLM reprocesses a module only once every tensor of it has arrived."""
+        if self.src is None or not self.src.tensors:
+            return {}
+        if self._by_layer is None:
+            self._by_layer = {}
+            for name in self.src.tensors:
+                m = checkpoint._LAYER.match(name)
+                if m:
+                    self._by_layer.setdefault(m.group(1), []).append(name)
+        layers = {m.group(1) for k in batch if (m := checkpoint._LAYER.match(k))}
+        missing = [k for layer in layers for k in self._by_layer.get(layer, []) if k not in batch]
+        if not missing:
+            return {}
+        from safetensors import safe_open
+
+        out: dict[str, torch.Tensor] = {}
+        for fname in sorted(self.src.weight_files):
+            with safe_open(str(self.src.path / fname), framework="pt") as fh:
+                keys = set(fh.keys())
+                for k in missing:
+                    if k in keys and k not in out:
+                        out[k] = fh.get_tensor(k)
+        return out
+
+    def _shape(self, name: str) -> tuple[int, ...]:
+        if name in self._buffer_names:
+            return tuple(self.model.get_buffer(name).shape)
+        return self.tree.shape(name)
+
+    def _stored_value(self, name: str, state: TreeState) -> dict[str, torch.Tensor] | None:
         """A tensor stored quantized that has adapter edits: transformers runs them as a
         side path, and vLLM gets the weight with them merged, in the stored format."""
         served = self.tree.served
         if served is None or name not in state.adapter:
             return None
-        value = self._value(name, state, live)
+        value = self._value(name, state)
         encoded = served.encode(name, self.tree.base(name).to(value.device), value)
         if encoded is None:
             return None
@@ -531,13 +593,13 @@ class VLLMEngine(Engine):
             )
         if served is not None:
             for name in changed:
-                shape = tuple(dict(self.model.named_parameters())[name].shape)
+                shape = self.tree.shape(name)
                 if name in state.promote and served.quantized(name, shape):
                     raise WspxError(
                         f"{name} is kept exact in bf16 (promote mode), and vLLM holds it in the "
                         "checkpoint's quantized format; edit it merged, or use engine = 'hf'"
                     )
-        params = dict(self.model.named_parameters())
+        params = self.tree.meta
         packed = [
             n
             for n in changed
@@ -551,8 +613,6 @@ class VLLMEngine(Engine):
             )
         touched = set(changed)
         groups = list(self._groups) if self.stale else [g for g in self._groups if touched & set(g)]
-        live: dict[str, torch.Tensor] = dict(self.model.named_parameters())
-        live.update(dict(self.model.named_buffers()))
         started = time.perf_counter()
 
         def chunks() -> Iterator[dict[str, torch.Tensor]]:
@@ -560,22 +620,22 @@ class VLLMEngine(Engine):
                 plain: dict[str, torch.Tensor] = {}
                 stored: dict[str, torch.Tensor] = {}
                 for n in group:
-                    shape = tuple(live[n].shape)
+                    shape = self._shape(n)
                     if served is not None and served.quantized(n, shape):
                         # the checkpoint's own format: the edited codes, or the source's bytes
-                        device = live[n].device
                         stored.update(
-                            self._stored_value(n, state, live)
+                            self._stored_value(n, state)
                             or served.stored(n)
-                            or served.source_parts(n, shape, device)
+                            or served.source_parts(n, shape, torch.device("cpu"))
                         )
                     else:
-                        plain[n] = self._value(n, state, live)
+                        plain[n] = self._value(n, state)
                 # vLLM loads only the dtype the checkpoint stores (transformers widens some)
                 as_stored, _ = checkpoint.as_stored(
                     self.src, checkpoint.to_checkpoint(self.model, plain)
                 )
-                yield {**as_stored, **stored}
+                batch = {**as_stored, **stored}
+                yield {**batch, **self._rest_of_layers(batch)}
 
         version = self.state_key(state) or f"sync-{len(self.syncs) + 1}"
         try:
@@ -718,7 +778,8 @@ class VLLMEngine(Engine):
     def ensure(self, text: Text) -> None:
         """vLLM holds the live weights; after a push, both engines are compared again."""
         pushed = self.sync()
-        if (pushed or self.agreement is None) and self.settings.agreement_prompts:
+        again = pushed is not None and self.settings.check_pushes
+        if (again or self.agreement is None) and self.settings.agreement_prompts:
             self.check_agreement(
                 text, agreement_prompts(text, self.ir, self.settings.agreement_prompts)
             )
