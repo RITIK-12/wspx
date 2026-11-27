@@ -13,6 +13,7 @@ the read-only files, so the working tree's base cache may evict them.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib
 import json
@@ -183,6 +184,8 @@ def load_skeleton(
                 p.data = p.data.float()
     from wspx.lab.weights import hollow
 
+    with contextlib.suppress(Exception):  # a tied head is the embedding (not in the checkpoint)
+        model.tie_weights()
     hollow(model)
     model.eval()
     try:

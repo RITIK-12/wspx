@@ -72,6 +72,19 @@ def _answers(engine: Any, lab: Any) -> tuple[list[list[int]], float]:
     return [ids for ids, _ in rows], time.perf_counter() - t
 
 
+def _first_token(engine: Any, lab: Any, watch: list[int]) -> list[list[float]]:
+    """vLLM's log-probabilities of ``watch`` at the first answer token, per prompt."""
+    rows = engine.generate_scored(lab.text, PROMPTS, max_tokens=1, watch=watch)
+    return [w[0] if w else [] for _, w in rows]
+
+
+def _maxdiff(a: list[list[float]], b: list[list[float]]) -> float:
+    return max(
+        (abs(x - y) for ra, rb in zip(a, b, strict=True) for x, y in zip(ra, rb, strict=True)),
+        default=0.0,
+    )
+
+
 def _throughput(engine: Any, lab: Any) -> dict[str, Any]:
     prompts = (PROMPTS * (BATCH // len(PROMPTS)))[:BATCH]
     t = time.perf_counter()
@@ -93,6 +106,14 @@ def run(model: str, edits: list[dict[str, Any]], out: str) -> None:
         report["base_agreement"] = engine.check_agreement(lab.text, PROMPTS)
         base, s = _answers(engine, lab)
         report["base_answers_s"] = round(s, 2)
+        # how repeatable vLLM is on its own (some kernels reduce in no fixed order)
+        again_now, _ = _answers(engine, lab)
+        report["base_repeat_exact"] = sum(a == b for a, b in zip(again_now, base, strict=True))
+        watch = sorted({ids[0] for ids in base if ids})
+        first = _first_token(engine, lab, watch)
+        report["base_repeat_logprob_maxdiff"] = round(
+            _maxdiff(first, _first_token(engine, lab, watch)), 5
+        )
         report["base_throughput"] = _throughput(engine, lab)
         rows = []
         for e in edits:
@@ -119,6 +140,9 @@ def run(model: str, edits: list[dict[str, Any]], out: str) -> None:
         report["discard_sync"] = engine.sync()
         again, _ = _answers(engine, lab)
         report["base_again_exact"] = sum(a == b for a, b in zip(again, base, strict=True))
+        report["restored_logprob_maxdiff"] = round(
+            _maxdiff(first, _first_token(engine, lab, watch)), 5
+        )
         report["syncs"] = engine.syncs
         engine.close()
     except Exception:

@@ -314,15 +314,7 @@ def requantize(
     if fmt.kind not in ("nvfp4", "mxfp8"):
         from wspx.lab import codecs
 
-        dev = compute or home
-        done = codecs.requantize(
-            fmt,
-            {k: v.to(dev) for k, v in parts.items()},
-            delta.to(dev),
-            keep_scales=keep_scales,
-        )
-        done.parts = {k: v.to(home) for k, v in done.parts.items()}
-        return done
+        return codecs.requantize(fmt, parts, delta, keep_scales=keep_scales, compute=compute)
     weight, scale = parts[fmt.weight], parts[fmt.scale]
     dev = compute or home
     n = fmt.block()

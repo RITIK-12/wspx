@@ -300,31 +300,58 @@ def _awq_pack(u: torch.Tensor, bits: int) -> torch.Tensor:
 
 
 def _mxfp4_decode(blocks: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """fp32 ``[..., out, nb · 32]`` from E2M1 codes ``[..., out, nb, 16]`` and E8M0 scales,
+    a slice of rows at a time (indices as int32), so a large expert tensor never needs
+    several times its size on the GPU."""
     from wspx.lab.quant import _e2m1_table
 
     table = _e2m1_table(blocks.device)
-    b = blocks.long()
-    codes = torch.stack((b & 0xF, b >> 4), dim=-1).flatten(-2)  # [..., nb, 32]
-    values = table[codes] * torch.exp2(scales.float() - 127).unsqueeze(-1)
-    return values.flatten(-2)
+    lead = blocks.shape[:-2]
+    flat_b = blocks.reshape(-1, *blocks.shape[-2:])
+    flat_s = scales.reshape(-1, scales.shape[-1])
+    out = torch.empty(flat_b.shape[0], flat_b.shape[1] * 32, device=blocks.device)
+    rows = max(1, 2**22 // max(flat_b.shape[1] * 32, 1))
+    for i in range(0, flat_b.shape[0], rows):
+        b = flat_b[i : i + rows].to(torch.int32)
+        codes = torch.stack((b & 0xF, b >> 4), dim=-1).flatten(-2)  # [r, nb, 32]
+        values = table[codes] * torch.exp2(flat_s[i : i + rows].float() - 127).unsqueeze(-1)
+        out[i : i + rows] = values.flatten(-2)
+    return out.reshape(*lead, -1)
 
 
 # ----------------------------------------------------------------------------- requantize
 
 
 def requantize(
-    fmt: Format, parts: dict[str, torch.Tensor], delta: torch.Tensor, *, keep_scales: bool
+    fmt: Format,
+    parts: dict[str, torch.Tensor],
+    delta: torch.Tensor,
+    *,
+    keep_scales: bool,
+    compute: torch.device | None = None,
 ) -> Requantized:
     """``quantize(dequantize(W) + Δ)`` on the groups ``Δ`` touches (``delta`` in the plain
-    checkpoint's layout)."""
+    checkpoint's layout). ``compute``: where it runs (the result stays on ``parts``'
+    device): an expert at a time for expert tensors, the whole matrix otherwise."""
+    if fmt.kind == "mxfp4":
+        return _requant_mxfp4(fmt, parts, delta, keep_scales, compute)
+    home = parts[fmt.weight].device
+    dev = compute or home
+    if dev != home:
+        done = requantize(
+            fmt,
+            {k: v.to(dev) for k, v in parts.items()},
+            delta.to(dev),
+            keep_scales=keep_scales,
+        )
+        done.parts = {k: v.to(home) for k, v in done.parts.items()}
+        return done
     if fmt.kind in ("fp8", "int8"):
         return _requant_scaled(fmt, parts, delta, keep_scales)
     if fmt.kind == "intpack":
         return _requant_intpack(fmt, parts, delta, keep_scales)
     if fmt.kind in ("gptq", "awq"):
         return _requant_int(fmt, parts, delta, keep_scales)
-    if fmt.kind == "mxfp4":
-        return _requant_mxfp4(fmt, parts, delta, keep_scales)
     raise ValueError(f"no encoder for {fmt.kind}")
 
 
@@ -471,35 +498,44 @@ def _requant_int(
 
 
 def _requant_mxfp4(
-    fmt: Format, parts: dict[str, torch.Tensor], delta: torch.Tensor, keep_scales: bool
+    fmt: Format,
+    parts: dict[str, torch.Tensor],
+    delta: torch.Tensor,
+    keep_scales: bool,
+    compute: torch.device | None = None,
 ) -> Requantized:
+    """Per expert (the leading index; one matrix when there is none), on ``compute``."""
     from wspx.lab.quant import Requantized, _blocks, _e2m1_round, _pack
 
     blocks, scales = parts[fmt.weight], parts[fmt.scale]
-    d = delta.float().to(blocks.device).transpose(-1, -2)  # stored [..., out, in]
-    x = _mxfp4_decode(blocks, scales) + d.reshape(*blocks.shape[:-2], -1)
-    xb = _blocks(x, 32)  # [..., out, nb, 32]
-    hit = _blocks(d.reshape((*xb.shape[:-2], -1)), 32).ne(0).any(-1)
-    peak = xb.abs().amax(-1)
-    if keep_scales:
-        new_e = scales.float() - 127
-    else:  # OCP MX: the shared exponent is floor(log2(peak)) - 2 (E2M1's largest is 6 = 1.5·2²)
-        fresh = torch.floor(torch.log2(peak.clamp(min=2**-127))) - 2
-        new_e = torch.where(hit & (peak > 0), fresh, scales.float() - 127)
-    unit = torch.exp2(new_e).unsqueeze(-1)
-    idx = _e2m1_round(xb / unit)
-    over = (xb / unit).abs() > 7.0
-    codes = _pack(idx.flatten(-2)).reshape(blocks.shape)
-    mask = hit.unsqueeze(-1).expand(blocks.shape)
-    new_blocks = torch.where(mask, codes, blocks)
-    new_scales = torch.where(hit, (new_e + 127).clamp(0, 254).to(torch.uint8), scales)
+    home, dev = blocks.device, compute or blocks.device
+    d_all = delta.float().to(home).transpose(-1, -2)  # stored [..., out, in]
+    single = blocks.dim() == 3
+    if single:
+        blocks, scales, d_all = blocks.unsqueeze(0), scales.unsqueeze(0), d_all.unsqueeze(0)
+    new_blocks, new_scales = blocks.clone(), scales.clone()
+    hit_n = values = clipped = 0
+    for e in d_all.flatten(1).ne(0).any(1).nonzero().flatten().tolist():
+        b_e, s_e, d = blocks[e].to(dev), scales[e].to(dev), d_all[e].to(dev)
+        x = _mxfp4_decode(b_e, s_e) + d
+        xb = _blocks(x, 32)  # [out, nb, 32]
+        hit = _blocks(d, 32).ne(0).any(-1)
+        peak = xb.abs().amax(-1)
+        if keep_scales:
+            new_e = s_e.float() - 127
+        else:  # OCP MX: shared exponent floor(log2(peak)) - 2 (E2M1's largest is 1.5 · 2²)
+            fresh = torch.floor(torch.log2(peak.clamp(min=2**-127))) - 2
+            new_e = torch.where(hit & (peak > 0), fresh, s_e.float() - 127)
+        unit = torch.exp2(new_e).unsqueeze(-1)
+        over = (xb / unit).abs() > 7.0
+        codes = _pack(_e2m1_round(xb / unit).flatten(-2)).reshape(b_e.shape)
+        out_b = torch.where(hit.unsqueeze(-1).expand(b_e.shape), codes, b_e)
+        out_s = torch.where(hit, (new_e + 127).clamp(0, 254).to(torch.uint8), s_e)
+        hit_n += int(hit.sum())
+        values += int((out_b != b_e).sum())
+        clipped += int((over & hit.unsqueeze(-1)).sum())
+        new_blocks[e], new_scales[e] = out_b.to(home), out_s.to(home)
     out = dict(parts)
-    out[fmt.weight] = new_blocks
-    out[fmt.scale] = new_scales
-    return Requantized(
-        out,
-        int(hit.sum()),
-        int((new_blocks != blocks).sum()),
-        int((over & hit.unsqueeze(-1)).sum()),
-        0,
-    )
+    out[fmt.weight] = new_blocks.squeeze(0) if single else new_blocks
+    out[fmt.scale] = new_scales.squeeze(0) if single else new_scales
+    return Requantized(out, hit_n, values, clipped, 0)

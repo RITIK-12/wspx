@@ -226,3 +226,20 @@ def test_a_quantized_checkpoint_is_read_edited_and_written_in_its_format(
             assert torch.equal(raw(written[k]), raw(v)), k
     if kind == "fp8":
         assert "model.layers.0.mlp.down_proj.input_scale" in written
+
+
+def test_a_tied_head_the_checkpoint_does_not_store_is_the_embedding(tmp_path: Path) -> None:
+    from safetensors.torch import save_file
+
+    model = tiny_llama().to(torch.bfloat16)
+    model.config.tie_word_embeddings = True
+    model.config.architectures = ["LlamaForCausalLM"]
+    ckpt = tmp_path / "ckpt"
+    ckpt.mkdir()
+    model.config.save_pretrained(ckpt)
+    state = {k: v for k, v in model.state_dict().items() if k != "lm_head.weight"}
+    save_file({k: v.contiguous() for k, v in state.items()}, str(ckpt / "model.safetensors"))
+    (tmp_path / "w").mkdir()
+    light = open_lab(str(ckpt), store=tmp_path / "s", workdir=tmp_path / "w", weights="checkpoint")
+    assert "lm_head.weight" not in dict(light.model.named_parameters())
+    assert torch.isfinite(logits(light)).all()
