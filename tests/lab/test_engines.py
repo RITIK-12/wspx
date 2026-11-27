@@ -216,17 +216,23 @@ def test_plan_shares_one_gpu_or_says_why_not() -> None:
         )
 
 
-def test_models_vllm_cannot_serve_are_refused_with_the_reason(tmp_path: Path) -> None:
-    from tests.lab.test_conformance import _tiny_inkling
+def test_a_loader_that_takes_only_whole_models_gets_the_whole_model(tmp_path: Path) -> None:
+    """vLLM's Inkling2 refuses an update missing any tensor; the engine then sends all."""
+    lab, worker, _ = vllm_lab(tmp_path, agreement_prompts=0)
+    total = len(list(lab.model.named_parameters()))
 
-    model = _tiny_inkling()
-    p = plan(VllmSection(), checkpoint_bytes=GB, gpus=[("H100", 80 * GB), ("H100", 80 * GB)])
-    with pytest.raises(WspxError, match="Inkling2LoopForConditionalGeneration"):
-        VLLMEngine(
-            model,
-            tree=None,  # type: ignore[arg-type]
-            ir=None,
-            source=tmp_path,
-            settings=VllmSection(),
-            plan=p,
-        )
+    class Strict(FakeTransport):
+        def send(self, http: Any, chunks: Any, version: str) -> int:
+            chunks = list(chunks)
+            names = [n for c in chunks for n in c]
+            if len(names) < total:
+                raise WspxError(
+                    "vLLM worker /weights/update: 500 Missing checkpoint tensors: [...]"
+                )
+            return super().send(http, iter(chunks), version)
+
+    lab.engine.transport = Strict(worker)  # type: ignore[attr-defined]
+    lab.edit.scale("L1.mlp.down", factor=1.5)
+    lab.generate(PROMPTS, max_tokens=2)
+    assert lab.engine.full_resync  # type: ignore[attr-defined]
+    assert same_weights(lab.model, worker.model)

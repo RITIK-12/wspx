@@ -55,13 +55,9 @@ RECIPES: dict[str, tuple[list[str], dict[str, str]]] = {
         {"VLLM_USE_V2_MODEL_RUNNER": "1"},
     ),
 }
-UNSERVED = {
-    "inkling2_loop": (
-        "vLLM has no implementation of Inkling2LoopForConditionalGeneration (it serves the "
-        "inkling_model family), and its transformers fallback needs transformers 5.24, "
-        "which vLLM's pin (<5.23) excludes"
-    ),
-}
+UNSERVED: dict[str, str] = {}
+"""Model types vLLM cannot serve, with why (Inkling-2-Mini needs the pinned vLLM build of
+the vLLM lab image; vLLM 0.34.0 itself does not have it)."""
 
 
 class Transport:
@@ -254,6 +250,8 @@ class VLLMEngine(Engine):
         self.held = TreeState()
         """The state vLLM's weights are at (it loads the base checkpoint)."""
         self.syncs: list[dict[str, Any]] = []
+        self.full_resync = False
+        """Push every layer each time: for vLLM models whose loader takes only whole models."""
         self.agreement: dict[str, Any] | None = None
         self.proc: subprocess.Popen[bytes] | None = None
         self.log = log
@@ -448,7 +446,11 @@ class VLLMEngine(Engine):
                 "adapter edits on this checkpoint"
             )
         touched = set(changed)
-        groups = [g for g in self._groups if touched & set(g)]
+        groups = (
+            list(self._groups)
+            if self.full_resync
+            else [g for g in self._groups if touched & set(g)]
+        )
         live: dict[str, torch.Tensor] = dict(self.model.named_parameters())
         live.update(dict(self.model.named_buffers()))
         started = time.perf_counter()
@@ -467,7 +469,16 @@ class VLLMEngine(Engine):
                 yield {**checkpoint.to_checkpoint(self.model, plain), **stored}
 
         version = self.state_key(state) or f"sync-{len(self.syncs) + 1}"
-        sent = self.transport.send(self.http, chunks(), version)
+        try:
+            sent = self.transport.send(self.http, chunks(), version)
+        except WspxError as exc:
+            if self.full_resync or "Missing checkpoint tensors" not in str(exc):
+                raise
+            # seen with vLLM's Inkling2: its loader takes only a whole model per update. The
+            # failed update left vLLM mid-reload; a full one (start → update → finish) mends it
+            self.full_resync = True
+            groups = list(self._groups)
+            sent = self.transport.send(self.http, chunks(), version)
         self.held = state
         record = {
             "version": version,

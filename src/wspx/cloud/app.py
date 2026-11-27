@@ -118,12 +118,18 @@ control_image = _image("control")
 gateway_image = _image("gateway")
 driver_image = _image("driver")
 lab_image = _image("lab")
-VLLM_VERSION = "0.34.0"
+VLLM_COMMIT = "47c0f890d6086aa360dafa2c0e07f15e1f94ba87"
+VLLM_WHEEL = (
+    f"https://wheels.vllm.ai/{VLLM_COMMIT}/"
+    "vllm-0.34.1rc1.dev251%2Bg47c0f890d-cp38-abi3-manylinux_2_28_x86_64.whl"
+)
+"""A vLLM build pinned by commit: Inkling-2-Mini (Inkling2Loop) is served from vLLM's main
+branch after 0.34.0, and no release has it yet."""
 # vLLM pins its own torch and transformers, so it gets an environment of its own; the lab's
 # vLLM worker runs with /opt/vllm/bin/python and talks to the lab over localhost
 vllm_lab_image = lab_image.run_commands(
     "python -m venv /opt/vllm",
-    f"/opt/vllm/bin/pip install --no-cache-dir vllm=={VLLM_VERSION}",
+    f"/opt/vllm/bin/pip install --no-cache-dir '{VLLM_WHEEL}'",
 ).env({"WSPX_VLLM_PYTHON": "/opt/vllm/bin/python"})
 
 
