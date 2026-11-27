@@ -19,6 +19,7 @@ pauses. No agent tool can reach it.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
@@ -632,8 +633,17 @@ def describe(config: GatewayConfig, provider: str, path: str, body: bytes) -> Ca
     )
 
 
+_B64_RUN = re.compile(rb"[A-Za-z0-9+/]{2048,}={0,2}")
+IMAGE_TOKENS = 6_000
+"""Above what any provider bills one image fitted to its limits (wspx.driver.media)."""
+PDF_PAGE_TOKENS = 3_000
+"""Above what a PDF page costs as an image, on top of its bytes (which bound its text)."""
+
+
 def input_bound(previous: tuple[bytes, int] | None, body: bytes, slack: int = 256) -> int:
-    """An upper bound on input tokens: every token covers at least one byte.
+    """An upper bound on input tokens: every token covers at least one byte, except that a
+    base64 image counts :data:`IMAGE_TOKENS` (its bytes would bound it a hundredfold too
+    high, and a screenshot would trip a spend limit) and a PDF its pages too.
 
     When this body extends the previous one (a growing conversation), the bound is
     the previous exact count plus the new bytes; otherwise it is the body length.
@@ -642,8 +652,30 @@ def input_bound(previous: tuple[bytes, int] | None, body: bytes, slack: int = 25
         prev, tokens = previous
         cut = max(0, len(prev) - slack)
         if len(body) >= cut and body[:cut] == prev[:cut]:
-            return tokens + (len(body) - cut)
-    return len(body)
+            return tokens + _bytes_bound(body[cut:])
+    return _bytes_bound(body)
+
+
+def _bytes_bound(data: bytes) -> int:
+    total = len(data)
+    for m in _B64_RUN.finditer(data):
+        run = m.group(0)
+        try:
+            head = base64.b64decode(run[:32])
+        except ValueError:
+            continue
+        if head.startswith((b"\x89PNG", b"\xff\xd8\xff", b"GIF8")) or (
+            head[:4] == b"RIFF" and head[8:12] == b"WEBP"
+        ):
+            total += IMAGE_TOKENS - len(run)
+        elif head.startswith(b"%PDF"):
+            try:
+                pdf = base64.b64decode(run + b"=" * (-len(run) % 4))
+            except ValueError:
+                continue
+            pages = len(re.findall(rb"/Type\s*/Page(?!s)", pdf)) or 1
+            total += pages * PDF_PAGE_TOKENS
+    return max(total, 0)
 
 
 def auth_headers(provider: str, key: str | None) -> dict[str, str]:

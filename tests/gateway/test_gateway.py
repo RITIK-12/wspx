@@ -559,3 +559,36 @@ def test_the_same_call_after_an_edit_is_not_a_repeat(setup) -> None:  # type: ig
     for _ in range(3):  # the same test three times on the same weights is a repeat
         turn(test)
     assert any("test" in json.dumps(e) for e in ledger.loop_events("s1"))
+
+
+def test_an_image_does_not_inflate_the_input_bound() -> None:
+    """Seen in review: a 1 MB screenshot bounded at ~1.4M input tokens, enough to trip a
+    dollar limit. A base64 image counts a fixed ceiling; a PDF counts its pages too."""
+    import base64
+    import io
+    import json
+
+    from PIL import Image
+
+    from wspx.gateway.app import IMAGE_TOKENS, PDF_PAGE_TOKENS, input_bound
+
+    buf = io.BytesIO()
+    Image.effect_noise((600, 600), 80).convert("RGB").save(buf, format="PNG")
+    data = base64.b64encode(buf.getvalue()).decode()
+    assert len(data) > 200_000
+    text = json.dumps({"messages": [{"content": "look at this " * 50}]})
+    with_image = json.dumps(
+        {
+            "messages": [
+                {"content": "look at this " * 50},
+                {"content": [{"type": "image", "source": {"type": "base64", "data": data}}]},
+            ]
+        }
+    ).encode()
+    bound = input_bound(None, with_image)
+    assert IMAGE_TOKENS <= bound < len(text) + IMAGE_TOKENS + 200
+    pdf = b"%PDF-1.4\n" + b"1 0 obj << /Type /Page >> endobj\n" * 3 + b"/Type /Pages" + b" " * 3000
+    with_pdf = json.dumps({"data": base64.b64encode(pdf).decode()}).encode()
+    assert input_bound(None, with_pdf) >= 3 * PDF_PAGE_TOKENS
+    # a growing conversation: only the new part is estimated again
+    assert input_bound((with_image, 10_000), with_image + b'{"more": 1}') < 10_000 + 300
