@@ -426,3 +426,4 @@ tr.failed td { color: var(--danger); }
   .gitdiff-split { grid-template-columns: 1fr; }
   .gitdiff-files { border-right: 0; border-bottom: 1px solid var(--line); max-height: 180px; }
 }
+.thumb.file .thumb-note { font-family: var(--mono, ui-monospace, monospace); text-transform: uppercase; }

@@ -21,6 +21,8 @@ from wspx.tools import mcp_tools
 
 CallFn = Callable[[str | None, str, dict[str, Any]], dict[str, Any]]
 """(session or None, tool, arguments) → tool result dict."""
+FetchFn = Callable[[str, str], tuple[bytes, str]]
+"""(session, attachment object id) → bytes and media type."""
 
 
 def _tool_list() -> list[types.Tool]:
@@ -30,7 +32,34 @@ def _tool_list() -> list[types.Tool]:
     ]
 
 
-def build_server(call: CallFn) -> Server[Any]:
+def _content(result: dict[str, Any], text: str, fetch: FetchFn | None) -> list[Any]:
+    """Text, then each attachment: images as MCP image content, other files as resources."""
+    import base64
+
+    out: list[Any] = [types.TextContent(type="text", text=text)]
+    session = result.get("session")
+    for a in result.get("attachments") or []:
+        label = a.get("name") or a.get("oid", "")[:16]
+        if fetch is None or not session:
+            out.append(types.TextContent(type="text", text=f"[attachment {label}]"))
+            continue
+        try:
+            data, kind = fetch(session, a["oid"])
+        except Exception as exc:
+            out.append(types.TextContent(type="text", text=f"[attachment {label}: {exc}]"))
+            continue
+        encoded = base64.b64encode(data).decode()
+        if kind.startswith("image/"):
+            out.append(types.ImageContent(type="image", data=encoded, mime_type=kind))
+        else:
+            resource = types.BlobResourceContents(
+                uri=f"wspx://{session}/attachments/{a['oid']}", mime_type=kind, blob=encoded
+            )
+            out.append(types.EmbeddedResource(type="resource", resource=resource))
+    return out
+
+
+def build_server(call: CallFn, *, fetch: FetchFn | None = None) -> Server[Any]:
     async def list_tools(_ctx: Any, _params: Any) -> types.ListToolsResult:
         return types.ListToolsResult(tools=_tool_list())
 
@@ -46,7 +75,7 @@ def build_server(call: CallFn) -> Server[Any]:
         if result.get("call_id"):
             text += f"\n[call {result['call_id']}]"
         return types.CallToolResult(
-            content=[types.TextContent(type="text", text=text)], is_error=not result.get("ok", True)
+            content=_content(result, text, fetch), is_error=not result.get("ok", True)
         )
 
     return Server(
@@ -58,11 +87,11 @@ def build_server(call: CallFn) -> Server[Any]:
     )
 
 
-def run_stdio(call: CallFn) -> None:
+def run_stdio(call: CallFn, *, fetch: FetchFn | None = None) -> None:
     """``wspx mcp``: a local stdio server forwarding to the hosted control plane."""
     from mcp.server.stdio import stdio_server
 
-    server = build_server(call)
+    server = build_server(call, fetch=fetch)
 
     async def main() -> None:
         async with stdio_server() as (read, write):

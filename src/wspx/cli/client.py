@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -46,6 +47,15 @@ class Control:
                 f"other than JSON (is the deployment stopped? run `wspx deploy`): {r.text[:200]}"
             ) from None
 
+    def _raw(self, method: str, path: str, **kw: Any) -> httpx.Response:
+        try:
+            r = self.client.request(method, path, **kw)
+        except httpx.HTTPError as exc:
+            raise WspxError(f"cannot reach the control plane at {self.url}: {exc}") from exc
+        if r.status_code >= 400:
+            raise WspxError(f"{method} {path}: {r.text[:300]}")
+        return r
+
     def sessions(self) -> list[dict[str, Any]]:
         data: list[dict[str, Any]] = self._req("GET", "/api/sessions")["sessions"]
         return data
@@ -60,6 +70,24 @@ class Control:
     def new(self, **body: Any) -> dict[str, Any]:
         data: dict[str, Any] = self._req("POST", "/api/sessions", json=body)
         return data
+
+    def upload(self, path: Path) -> dict[str, Any]:
+        """An image or file to give a session (with ``new --attach`` or ``steer --attach``)."""
+        import mimetypes
+
+        kind = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        data: dict[str, Any] = self._req(
+            "POST",
+            "/api/attachments",
+            params={"name": path.name},
+            content=path.read_bytes(),
+            headers={"content-type": kind},
+        )
+        return data
+
+    def attachment(self, sid: str, oid: str) -> tuple[bytes, str]:
+        r = self._raw("GET", f"/api/sessions/{sid}/attachments/{oid}")
+        return r.content, r.headers.get("content-type", "application/octet-stream")
 
     def export_session(self, sid: str) -> dict[str, Any]:
         """The session's whole record (``wspx-session/1``): trace, commits, evals, spend."""

@@ -11,11 +11,14 @@ import time
 import uuid
 from typing import Any
 
+from wspx.driver.media import Media
 from wspx.driver.messages import Message, ToolCall, Turn, Usage
 from wspx.tools import gemini_tools
 
 
 class GoogleProvider:
+    media: Media | None = None
+
     name = "google"
 
     def __init__(
@@ -41,6 +44,8 @@ class GoogleProvider:
         from google.genai import types
 
         out: list[Any] = []
+        media = self.media
+        visible = media.visible(history) if media is not None else set()
         for msg in history:
             if msg.role == "assistant":
                 if msg.provider == self.name and msg.native is not None:
@@ -62,18 +67,36 @@ class GoogleProvider:
                         )
                     )
                 continue
-            parts = [
-                types.Part(
-                    function_response=types.FunctionResponse(
-                        name=o.name,
-                        id=o.call_id,
-                        response={"error" if o.is_error else "result": o.content},
+            parts = []
+            for o in msg.outputs:
+                text = o.content
+                inline = []
+                if o.attachments and media is not None:
+                    for p in media.parts(o.attachments, visible):
+                        if p.text:
+                            text += "\n" + p.text
+                        else:  # multimodal function responses carry the bytes themselves
+                            blob = types.FunctionResponseBlob(mime_type=p.media_type, data=p.data)
+                            inline.append(types.FunctionResponsePart(inline_data=blob))
+                parts.append(
+                    types.Part(
+                        function_response=types.FunctionResponse(
+                            name=o.name,
+                            id=o.call_id,
+                            response={"error" if o.is_error else "result": text},
+                            parts=inline or None,
+                        )
                     )
                 )
-                for o in msg.outputs
-            ]
             if msg.text:
                 parts.append(types.Part(text=msg.text))
+            if msg.attachments and media is not None:
+                for p in media.parts(msg.attachments, visible):
+                    parts.append(
+                        types.Part(text=p.text)
+                        if p.text
+                        else types.Part(inline_data=types.Blob(mime_type=p.media_type, data=p.data))
+                    )
             parts.extend(types.Part(text=f"[operator] {note}") for note in msg.notes)
             out.append(types.Content(role="user", parts=parts))
         return out

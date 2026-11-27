@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import Any, Protocol
 
+from wspx.driver.media import Media
 from wspx.driver.messages import Message, Turn
 from wspx.errors import WspxError
 
@@ -23,6 +24,8 @@ from wspx.errors import WspxError
 class Provider(Protocol):
     name: str
     model: str
+    media: Media | None
+    """Fetches and prepares attachments (set by the runner)."""
 
     def step(
         self,

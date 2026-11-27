@@ -89,6 +89,8 @@ class DriverSection(_Section):
     model: str | None = None
     deny_tools: list[str] = Field(default_factory=list)
     """Tools the driver is not offered and may not call, e.g. ``["run", "export"]``."""
+    images: Literal["auto", "off"] = "auto"
+    """``off`` for a driver model without image input: images reach it as placeholders."""
 
 
 class VllmSection(_Section):

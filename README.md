@@ -186,6 +186,7 @@ quant_scales = "refit"      # stored NVFP4/MXFP8: edits are written in that form
 [driver]
 model = "anthropic:claude-opus-5-5"
 deny_tools = ["run"]        # tools the agent is not offered
+images = "auto"             # "off" for a model without image input
 
 [lab]
 gpu = "L4"

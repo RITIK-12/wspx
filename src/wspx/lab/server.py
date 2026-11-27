@@ -177,12 +177,14 @@ class LabServer:
                         result = call(self.lab, name, body.get("args") or {})
                     finally:
                         model_io = self.lab.io.drain()
+                        attachments = self.lab.take_attachments()
                     self.calls += 1
                     return {
                         "summary": result.budgeted(),
                         "data": result.data,
                         "handles": result.handles,
                         "ok": result.ok,
+                        "attachments": attachments,
                         "journal": self.journal(),
                         "workspace": self.workspace(),
                         "fingerprint": self.lab.ir.fingerprint,

@@ -11,11 +11,14 @@ import json
 import time
 from typing import Any
 
+from wspx.driver.media import Media, Part
 from wspx.driver.messages import Message, ToolCall, Turn, Usage
 from wspx.tools import openai_tools
 
 
 class OpenAIProvider:
+    media: Media | None = None
+
     name = "openai"
 
     def __init__(
@@ -38,6 +41,8 @@ class OpenAIProvider:
 
     def items(self, history: list[Message]) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
+        media = self.media
+        visible = media.visible(history) if media is not None else set()
         for msg in history:
             if msg.role == "assistant":
                 if msg.provider == self.name and msg.native:
@@ -55,11 +60,17 @@ class OpenAIProvider:
                         for c in msg.tool_calls
                     )
                 continue
-            out.extend(
-                {"type": "function_call_output", "call_id": o.call_id, "output": o.content}
-                for o in msg.outputs
-            )
-            if msg.text:
+            for o in msg.outputs:
+                output: Any = o.content
+                if o.attachments and media is not None:
+                    output = [{"type": "input_text", "text": o.content or "(no text)"}]
+                    output += [_item(p) for p in media.parts(o.attachments, visible)]
+                out.append({"type": "function_call_output", "call_id": o.call_id, "output": output})
+            if msg.attachments and media is not None:
+                content = [{"type": "input_text", "text": msg.text or "(attachments)"}]
+                content += [_item(p) for p in media.parts(msg.attachments, visible)]
+                out.append({"role": "user", "content": content})
+            elif msg.text:
                 out.append({"role": "user", "content": msg.text})
             out.extend({"role": "developer", "content": note} for note in msg.notes)
         return out
@@ -123,3 +134,15 @@ class OpenAIProvider:
             response.model,
             time.perf_counter() - started,
         )
+
+
+def _item(part: Part) -> dict[str, Any]:
+    if part.text:
+        return {"type": "input_text", "text": part.text}
+    if part.attachment.image:
+        return {"type": "input_image", "image_url": part.data_url, "detail": "auto"}
+    return {
+        "type": "input_file",
+        "filename": part.attachment.name or "attachment",
+        "file_data": part.data_url,
+    }

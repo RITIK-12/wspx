@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { formatTokens, post, stream, type Session, type TimelineEvent } from "../api";
 import { Markdown } from "../markdown";
-import { MediaStrip, mediaParts } from "../media";
+import { AttachmentStrip, MediaStrip, mediaParts } from "../media";
 
 // The session as a conversation: your messages on the right (the task, and anything you send
 // while it runs); on the left, the leader's replies with their thinking folded away and the
@@ -266,7 +266,7 @@ function ChatItem({ item, session }: { item: Item; session: string }) {
           </div>
           {p.reasoning && <Thinking text={p.reasoning} tokens={p.usage?.reasoning} />}
           {p.text && <Markdown text={p.text} />}
-          {item.tools.length > 0 && <Tools tools={item.tools} />}
+          {item.tools.length > 0 && <Tools tools={item.tools} session={session} />}
         </div>
       </div>
     );
@@ -277,7 +277,7 @@ function ChatItem({ item, session }: { item: Item; session: string }) {
         <Avatar kind="client" />
         <div className="bubble client">
           <div className="who">{item.source || "client"}</div>
-          <Tools tools={item.tools} />
+          <Tools tools={item.tools} session={session} />
         </div>
       </div>
     );
@@ -285,7 +285,7 @@ function ChatItem({ item, session }: { item: Item; session: string }) {
   return <OpenModel io={item.io} model={item.model} session={session} />;
 }
 
-function Tools({ tools }: { tools: ToolUse[] }) {
+function Tools({ tools, session }: { tools: ToolUse[]; session: string }) {
   return (
     <div className="tool-uses">
       {tools.map((t) => {
@@ -301,6 +301,7 @@ function Tools({ tools }: { tools: ToolUse[] }) {
             </summary>
             <pre className="tool-io">{JSON.stringify(t.args, null, 2)}</pre>
             {r ? <pre className="result">{r.summary}</pre> : <div className="muted small">running…</div>}
+            {r && <AttachmentStrip session={session} items={r.attachments} />}
           </details>
         );
       })}

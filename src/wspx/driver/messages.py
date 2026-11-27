@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
+from wspx.driver.media import Attachment, attachments
+
 
 @dataclass
 class ToolCall:
@@ -25,6 +27,8 @@ class ToolOutput:
     name: str
     content: str
     is_error: bool = False
+    attachments: list[Attachment] = field(default_factory=list)
+    """Images and files the tool returned (object ids; encoded per provider)."""
 
 
 @dataclass
@@ -38,6 +42,8 @@ class Message:
     outputs: list[ToolOutput] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     """Operator notes (nudges, workspace table, human steering) for the model."""
+    attachments: list[Attachment] = field(default_factory=list)
+    """Images and files given with the task or a steering message."""
 
 
 def dump_message(msg: Message) -> dict[str, Any]:
@@ -57,8 +63,12 @@ def load_message(data: dict[str, Any]) -> Message:
         native=data.get("native"),
         provider=data.get("provider"),
         tool_calls=[ToolCall(**c) for c in data.get("tool_calls") or []],
-        outputs=[ToolOutput(**o) for o in data.get("outputs") or []],
+        outputs=[
+            ToolOutput(**{**o, "attachments": attachments(o.get("attachments"))})
+            for o in data.get("outputs") or []
+        ],
         notes=list(data.get("notes") or []),
+        attachments=attachments(data.get("attachments")),
     )
 
 

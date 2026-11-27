@@ -684,3 +684,98 @@ def test_a_vllm_session_needs_a_gpu_vllm_can_use() -> None:
         check_engine_gpu("vllm", "T4")
     with pytest.raises(WspxError, match="unknown engine"):
         check_engine_gpu("sglang", "H100")
+
+
+def test_a_scripts_image_reaches_the_driver_and_nothing_else_does(tmp_path: Path) -> None:
+    """A run script attaches a plot; the driver's next request carries it. A runner token
+    reads only its own session's attachments, and only ones the session was given."""
+    from tests.driver.test_loop import Scripted
+
+    (tmp_path / "plot.py").write_text(
+        "import numpy as np, wspx\n"
+        "wspx.session().attach(np.zeros((6, 8, 3), dtype=np.uint8), name='map.png', caption='zeros')\n"
+        "print('plotted')\n"
+    )
+    seen: list[Any] = []
+
+    class Looking(Scripted):
+        def step(self, system: str, history: list[Any], tools: list[Any], **kw: Any) -> Any:
+            outs = [o for m in history for o in m.outputs if o.attachments]
+            if outs:
+                part = self.media.part(outs[-1].attachments[0], True)  # type: ignore[attr-defined]
+                seen.append((outs[-1].attachments[0], part.media_type, part.data[:8]))
+            return super().step(system, history, tools, **kw)
+
+    port = free_port()
+    client, manager = make(tmp_path, port=port)
+    script = [call("run", {"script": "plot.py"}), done("looked")]
+    manager.backend.runner_factory = lambda record, env: (  # type: ignore[attr-defined]
+        lambda: __import__("wspx.driver.run", fromlist=["x"]).run_from_env(
+            env, provider=Looking(list(script))
+        )
+    )
+    with LiveServer(client.app, port):
+        upload = client.post(
+            "/api/attachments",
+            params={"name": "task.png"},
+            content=b"\x89PNG\r\n\x1a\n" + b"\0" * 16,
+            headers=USER | {"content-type": "image/png"},
+        ).json()
+        sid = client.post(
+            "/api/sessions",
+            json={
+                "model": "tiny",
+                "driver": "anthropic:claude-opus-5-5",
+                "task": "look",
+                "attachments": [upload],
+            },
+            headers=USER,
+        ).json()["id"]
+        wait(lambda: manager.get(sid).status == "done", timeout=60)
+        (att, kind, head) = seen[-1]
+        assert (att.name, att.caption, kind) == ("map.png", "zeros", "image/png")
+        assert head == b"\x89PNG\r\n\x1a\n"
+        own = {"authorization": f"Bearer {mint(SECRET, sid, scope='runner')}"}
+        assert (
+            client.get(f"/api/sessions/{sid}/attachments/{att.oid}", headers=own).status_code == 200
+        )
+        assert (
+            client.get(f"/api/sessions/{sid}/attachments/{upload['oid']}", headers=own).status_code
+            == 200
+        )
+        other = client.post("/api/sessions", json={"model": "tiny"}, headers=USER).json()["id"]
+        theirs = {"authorization": f"Bearer {mint(SECRET, other, scope='runner')}"}
+        assert (
+            client.get(f"/api/sessions/{sid}/attachments/{att.oid}", headers=theirs).status_code
+            == 403
+        )
+        assert (
+            client.get(f"/api/sessions/{other}/attachments/{att.oid}", headers=theirs).status_code
+            == 400
+        )
+        snapshot_like = manager.store.objects.put(b"held-out answers")
+        assert (
+            client.get(f"/api/sessions/{sid}/attachments/{snapshot_like}", headers=own).status_code
+            == 400
+        )
+        events = client.get(f"/api/sessions/{sid}/timeline", headers=USER).json()["events"]
+        (start,) = [e["payload"] for e in events if e["kind"] == "start"]
+        assert start["attachments"][0]["name"] == "task.png"
+
+
+def test_mcp_results_carry_images_and_files() -> None:
+    from mcp import types
+
+    from wspx.control.mcp_server import _content
+
+    blobs = {"sha256:a": (b"png-bytes", "image/png"), "sha256:b": (b"%PDF", "application/pdf")}
+    result = {
+        "session": "s_1",
+        "attachments": [{"oid": "sha256:a", "name": "a.png"}, {"oid": "sha256:b", "name": "b.pdf"}],
+    }
+    text, image, resource = _content(result, "ran", lambda sid, oid: blobs[oid])
+    assert isinstance(text, types.TextContent)
+    assert isinstance(image, types.ImageContent)
+    assert image.mime_type == "image/png"
+    assert isinstance(resource, types.EmbeddedResource)
+    assert resource.resource.uri.endswith("/attachments/sha256:b")

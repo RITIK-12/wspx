@@ -45,17 +45,62 @@ export function MediaStrip({ session, parts }: { session: string; parts: Part[] 
   );
 }
 
+// Images and files a tool returned, or the session was given (by object id).
+export interface Attached {
+  oid: string;
+  media_type: string;
+  name?: string;
+  caption?: string;
+}
+
+export function AttachmentStrip({ session, items }: { session: string; items?: Attached[] }) {
+  if (!items?.length) return null;
+  return (
+    <div className="media-strip">
+      {items.map((a) =>
+        a.media_type.startsWith("image/") ? (
+          <Thumb key={a.oid} session={session} path={a.caption ? `${a.name ?? "image"} · ${a.caption}` : a.name ?? a.oid} href={attachmentUrl(session, a.oid)} />
+        ) : (
+          <FileLink key={a.oid} href={attachmentUrl(session, a.oid)} name={a.name ?? a.oid.slice(0, 16)} kind={a.media_type} />
+        ),
+      )}
+    </div>
+  );
+}
+
+function attachmentUrl(session: string, oid: string): string {
+  return `/api/sessions/${session}/attachments/${encodeURIComponent(oid)}`;
+}
+
+function FileLink({ href, name, kind }: { href: string; name: string; kind: string }) {
+  const [error, setError] = useState<string>();
+  const open = () =>
+    apiBlob(href)
+      .then((blob) => {
+        const src = URL.createObjectURL(blob);
+        window.open(src, "_blank", "noopener");
+        setTimeout(() => URL.revokeObjectURL(src), 60_000);
+      })
+      .catch((e) => setError(String(e.message ?? e)));
+  return (
+    <button className="thumb file" onClick={open} title={kind}>
+      <span className="thumb-note">{kind.split("/").pop()}</span>
+      <span className="thumb-name">{error ? `${name}: ${error}` : name}</span>
+    </button>
+  );
+}
+
 function url(session: string, path: string): string {
   return `/api/sessions/${session}/media?path=${encodeURIComponent(path)}`;
 }
 
-function useBlob(session: string, path: string, wanted: boolean): { src?: string; error?: string } {
+function useBlob(session: string, path: string, wanted: boolean, href?: string): { src?: string; error?: string } {
   const [state, setState] = useState<{ src?: string; error?: string }>({});
   useEffect(() => {
     if (!wanted) return;
     let src: string | undefined;
     let gone = false;
-    apiBlob(url(session, path))
+    apiBlob(href ?? url(session, path))
       .then((blob) => {
         if (gone) return;
         src = URL.createObjectURL(blob);
@@ -66,7 +111,7 @@ function useBlob(session: string, path: string, wanted: boolean): { src?: string
       gone = true;
       if (src) URL.revokeObjectURL(src);
     };
-  }, [session, path, wanted]);
+  }, [session, path, wanted, href]);
   return state;
 }
 
@@ -91,9 +136,9 @@ function useOnScreen<T extends Element>(): [RefObject<T | null>, boolean] {
   return [ref, seen];
 }
 
-function Thumb({ session, path }: { session: string; path: string }) {
+function Thumb({ session, path, href }: { session: string; path: string; href?: string }) {
   const [ref, seen] = useOnScreen<HTMLButtonElement>();
-  const { src, error } = useBlob(session, path, seen);
+  const { src, error } = useBlob(session, path, seen, href);
   const [big, setBig] = useState(false);
   return (
     <>

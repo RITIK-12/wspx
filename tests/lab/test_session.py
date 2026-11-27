@@ -400,3 +400,18 @@ def test_contrast_keeps_its_direction_when_ranking_writers_fails(
     assert "dir:kept" in d.summary
     assert "not ranked (RuntimeError: CUDA out of memory)" in d.summary
     assert "kept" in lab.directions
+
+
+def test_attach_returns_images_and_files_with_the_call(lab: Lab, tmp_path: Path) -> None:
+    (tmp_path / "work" / "notes.txt").write_text("hello")
+    meta = lab.attach("notes.txt")
+    assert (meta["name"], meta["media_type"]) == ("notes.txt", "text/plain")
+    image = lab.attach(torch.rand(5, 7), caption="a map")
+    assert (image["media_type"], image["width"], image["height"]) == ("image/png", 7, 5)
+    assert lab.store.objects.get(image["oid"]).startswith(b"\x89PNG")
+    assert [m["oid"] for m in lab.take_attachments()] == [meta["oid"], image["oid"]]
+    assert lab.take_attachments() == []
+    from wspx.errors import WspxError
+
+    with pytest.raises(WspxError, match="not a file in the project"):
+        lab.attach("../outside.txt")

@@ -123,6 +123,8 @@ class Lab:
         """What generates: transformers here, or vLLM beside the lab (``[lab] engine``)."""
         self.progress: dict[str, Any] | None = None
         """A long call's progress, reported with the heartbeat."""
+        self._attachments: list[dict[str, Any]] = []
+        """Images and files the current call returns to its caller (:meth:`attach`)."""
         self.source_dir = source_dir
         """The checkpoint folder the model was loaded from (exports copy its non-weight files)."""
         self.ir = ir
@@ -807,6 +809,34 @@ class Lab:
             text = self.text.decode(ids)
             reasoning, answer = split_reasoning(text)
             out.append(Completion(text, ids, finish, n, reasoning, answer).to_dict())
+        return out
+
+    def attach(self, item: Any, *, name: str | None = None, caption: str = "") -> dict[str, Any]:
+        """Return an image or file to the caller with this call's result (``run`` scripts):
+        a PIL image, a matplotlib figure, an ``(h, w[, 3])`` array or tensor, bytes (with
+        ``name``), or a path in the project. The driver sees images as images."""
+        data, kind, label = _attachment_bytes(item, name, self.workdir)
+        if len(data) > ATTACHMENT_BYTES:
+            raise WspxError(f"{label}: {len(data) / 2**20:.0f} MB; attachments are at most 20 MB")
+        meta: dict[str, Any] = {
+            "oid": self.store.objects.put(data),
+            "media_type": kind,
+            "name": label,
+            "size": len(data),
+        }
+        if caption:
+            meta["caption"] = caption
+        if kind.startswith("image/"):
+            with contextlib.suppress(Exception):
+                from PIL import Image
+
+                with Image.open(io.BytesIO(data)) as im:
+                    meta["width"], meta["height"] = im.size
+        self._attachments.append(meta)
+        return meta
+
+    def take_attachments(self) -> list[dict[str, Any]]:
+        out, self._attachments = self._attachments, []
         return out
 
     # ------------------------------------------------------------------ contrast
@@ -2646,3 +2676,43 @@ def _as_chat(chat: Any, template: dict[str, Any] | None) -> Any:
             raise WspxError("template settings need a chat (a list of messages)")
         prompt = {**prompt, "template": template}
     return prompt
+
+
+ATTACHMENT_BYTES = 20 * 2**20
+
+
+def _attachment_bytes(item: Any, name: str | None, workdir: Path) -> tuple[bytes, str, str]:
+    """``(bytes, media type, name)`` for what ``attach`` accepts."""
+    import mimetypes
+
+    if isinstance(item, str | Path):
+        path = (workdir / item).resolve()
+        if not path.is_relative_to(workdir.resolve()) or not path.is_file():
+            raise WspxError(f"{item}: not a file in the project")
+        kind = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        return path.read_bytes(), kind, name or path.name
+    if isinstance(item, bytes | bytearray):
+        label = name or "attachment.bin"
+        return bytes(item), mimetypes.guess_type(label)[0] or "application/octet-stream", label
+    if hasattr(item, "savefig"):  # a matplotlib figure
+        buf = io.BytesIO()
+        item.savefig(buf, format="png", bbox_inches="tight", dpi=120)
+        return buf.getvalue(), "image/png", name or "figure.png"
+    if isinstance(item, torch.Tensor):
+        item = item.detach().float().cpu().numpy()
+    if type(item).__module__ == "numpy":
+        import numpy as np
+        from PIL import Image
+
+        arr = np.asarray(item)
+        if arr.dtype != np.uint8:
+            lo, hi = float(arr.min()), float(arr.max())
+            arr = ((arr - lo) / (hi - lo or 1.0) * 255).astype(np.uint8)
+        item = Image.fromarray(arr)
+    if hasattr(item, "save") and hasattr(item, "size"):  # a PIL image
+        buf = io.BytesIO()
+        item.save(buf, format="PNG")
+        return buf.getvalue(), "image/png", name or "image.png"
+    raise WspxError(
+        f"cannot attach a {type(item).__name__}: pass an image, a figure, an array, bytes or a path"
+    )

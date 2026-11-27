@@ -89,12 +89,15 @@ class NewSession(BaseModel):
     dtype: str = "bfloat16"
     trust_remote_code: bool = False
     engine: Literal["hf", "vllm"] = "hf"
+    driver_images: Literal["auto", "off"] = "auto"
     grace_s: float = Field(900.0, ge=0)
     keep_warm: str = "auto"
     project: str = ""
     snapshot: str | None = Field(None, pattern=r"^sha256:[0-9a-f]{64}$")
     tools_deny: list[str] = Field(default_factory=list)
     max_lab_s: float | None = Field(None, gt=0)
+    attachments: list[dict[str, Any]] = Field(default_factory=list)
+    """Images and files for the task, from ``POST /api/attachments``."""
 
 
 class ToolCall(BaseModel):
@@ -161,6 +164,9 @@ def create_app(
 
     # ------------------------------------------------------------------ MCP
 
+    def mcp_fetch(session: str, oid: str) -> tuple[bytes, str]:
+        return manager.attachment(session, oid)
+
     def mcp_call(session: str | None, name: str, args: dict[str, Any]) -> dict[str, Any]:
         if session is None:
             running = [
@@ -175,13 +181,13 @@ def create_app(
                 }
             session = running[0]
         try:
-            return manager.tool(session, name, args, source="mcp")
+            return {**manager.tool(session, name, args, source="mcp"), "session": session}
         except WspxError as exc:
             return {"summary": str(exc), "ok": False}
 
     from mcp.server.transport_security import TransportSecuritySettings
 
-    mcp_server = build_server(mcp_call)
+    mcp_server = build_server(mcp_call, fetch=mcp_fetch)
     mcp_inner = mcp_server.streamable_http_app(
         streamable_http_path="/",
         stateless_http=True,
@@ -303,6 +309,24 @@ def create_app(
             return Response(status_code=204)
         return Response(state, media_type="application/octet-stream")
 
+    @app.post("/api/attachments", dependencies=[Depends(user)])
+    async def upload_attachment(request: Request, name: str = "attachment") -> dict[str, Any]:
+        """An image or file to give a session (with its task, or a steering message)."""
+        data = await request.body()
+        kind = request.headers.get("content-type", "application/octet-stream").split(";")[0]
+        meta: dict[str, Any] = await offload(
+            lambda: manager.upload(data, name=name, media_type=kind)
+        )
+        return meta
+
+    @app.get("/api/sessions/{sid}/attachments/{oid}")
+    def get_attachment(sid: str, oid: str, _caller: str = Depends(session_caller)) -> Response:
+        """An attachment this session's tools returned or it was given; nothing else."""
+        data, kind = guarded(lambda: manager.attachment(sid, oid))
+        return Response(
+            data, media_type=kind, headers={"cache-control": "private, max-age=86400, immutable"}
+        )
+
     @app.get("/api/sessions/{sid}/commands")
     def commands(sid: str, _caller: str = Depends(session_caller)) -> dict[str, Any]:
         manager.touch(sid)
@@ -319,7 +343,9 @@ def create_app(
             "pause": lambda: manager.pause(sid, body.get("reason", "paused by user")),
             "resume": lambda: manager.resume(sid),
             "stop": lambda: manager.kill(sid),
-            "inject": lambda: manager.command(sid, "inject", body.get("text", "")),
+            "inject": lambda: manager.command(
+                sid, "inject", body.get("text", ""), attachments=body.get("attachments")
+            ),
             "start": lambda: manager.start_driver(sid),
         }
         if action not in actions:

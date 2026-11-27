@@ -26,6 +26,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from wspx.driver.media import Media, attachments
 from wspx.driver.messages import Message, ToolCall, ToolOutput, Turn, dump_message, load_message
 from wspx.driver.providers import Provider
 from wspx.tools import TOOLS
@@ -38,6 +39,8 @@ _CODE_RE = re.compile(r"\b([EW]\d{3})\b")
 class ToolReply:
     text: str
     ok: bool = True
+    attachments: list[dict[str, Any]] = field(default_factory=list)
+    """Images and files the tool returned (object ids and media types)."""
 
 
 @dataclass
@@ -56,6 +59,8 @@ class Hooks:
     """Keep the conversation so far (called after every step)."""
     load_state: Callable[[], dict[str, Any] | None] = lambda: None
     """This runner's earlier checkpoint, when it is being restarted."""
+    blob: Callable[[str], bytes] | None = None
+    """An attachment's bytes by object id (fetched when a request is built)."""
 
 
 @dataclass
@@ -73,6 +78,10 @@ class RunnerConfig:
     """No default: long experiments are never cut off by the runner."""
     deny: frozenset[str] = frozenset()
     """Tools this session turned off: the model is not offered them."""
+    attachments: list[dict[str, Any]] = field(default_factory=list)
+    """Images and files given with the task."""
+    vision: bool = True
+    """``False`` for a model without image input: images become placeholders."""
 
 
 @dataclass
@@ -93,6 +102,13 @@ class Runner:
         self.turns = 0
         self._recent: list[tuple[str, tuple[str, ...]]] = []
         self._tools = [t for t in provider.tools() if _tool_name(t) not in config.deny]
+        kind = provider.name.split(":")[0]
+        provider.media = Media(
+            hooks.blob,
+            provider=kind if kind in ("anthropic", "openai", "google") else "compat",
+            vision=config.vision,
+            files=kind in ("anthropic", "openai", "google"),
+        )
 
     def run(self) -> RunResult:
         state = self.hooks.load_state()
@@ -100,7 +116,9 @@ class Runner:
             return self._resume(state)
         workspace = self.hooks.workspace()
         first = self.config.task + (f"\n\nWorkspace:\n{workspace}" if workspace else "")
-        self.history = [Message("user", text=first)]
+        self.history = [
+            Message("user", text=first, attachments=attachments(self.config.attachments))
+        ]
         self.hooks.event(  # the trace starts with everything the model is given
             {
                 "type": "start",
@@ -112,6 +130,7 @@ class Runner:
                 "tools": sorted(n for n in TOOLS if n not in self.config.deny),
                 "system": self.config.system,
                 "message": first,
+                "attachments": self.config.attachments,
             }
         )
         self._checkpoint()
@@ -141,8 +160,11 @@ class Runner:
                     return self._end("stopped", "stopped by a human")
                 if cmd.get("type") == "pause":
                     return self._end("paused", "paused by a human")
-                if cmd.get("type") == "inject" and cmd.get("text"):
-                    pending.append(f"Message from the human supervising you: {cmd['text']}")
+                if cmd.get("type") == "inject" and (cmd.get("text") or cmd.get("attachments")):
+                    pending.append(
+                        f"Message from the human supervising you: {cmd.get('text') or '(see the attachments)'}"
+                    )
+                    self.history[-1].attachments.extend(attachments(cmd.get("attachments")))
             if self.config.max_turns is not None and self.turns >= self.config.max_turns:
                 return self._end(
                     "stopped", f"reached the turn limit the user set ({self.config.max_turns})"
@@ -218,9 +240,18 @@ class Runner:
                     "ok": reply.ok,
                     "summary": reply.text[:2000],
                     "latency": time.perf_counter() - started,
+                    **({"attachments": reply.attachments} if reply.attachments else {}),
                 }
             )
-            outputs.append(ToolOutput(call.id, call.name, reply.text, is_error=not reply.ok))
+            outputs.append(
+                ToolOutput(
+                    call.id,
+                    call.name,
+                    reply.text,
+                    is_error=not reply.ok,
+                    attachments=attachments(reply.attachments),
+                )
+            )
             pending.extend(self._stuck(call.name, reply.text))
         self.history.append(Message("tool", outputs=outputs))
         self._checkpoint()

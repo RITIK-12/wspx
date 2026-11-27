@@ -282,6 +282,10 @@ def new(
         str | None,
         typer.Option("--max-gpu-time", help="GPU time for the session, load included, e.g. 100m."),
     ] = None,
+    attach: Annotated[
+        list[Path] | None,
+        typer.Option("--attach", help="An image or file for the task (repeatable)."),
+    ] = None,
     grace: Annotated[
         str | None,
         typer.Option("--grace", help="Release the GPU after this long idle, e.g. 5m."),
@@ -299,6 +303,7 @@ def new(
             raise typer.BadParameter("pass --model, or set [model] id in wspx.toml (`wspx init`)")
         control = _control()
         snapshot = control.upload_project(project.pack()) if project else None
+        given = [control.upload(Path(f)) for f in attach or []]
         record = control.new(
             model=model,
             driver=driver or cfg.driver.model,
@@ -309,6 +314,8 @@ def new(
             dtype=cfg.model.dtype,
             trust_remote_code=trust_remote_code or cfg.model.trust_remote_code,
             engine=cfg.lab.engine,
+            driver_images=cfg.driver.images,
+            attachments=given,
             grace_s=_duration(grace, "--grace") if grace else cfg.lab.grace,
             keep_warm=cfg.lab.keep_warm,
             project=project.name if project else "",
@@ -435,10 +442,18 @@ for _action, _help in (
 
 
 @app.command()
-def steer(text: Annotated[str, typer.Argument()], session: Session = None) -> None:
-    """Send a message to the driver of a running session."""
+def steer(
+    text: Annotated[str, typer.Argument()],
+    session: Session = None,
+    attach: Annotated[
+        list[Path] | None, typer.Option("--attach", help="An image or file (repeatable).")
+    ] = None,
+) -> None:
+    """Send a message (and images or files) to the driver of a running session."""
     try:
-        _control().action(_session(session), "inject", text=text)
+        control = _control()
+        given = [control.upload(Path(f)) for f in attach or []]
+        control.action(_session(session), "inject", text=text, attachments=given)
     except WspxError as exc:
         _fail(exc)
     typer.echo("sent")
@@ -933,12 +948,13 @@ def mcp() -> None:
     root = _project_root()
 
     def call(session: str | None, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        sid = session or cfg.current(root)
         try:
-            return control.tool(session or cfg.current(root), name, args)
+            return {**control.tool(sid, name, args), "session": sid}
         except WspxError as exc:
             return {"summary": str(exc), "ok": False}
 
-    run_stdio(call)
+    run_stdio(call, fetch=control.attachment)
 
 
 @hook_app.command("codex")

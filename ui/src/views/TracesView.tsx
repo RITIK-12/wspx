@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { api, formatTokens, type Session } from "../api";
-import { MediaStrip, mediaParts } from "../media";
+import { AttachmentStrip, MediaStrip, mediaParts } from "../media";
 
 // Two traces of one session, each a tree of spans. Leader: the driver model's run — every
 // LLM call with its reasoning, tokens and cost, every tool call with its full result, and
@@ -293,7 +293,7 @@ function leaderTree(record: any, handles: Record<string, any>): Span {
         end: e.ts,
         children: [],
         open: true,
-        detail: () => <RunDetail p={p} />,
+        detail: () => <RunDetail p={p} session={s.id ?? ""} />,
       };
       root.children.push(run);
     } else if (e.kind === "turn") {
@@ -325,7 +325,7 @@ function leaderTree(record: any, handles: Record<string, any>): Span {
           failed: !p.ok,
           badge: exchanges.length ? `open model: ${made} gen, ${exchanges.length - made} fwd` : undefined,
           children: [],
-          detail: () => <ToolDetail p={p} handles={handles} />,
+          detail: () => <ToolDetail p={p} handles={handles} session={s.id ?? ""} />,
         },
         e.source === "driver",
       );
@@ -439,7 +439,7 @@ function SessionDetail({ record }: { record: any }) {
   );
 }
 
-function RunDetail({ p }: { p: any }) {
+function RunDetail({ p, session }: { p: any; session: string }) {
   return (
     <>
       <div className="muted small">
@@ -452,6 +452,7 @@ function RunDetail({ p }: { p: any }) {
       <details open>
         <summary>first message</summary>
         <pre className="reasoning">{p.message}</pre>
+        <AttachmentStrip session={session} items={p.attachments} />
       </details>
     </>
   );
@@ -479,7 +480,7 @@ function TurnDetail({ p }: { p: any }) {
   );
 }
 
-function ToolDetail({ p, handles }: { p: any; handles: Record<string, any> }) {
+function ToolDetail({ p, handles, session }: { p: any; handles: Record<string, any>; session: string }) {
   const trace = (p.handles ?? []).map((h: string) => handles[h]).find((h: any) => h?.kind === "trace");
   return (
     <>
@@ -489,6 +490,7 @@ function ToolDetail({ p, handles }: { p: any; handles: Record<string, any> }) {
       </div>
       <pre className="reasoning">{JSON.stringify(p.args, null, 2)}</pre>
       <pre className="result">{p.summary}</pre>
+      <AttachmentStrip session={session} items={p.attachments} />
       {trace && <TraceObject handle={trace} />}
     </>
   );

@@ -11,6 +11,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from wspx.driver.media import Media, Part
 from wspx.driver.messages import Message, ToolCall, Turn, Usage
 from wspx.tools import anthropic_tools
 
@@ -36,6 +37,8 @@ ADAPTIVE_PREFIXES = (
 
 
 class AnthropicProvider:
+    media: Media | None = None
+
     name = "anthropic"
 
     def __init__(
@@ -60,22 +63,31 @@ class AnthropicProvider:
 
     def messages(self, history: list[Message]) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
+        media = self.media
+        visible = media.visible(history) if media is not None else set()
         for msg in history:
             if msg.role == "assistant":
                 content = msg.native if msg.provider == self.name and msg.native else _plain(msg)
                 out.append({"role": "assistant", "content": content})
                 continue
-            blocks: list[dict[str, Any]] = [
-                {
-                    "type": "tool_result",
-                    "tool_use_id": o.call_id,
-                    "content": o.content,
-                    "is_error": o.is_error,
-                }
-                for o in msg.outputs
-            ]
+            blocks: list[dict[str, Any]] = []
+            for o in msg.outputs:
+                result: Any = o.content
+                if o.attachments and media is not None:
+                    result = [{"type": "text", "text": o.content or "(no text)"}]
+                    result += [_block(p) for p in media.parts(o.attachments, visible)]
+                blocks.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": o.call_id,
+                        "content": result,
+                        "is_error": o.is_error,
+                    }
+                )
             if msg.text:
                 blocks.append({"type": "text", "text": msg.text})
+            if msg.attachments and media is not None:
+                blocks += [_block(p) for p in media.parts(msg.attachments, visible)]
             blocks.extend({"type": "text", "text": f"[operator] {note}"} for note in msg.notes)
             out.append({"role": "user", "content": blocks})
         return out
@@ -151,3 +163,12 @@ def _plain(msg: Message) -> list[dict[str, Any]]:
         {"type": "tool_use", "id": c.id, "name": c.name, "input": c.args} for c in msg.tool_calls
     )
     return blocks or [{"type": "text", "text": "(no content)"}]
+
+
+def _block(part: Part) -> dict[str, Any]:
+    if part.text:
+        return {"type": "text", "text": part.text}
+    source = {"type": "base64", "media_type": part.media_type, "data": part.b64}
+    if part.attachment.pdf:
+        return {"type": "document", "source": source, "title": part.attachment.name or "document"}
+    return {"type": "image", "source": source}

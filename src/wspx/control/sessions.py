@@ -119,12 +119,14 @@ class SessionManager:
         dtype: str = "bfloat16",
         trust_remote_code: bool = False,
         engine: str = "hf",
+        driver_images: str = "auto",
         grace_s: float = 900.0,
         keep_warm: str = "auto",
         project: str = "",
         snapshot: str | None = None,
         tools_deny: list[str] | None = None,
         max_lab_s: float | None = None,
+        attachments: list[dict[str, Any]] | None = None,
     ) -> SessionRecord:
         if self.halted:
             raise WspxError("wspx is halted; `wspx resume` first")
@@ -156,8 +158,12 @@ class SessionManager:
             tools_deny=sorted(set(tools_deny or [])),
             max_lab_s=max_lab_s,
             engine=engine,
+            driver_images=driver_images,
         )
         self.records[sid] = record
+        if attachments:
+            self.allow(record, attachments)
+            record.extra["task_attachments"] = [a["oid"] for a in attachments]
         self._save(record)
         self.trace.event(
             sid,
@@ -214,6 +220,8 @@ class SessionManager:
             "WSPX_RUNNER_TOKEN": mint(self.secret, sid, scope="runner"),
             "WSPX_LLM_TOKEN": mint(self.secret, sid, scope="llm"),
             "WSPX_TOOLS_DENY": ",".join(record.tools_deny),
+            "WSPX_ATTACHMENTS": json.dumps(self.task_attachments(record)),
+            "WSPX_DRIVER_IMAGES": record.driver_images,
             # a cloud runner restarted on this same input resumes from its checkpoint
             "WSPX_RUNNER_ID": "r_" + secrets.token_hex(6),
         }
@@ -419,6 +427,9 @@ class SessionManager:
             else:
                 self._persist(sid, result)
                 result.pop("journal", None)
+                if result.get("attachments"):  # replayed into the store with the journal
+                    self.allow(record, result["attachments"])
+                    self._save(record)
             if note:
                 note = note.format(time.time() - started)
         latency = time.time() - started
@@ -543,11 +554,77 @@ class SessionManager:
         self.idle_since.pop(sid, None)
 
     def command(
-        self, sid: str, kind: str, text: str | None = None, *, source: str = "human"
+        self,
+        sid: str,
+        kind: str,
+        text: str | None = None,
+        *,
+        source: str = "human",
+        attachments: list[dict[str, Any]] | None = None,
     ) -> None:
-        self.get(sid)
-        self.commands[sid].append({"type": kind, **({"text": text} if text else {})})
-        self.trace.event(sid, "command", {"type": kind, "text": text}, source=source)
+        record = self.get(sid)
+        entry: dict[str, Any] = {"type": kind, **({"text": text} if text else {})}
+        if attachments:
+            self.allow(record, attachments)
+            entry["attachments"] = attachments
+        self.commands[sid].append(entry)
+        self.trace.event(sid, "command", entry, source=source)
+
+    # ------------------------------------------------------------------ attachments
+
+    def upload(self, data: bytes, *, name: str, media_type: str) -> dict[str, Any]:
+        """Store an image or file a session may be given; it is shown to a driver only once
+        a session is given it (a task, a steering message)."""
+        if len(data) > MAX_ATTACHMENT:
+            raise WspxError(f"{name}: {len(data) / 2**20:.0f} MB; attachments are at most 20 MB")
+        meta: dict[str, Any] = {
+            "oid": self.store.objects.put(data),
+            "media_type": media_type,
+            "name": name,
+            "size": len(data),
+        }
+        if media_type.startswith("image/"):
+            with contextlib.suppress(Exception):
+                import io
+
+                from PIL import Image
+
+                with Image.open(io.BytesIO(data)) as im:
+                    meta["width"], meta["height"] = im.size
+        return meta
+
+    def allow(self, record: SessionRecord, metas: list[dict[str, Any]]) -> None:
+        """Attachments this session's driver may fetch: what its tools returned, what it was
+        given. Nothing else in the store (held-out suites live there too)."""
+        allowed = record.extra.setdefault("attachments", {})
+        for m in metas:
+            if (
+                isinstance(m, dict)
+                and isinstance(m.get("oid"), str)
+                and self.store.objects.has(m["oid"])
+            ):
+                allowed[m["oid"]] = {
+                    k: m[k]
+                    for k in ("media_type", "name", "size", "width", "height", "caption")
+                    if k in m
+                }
+
+    def attachment(self, sid: str, oid: str) -> tuple[bytes, str]:
+        record = self.get(sid)
+        meta = record.extra.get("attachments", {}).get(oid)
+        if meta is None:
+            raise WspxError(f"{oid[:16]}: not an attachment of {sid}")
+        return self.store.objects.get(oid), str(
+            meta.get("media_type") or "application/octet-stream"
+        )
+
+    def task_attachments(self, record: SessionRecord) -> list[dict[str, Any]]:
+        allowed = record.extra.get("attachments", {})
+        return [
+            {"oid": o, **allowed[o]}
+            for o in record.extra.get("task_attachments", [])
+            if o in allowed
+        ]
 
     def take_commands(self, sid: str) -> list[dict[str, Any]]:
         out = []
@@ -699,6 +776,8 @@ class SessionManager:
 def _minutes(seconds: float) -> str:
     return f"{seconds / 60:.0f} min" if seconds >= 60 else f"{seconds:.0f} s"
 
+
+MAX_ATTACHMENT = 20 * 2**20
 
 GPU_CAPABILITY = {
     "T4": 7.5,

@@ -27,6 +27,8 @@ class SessionRecord:
     trust_remote_code: bool = False
     engine: str = "hf"
     """What generates in the lab: ``hf`` (transformers) or ``vllm`` (beside it)."""
+    driver_images: str = "auto"
+    """``off`` when the driver model takes no images."""
     status: str = "idle"
     """starting (driver queued until the lab is up) · idle · running · paused · stopped · done · error"""
     tier: str = "cold"

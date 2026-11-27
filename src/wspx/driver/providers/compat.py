@@ -10,11 +10,14 @@ import json
 import time
 from typing import Any
 
+from wspx.driver.media import Media, Part
 from wspx.driver.messages import Message, ToolCall, Turn, Usage
 from wspx.tools import TOOLS
 
 
 class ChatProvider:
+    media: Media | None = None
+
     def __init__(
         self,
         model: str,
@@ -47,6 +50,8 @@ class ChatProvider:
 
     def messages(self, system: str, history: list[Message]) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = [{"role": "system", "content": system}]
+        media = self.media
+        visible = media.visible(history) if media is not None else set()
         for msg in history:
             if msg.role == "assistant":
                 entry: dict[str, Any] = {"role": "assistant", "content": msg.text or None}
@@ -65,8 +70,19 @@ class ChatProvider:
                 {"role": "tool", "tool_call_id": o.call_id, "content": o.content}
                 for o in msg.outputs
             )
+            # most OpenAI-compatible servers take only text in tool messages: the tools'
+            # images follow in a user message, as data URLs
+            shown: list[dict[str, Any]] = []
+            if media is not None:
+                for o in msg.outputs:
+                    for p in media.parts(o.attachments, visible):
+                        shown.append(_part(p, f"from {o.name} ({o.call_id})"))
+                shown += [_part(p, "") for p in media.parts(msg.attachments, visible)]
             text = "\n".join([msg.text, *(f"[operator] {n}" for n in msg.notes)]).strip()
-            if text:
+            if shown:
+                lead = text or "Attachments from the tool calls above:"
+                out.append({"role": "user", "content": [{"type": "text", "text": lead}, *shown]})
+            elif text:
                 out.append({"role": "user", "content": text})
         return out
 
@@ -113,3 +129,10 @@ class ChatProvider:
             self.model,
             time.perf_counter() - started,
         )
+
+
+def _part(part: Part, where: str) -> dict[str, Any]:
+    if part.text or not part.attachment.image:
+        label = f"{part.text or '[file ' + part.attachment.label() + ']'}"
+        return {"type": "text", "text": f"{label} {where}".strip()}
+    return {"type": "image_url", "image_url": {"url": part.data_url}}

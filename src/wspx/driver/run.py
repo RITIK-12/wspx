@@ -68,7 +68,14 @@ class ControlHooks:
                 f"{name}: control plane error {r.status_code}: {r.text[:500]}", ok=False
             )
         data = r.json()
-        return ToolReply(data.get("summary", ""), bool(data.get("ok", True)))
+        return ToolReply(
+            data.get("summary", ""), bool(data.get("ok", True)), list(data.get("attachments") or [])
+        )
+
+    def blob(self, oid: str) -> bytes:
+        r = self.control.get(f"/api/sessions/{self.session}/attachments/{oid}")
+        r.raise_for_status()
+        return r.content
 
     def gateway_state(self) -> dict[str, Any]:
         if self.gateway is None:
@@ -130,6 +137,7 @@ class ControlHooks:
             event=self.event,
             save_state=self.save_state,
             load_state=self.load_state,
+            blob=self.blob,
         )
 
 
@@ -159,6 +167,8 @@ def run_from_env(
         task=env.get("WSPX_TASK", ""),
         effort=env.get("WSPX_EFFORT", "high"),
         deny=deny,
+        attachments=json.loads(env.get("WSPX_ATTACHMENTS") or "[]"),
+        vision=env.get("WSPX_DRIVER_IMAGES", "auto") != "off",
     )
     return Runner(provider, hooks.hooks(), config).run()
 

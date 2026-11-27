@@ -55,6 +55,7 @@ driver = [
     "anthropic>=2.11",
     "google-genai>=3.6",
     "openai>=3.56",
+    "pillow>=11",
 ]
 # Deliberately small: no provider SDKs, so the only holder of keys is easy to audit.
 gateway = [
