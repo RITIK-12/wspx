@@ -163,5 +163,6 @@ asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 markers = [
     "slow: exercises real Hugging Face architectures; deselect with -m 'not slow'",
+    "release: the release matrix (real models on a GPU, real driver APIs); WSPX_RELEASE=1",
 ]
 filterwarnings = ["error::DeprecationWarning:wspx.*"]

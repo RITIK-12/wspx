@@ -435,6 +435,18 @@ class VLLMEngine(Engine):
                         f"{name} is kept exact in bf16 (promote mode), and vLLM holds it in the "
                         "checkpoint's quantized format; edit it merged, or use engine = 'hf'"
                     )
+        params = dict(self.model.named_parameters())
+        packed = [
+            n
+            for n in changed
+            if n in params and not params[n].dtype.is_floating_point and n in state.adapter
+        ]
+        if packed:  # an int4/int8 weight plus a float delta is not a weight vLLM can load
+            raise WspxError(
+                f"{packed[0]} is stored as {params[packed[0]].dtype} integers, and an adapter "
+                "edit to it cannot be merged into what vLLM holds; use engine = 'hf' for "
+                "adapter edits on this checkpoint"
+            )
         touched = set(changed)
         groups = [g for g in self._groups if touched & set(g)]
         live: dict[str, torch.Tensor] = dict(self.model.named_parameters())
