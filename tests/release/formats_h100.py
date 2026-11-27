@@ -63,7 +63,7 @@ def formats(only: str = "") -> list[dict]:  # type: ignore[type-arg]
 
     out = []
     for i, (name, edits) in enumerate(CASES):
-        if only and only not in name:
+        if only and not any(o and o in name for o in only.split(",")):
             continue
         model, path = f"/models/{name}", f"/tmp/formats-{i}.json"
         if not Path(model, "config.json").exists():

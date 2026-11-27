@@ -276,7 +276,11 @@ def build_app(engine_argv: list[str], token: str) -> Any:
     async def incomplete() -> dict[str, Any]:
         """Modules the running update has given only part of their tensors."""
         out = await engine().collective_rpc("wspx_incomplete")
-        return {"modules": sorted({m for rank in out or [] for m in rank or []})}
+        ranks = [r for r in out or [] if isinstance(r, dict)]
+        return {
+            "modules": sorted({m for r in ranks for m in r.get("modules", [])}),
+            "need": sorted({n for r in ranks for n in r.get("need", [])}),
+        }
 
     @app.get("/checksums")
     async def checksums() -> Any:

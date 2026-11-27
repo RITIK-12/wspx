@@ -71,9 +71,10 @@ Chunks = Iterable[dict[str, torch.Tensor]]
 class Transport:
     """How tensors reach the worker. Over CUDA IPC normally; tests swap in their own.
 
-    ``more``: further chunks, in order, sent before the update finishes while vLLM reports
-    modules it has given only part of their tensors; returns the bytes sent and how many
-    of ``more`` it took."""
+    Before the update finishes, while vLLM reports modules it has given only part of their
+    tensors: ``supply`` sends the checkpoint tensors vLLM names as completing them, and
+    failing that, ``more`` sends further chunks, in order. Returns the bytes sent and how
+    many of ``more`` it took."""
 
     def send(
         self,
@@ -81,6 +82,7 @@ class Transport:
         chunks: Chunks,
         version: str,
         more: Sequence[Callable[[], Chunks]] = (),
+        supply: Callable[[list[str]], Chunks] | None = None,
     ) -> tuple[int, int]:
         raise NotImplementedError
 
@@ -102,20 +104,25 @@ class IPCTransport(Transport):
         chunks: Chunks,
         version: str,
         more: Sequence[Callable[[], Chunks]] = (),
+        supply: Callable[[list[str]], Chunks] | None = None,
     ) -> tuple[int, int]:
         uuid = str(torch.cuda.get_device_properties(self.device).uuid)
         if not self._inited:
             _post(http, "/weights/init", {"packed": False})
             self._inited = True
         _post(http, "/weights/start", {})
-        sent = used = 0
+        sent = used = rounds = 0
         try:
             sent += self._updates(http, chunks, uuid)
             while True:
-                missing = _incomplete(http)
+                missing, need = _incomplete(http)
                 if not missing:
                     break
                 self.reported = missing
+                if need and supply is not None and rounds < 4:
+                    sent += self._updates(http, supply(need), uuid)
+                    rounds += 1
+                    continue
                 if used == len(more):
                     raise WspxError(
                         "vLLM has only part of the tensors of "
@@ -164,11 +171,14 @@ class IPCTransport(Transport):
         return sent
 
 
-def _incomplete(http: httpx.Client) -> list[str]:
+def _incomplete(http: httpx.Client) -> tuple[list[str], list[str]]:
+    """Modules the running update has given only part of their tensors, and the checkpoint
+    tensors that complete them."""
     r = http.get("/weights/incomplete")
     if r.status_code != 200:  # a worker without the check: nothing to say
-        return []
-    return list(r.json().get("modules", []))
+        return [], []
+    body = r.json()
+    return list(body.get("modules", [])), list(body.get("need", []))
 
 
 def _post(http: httpx.Client, path: str, body: dict[str, Any]) -> Any:
@@ -396,6 +406,8 @@ class VLLMEngine(Engine):
         self.survival: dict[str, Any] = {}
         """Adapter edits on tensors stored quantized, as vLLM serves them (merged)."""
         self._by_layer: dict[str, list[str]] | None = None
+        self._producers: dict[str, str] | None = None
+        """Checkpoint tensor → the lab tensor that produces it."""
         self.with_outside = False
         """Pushes also send what lies outside the layer stacks (a model whose vLLM loader
         maps such tensors into every layer), learned from vLLM on the first push."""
@@ -486,6 +498,9 @@ class VLLMEngine(Engine):
             *argv,
         ]
         self.proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, env=env)
+        import atexit
+
+        atexit.register(self.close)  # a lab that ends any way frees vLLM's GPU memory
         return httpx.Client(
             base_url=f"http://127.0.0.1:{port}",
             headers={"authorization": f"Bearer {token}"},
@@ -570,6 +585,65 @@ class VLLMEngine(Engine):
         live: torch.Tensor = self.tree.params[name]
         return live
 
+    def _supply(self, need: list[str], state: TreeState) -> Chunks:
+        """The checkpoint tensors ``need`` names, at their current values: converted from
+        the tensors the lab holds that produce them, or as the source stores them."""
+        served = self.tree.served
+        if self._producers is None:
+            self._producers = {}
+            for n in self._names:
+                shape = self._shape(n)
+                for ck in checkpoint.names_in_checkpoint(self.model, n, shape):
+                    fmt = served.formats.get(ck) if served is not None else None
+                    for part in fmt.parts if fmt is not None else [ck]:
+                        self._producers.setdefault(part, n)
+        by_lab: dict[str, set[str]] = {}
+        stored: list[str] = []
+        for ck in need:
+            producer = self._producers.get(ck)
+            if producer is None:
+                stored.append(ck)
+            else:
+                by_lab.setdefault(producer, set()).add(ck)
+        out: dict[str, torch.Tensor] = {}
+        for n, cks in by_lab.items():
+            shape = self._shape(n)
+            if served is not None and served.quantized(n, shape):
+                parts = (
+                    self._stored_value(n, state)
+                    or served.stored(n)
+                    or served.source_parts(n, shape, torch.device("cpu"))
+                )
+                out.update({k: v for k, v in parts.items() if k in cks})
+                continue
+            try:
+                converted = checkpoint.to_checkpoint(self.model, {n: self._value(n, state)})
+            except Exception:  # a conversion that needs others' tensors: as stored
+                stored += sorted(cks)
+                continue
+            converted, _ = checkpoint.as_stored(self.src, converted)
+            for k in cks:
+                if k in converted:
+                    out[k] = converted[k]
+                else:
+                    stored.append(k)
+        out.update(self._source_tensors([k for k in stored if k not in out]))
+        return [out]
+
+    def _source_tensors(self, names: list[str]) -> dict[str, torch.Tensor]:
+        if self.src is None or not names:
+            return {}
+        from safetensors import safe_open
+
+        out: dict[str, torch.Tensor] = {}
+        for fname in sorted(self.src.weight_files):
+            with safe_open(str(self.src.path / fname), framework="pt") as fh:
+                keys = set(fh.keys())
+                for k in names:
+                    if k in keys and k not in out:
+                        out[k] = fh.get_tensor(k)
+        return out
+
     def _rest_of_layers(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         """The checkpoint tensors of the layers in ``batch`` that the lab does not hold
         (static activation scales, KV-cache scales and the like), as the source stores them:
@@ -584,18 +658,7 @@ class VLLMEngine(Engine):
                     self._by_layer.setdefault(m.group(1), []).append(name)
         layers = {m.group(1) for k in batch if (m := checkpoint._LAYER.match(k))}
         missing = [k for layer in layers for k in self._by_layer.get(layer, []) if k not in batch]
-        if not missing:
-            return {}
-        from safetensors import safe_open
-
-        out: dict[str, torch.Tensor] = {}
-        for fname in sorted(self.src.weight_files):
-            with safe_open(str(self.src.path / fname), framework="pt") as fh:
-                keys = set(fh.keys())
-                for k in missing:
-                    if k in keys and k not in out:
-                        out[k] = fh.get_tensor(k)
-        return out
+        return self._source_tensors(missing)
 
     def _shape(self, name: str) -> tuple[int, ...]:
         if name in self._buffer_names:
@@ -684,13 +747,24 @@ class VLLMEngine(Engine):
                 batch = {**as_stored, **stored}
                 yield {**batch, **self._rest_of_layers(batch)}
 
-        def these(gs: list[list[str]]) -> Callable[[], Chunks]:
-            return lambda: chunks(gs)
+        sent_groups = [list(g) for g in groups]
 
-        more = [these([g for g in outside if g not in groups]), these(list(self._groups))]
+        def these(level: Callable[[], list[list[str]]]) -> Callable[[], Chunks]:
+            def go() -> Chunks:
+                # never a group already sent in this update: vLLM has processed it into its
+                # kernel layout, and a second copy of its checkpoint tensors does not fit
+                gs = [g for g in level() if g not in sent_groups]
+                sent_groups.extend(gs)
+                return chunks(gs)
+
+            return go
+
+        more = [these(lambda: outside), these(lambda: list(self._groups))]
         version = self.state_key(state) or f"sync-{len(self.syncs) + 1}"
         try:
-            sent, used = self.transport.send(self.http, chunks(groups), version, more)
+            sent, used = self.transport.send(
+                self.http, chunks(groups), version, more, lambda need: self._supply(need, state)
+            )
         except Exception:
             self.stale = True
             raise

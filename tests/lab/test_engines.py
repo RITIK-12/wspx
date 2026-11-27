@@ -87,6 +87,7 @@ class FakeTransport(Transport):
         chunks: Iterable[dict[str, torch.Tensor]],
         version: str,
         more: Any = (),
+        supply: Any = None,
     ) -> tuple[int, int]:
         state = self.worker.model.state_dict()
         names: list[str] = []
@@ -245,7 +246,9 @@ def test_a_push_sends_only_changed_layers_and_a_failed_one_is_mended(tmp_path: P
     assert all(".layers.1." in n for n in transport.pushes[-1])
 
     class Flaky(FakeTransport):
-        def send(self, http: Any, chunks: Any, version: str, more: Any = ()) -> tuple[int, int]:
+        def send(
+            self, http: Any, chunks: Any, version: str, more: Any = (), supply: Any = None
+        ) -> tuple[int, int]:
             next(iter(chunks))
             raise WspxError("vLLM worker /weights/update: 500 out of memory")
 
@@ -279,6 +282,45 @@ def test_a_model_that_maps_outside_tensors_into_its_layers_gets_them_each_push(
     lab.edit.scale("L0.mlp.down", factor=0.5)
     lab.generate(PROMPTS, max_tokens=2)
     assert "model.norm.weight" in transport.pushes[-1]
+    assert same_weights(lab.model, worker.model)
+
+
+def test_vllm_names_what_completes_a_module_and_gets_current_values(tmp_path: Path) -> None:
+    """A vLLM module gathered from tensors of two layers (as Inkling2Loop's query lists):
+    vLLM names the checkpoint tensors it lacks, and the lab sends those, at the values the
+    lab holds (an edit to them included), not the whole model."""
+    lab, worker, _ = vllm_lab(tmp_path, agreement_prompts=0)
+    gathered = ("model.layers.0.mlp.down_proj.weight", "model.layers.1.mlp.down_proj.weight")
+
+    class Gathering(FakeTransport):
+        def send(
+            self, http: Any, chunks: Any, version: str, more: Any = (), supply: Any = None
+        ) -> tuple[int, int]:
+            names: list[str] = []
+            state = self.worker.model.state_dict()
+
+            def load(cs: Any) -> None:
+                for chunk in cs:
+                    for name, t in chunk.items():
+                        with torch.no_grad():
+                            state[name].copy_(t)
+                        names.append(name)
+
+            load(chunks)
+            need = [n for n in gathered if n not in names]
+            if any(n in names for n in gathered) and need:
+                load(supply(need))
+            self.pushes.append(names)
+            return 0, 0
+
+    lab.edit.scale("L0.mlp.down", factor=2.0)
+    lab.engine.transport = transport = Gathering(worker)  # type: ignore[attr-defined]
+    lab.generate(PROMPTS, max_tokens=2)  # pushes layer 0; vLLM asks for layer 1's tensor
+    lab.edit.scale("L1.mlp.down", factor=0.5)
+    lab.generate(PROMPTS, max_tokens=2)  # pushes layer 1; vLLM asks for layer 0's, as edited
+    last = transport.pushes[-1]
+    assert "model.layers.0.mlp.down_proj.weight" in last
+    assert not any(".layers.0.self_attn." in n for n in last)  # only what was named
     assert same_weights(lab.model, worker.model)
 
 

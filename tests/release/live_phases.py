@@ -152,6 +152,7 @@ def run(model: str, edits: list[dict[str, Any]], out: str) -> None:
         if engine_ is not None:
             report["incomplete"] = getattr(engine_.transport, "reported", None)
             report["notes"] = list(engine_.notes)
+            engine_.close()  # its GPU memory is the next model's
     log = work / "vllm.log"
     if log.exists():
         lines = log.read_text(errors="replace").splitlines()

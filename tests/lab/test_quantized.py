@@ -220,7 +220,9 @@ def test_vllm_gets_the_edited_layer_in_its_stored_format(lab: Any) -> None:
     pushed: dict[str, torch.Tensor] = {}
 
     class Record(Transport):
-        def send(self, http: Any, chunks: Any, version: str, more: Any = ()) -> tuple[int, int]:
+        def send(
+            self, http: Any, chunks: Any, version: str, more: Any = (), supply: Any = None
+        ) -> tuple[int, int]:
             for chunk in chunks:
                 pushed.update(chunk)
             return 0, 0

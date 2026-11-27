@@ -24,6 +24,7 @@ Like the worker, it runs with vLLM's own Python and imports nothing from wspx.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 from collections.abc import Iterable
 from typing import Any
@@ -178,10 +179,19 @@ def _patch_finish() -> bool:
     original = reload.finish_reload
     if getattr(original, "_wspx", False):
         return True
+    begin = reload.start_reload
+
+    @functools.wraps(begin)
+    def start_reload(model: Any) -> Any:
+        SENT.clear()
+        return begin(model)
+
+    reload.start_reload = start_reload
 
     @functools.wraps(original)
     def finish_reload(model: Any, model_config: Any, device: Any) -> Any:
         out = original(model, model_config, device)
+        SENT.clear()
         touched, _TOUCHED[:] = list(_TOUCHED), []
         for module in touched:
             _rebuild_experts(module)
@@ -211,6 +221,105 @@ def patch_reload() -> list[str]:
     return done
 
 
+SOURCES: dict[str, set[str]] = {}
+"""vLLM parameter → the checkpoint tensors the cold start loaded into it."""
+SENT: set[str] = set()
+"""Checkpoint tensors the update running now has delivered."""
+
+
+def _set_loader(p: Any, loader: Any) -> bool:
+    prop = getattr(type(p), "weight_loader", None)
+    try:
+        if isinstance(prop, property):  # vLLM's own parameter classes keep it here
+            p._weight_loader = loader
+        else:
+            p.weight_loader = loader
+    except Exception:
+        return False
+    return True
+
+
+def _patch_cold_start() -> bool:
+    """At cold start, record which parameters the load filled (a model's ``load_weights``
+    names them) and which checkpoint tensor each loader call carried; after it, record the
+    names each update delivers. An update is then checked against what a module had at
+    cold start, and what completes it is named by checkpoint tensor."""
+    try:
+        from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
+        from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+    except Exception:
+        return False
+    original = DefaultModelLoader.load_weights
+    if getattr(original, "_wspx", False):
+        return True
+
+    @functools.wraps(original)
+    def load_weights(self: Any, model: Any, model_config: Any) -> Any:
+        inner = model.load_weights
+        seen: set[str] = set()
+        by_storage: dict[int, str] = {}
+        current: list[str | None] = [None]
+        restore: list[tuple[Any, Any]] = []
+        for pname, param in model.named_parameters():
+            loader = getattr(param, "weight_loader", None)
+
+            def recorded(*args: Any, _l: Any = loader, _n: str = pname, **kwargs: Any) -> Any:
+                loaded: Any = args[1] if len(args) > 1 else kwargs.get("loaded_weight")
+                source = current[0]
+                with contextlib.suppress(Exception):
+                    source = by_storage.get(loaded.untyped_storage().data_ptr(), source)
+                if source is not None:
+                    SOURCES.setdefault(_n, set()).add(source)
+                return (_l or default_weight_loader)(*args, **kwargs)
+
+            if _set_loader(param, recorded):
+                restore.append((param, loader))
+
+        def tracked(weights: Any) -> Any:
+            for name, tensor in weights:
+                current[0] = name
+                with contextlib.suppress(Exception):
+                    by_storage[tensor.untyped_storage().data_ptr()] = name
+                yield name, tensor
+            current[0] = None
+
+        def recording(weights: Any) -> Any:
+            out = inner(tracked(weights))
+            if out:
+                seen.update(out)
+            return out
+
+        model.load_weights = recording
+        try:
+            return original(self, model, model_config)
+        finally:
+            del model.load_weights
+            for param, loader in restore:
+                if loader is None:
+                    with contextlib.suppress(Exception):
+                        del param.weight_loader
+                else:
+                    _set_loader(param, loader)
+            by_storage.clear()
+            model._wspx_cold_loaded = seen
+            updating = model.load_weights
+
+            def delivered(weights: Any) -> Any:
+                from vllm.model_executor.model_loader.reload import weight_update_active
+
+                weights = list(weights)
+                if weight_update_active():
+                    SENT.update(name for name, _ in weights)
+                return updating(weights)
+
+            model.load_weights = delivered
+
+    load_weights._wspx = True  # type: ignore[attr-defined]
+    DefaultModelLoader.load_weights = load_weights
+    return True
+
+
+_patch_cold_start()
 PATCHED = patch() + patch_reload()
 
 
@@ -220,29 +329,44 @@ class WspxWorkerExtension:
     def wspx_patched_loaders(self) -> list[str]:
         return list(PATCHED)
 
-    def wspx_incomplete(self) -> list[str]:
-        """Modules an update running now has given only part of their tensors: finishing
-        would process them with the rest missing. A model can map a checkpoint tensor kept
-        outside the layer stack into every layer (Inkling2Loop's message queries)."""
+    def wspx_incomplete(self) -> dict[str, list[str]]:
+        """Modules an update running now has given only part of their tensors (finishing
+        would process them with the rest missing), and the checkpoint tensors that complete
+        them (a model can gather one module from tensors the checkpoint keeps apart:
+        Inkling2Loop's per-layer queries are one list)."""
         from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
 
         runner = getattr(self, "model_runner", None)
         model = getattr(runner, "model", None)
         if model is None:
-            return []
-        out = []
+            return {"modules": [], "need": []}
+        cold: set[str] = getattr(model, "_wspx_cold_loaded", set())
+        out: list[str] = []
+        need: set[str] = set()
         for name, module in model.named_modules():
+            prefix = f"{name}." if name else ""
             if module in _TOUCHED:  # experts reloaded here: every tensor must have come
                 parts = [f"{p}_{s}" for p in ("w13", "w2") for s in ("weight", "weight_scale")]
-                if getattr(module, "humming", None) is not None and any(
-                    getattr(module, n).numel() == 0 for n in parts
-                ):
-                    out.append(f"{name} ({type(module).__name__}: part of its experts)")
+                if getattr(module, "humming", None) is not None:
+                    empty = [n for n in parts if getattr(module, n).numel() == 0]
+                    if empty:
+                        out.append(f"{name} ({type(module).__name__}: no {', '.join(empty)})")
+                        for n in empty:
+                            need |= SOURCES.get(prefix + n, set())
                 continue
             info = LAYERWISE_INFO.get(module)
-            if info is None or not info.can_load():
+            if info is None or not info.can_load() or not info.loaded_weights:
+                continue  # done (processed when its last tensor came), or not in this update
+            got = {n for n, _ in info.loaded_weights}
+            if cold:  # what the cold start loaded into this module, and not this update
+                had = {n for n, _ in module.named_parameters(recurse=False) if prefix + n in cold}
+                missing = sorted(had - got)
+                if missing:
+                    out.append(f"{name} ({type(module).__name__}: no {', '.join(missing[:4])})")
+                    for n in missing:
+                        need |= SOURCES.get(prefix + n, set())
                 continue
             loaded, total = info.load_numel, info.load_numel_total
             if total and 0 < loaded < total:
                 out.append(f"{name} ({type(module).__name__}: {loaded}/{total})")
-        return out
+        return {"modules": out, "need": sorted(need - SENT)}
