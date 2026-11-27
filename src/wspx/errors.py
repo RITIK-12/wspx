@@ -49,8 +49,9 @@ class CheckFailed(WspxError):
 
     def __init__(self, diagnostics: list[Diagnostic]) -> None:
         self.diagnostics = diagnostics
-        codes = ", ".join(d.code for d in diagnostics) or "no diagnostics"
-        super().__init__(f"check failed: {codes}")
+        # the message says why, so a caller that only prints the exception still learns it
+        why = "\n".join(d.render() for d in diagnostics) or "no diagnostics"
+        super().__init__(f"check failed: {why}")
 
 
 class GrepError(WspxError):

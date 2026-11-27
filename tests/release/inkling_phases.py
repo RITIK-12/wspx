@@ -106,37 +106,62 @@ def _lab_phase(report: dict) -> None:  # type: ignore[type-arg]
     torch.manual_seed(0)
     width = int(lab.model.config.get_text_config().hidden_size)
     direction = torch.randn(width)
+    # (label, op, args, expected): a rank-one projection is far below the 4-bit grid's step,
+    # so only ~18% of it would be served and the lab refuses it; the 8-bit grid keeps most
     edits = [
         (
             "nvfp4 project_out, every expert of L10",
             "project_out",
             {"direction": direction, "targets": "L10.mlp.experts.down_proj"},
+            "refused",
         ),
         (
             "nvfp4 scale, experts 0-15 of L5",
             "scale",
             {"targets": "L5.mlp.experts.gate_up_proj[0:16]", "factor": 1.3},
+            "kept",
         ),
         (
             "mxfp8 project_out, every expert of L21",
             "project_out",
             {"direction": direction, "targets": "L21.mlp.experts.down_proj"},
+            "kept",
         ),
         (
             "mxfp8 scale, part of expert 3 of L22",
             "scale",
             {"targets": "L22.mlp.experts.gate_up_proj[3, 0:256, :]", "factor": 0.8},
+            "kept",
+        ),
+        (
+            "tiny nvfp4 nudge, 4 columns of expert 2 of L3",
+            "scale",
+            {"targets": "L3.mlp.experts.gate_up_proj[2, :, 1:5]", "factor": 1.03},
+            "refused",
         ),
     ]
     rows = []
-    for label, op, args in edits:
+    for label, op, args, expected in edits:
         t = time.perf_counter()
         try:
             ref = lab.edit(op, **args)
         except Exception as exc:  # recorded, not fatal: the report says what failed
-            rows.append({"edit": label, "error": f"{type(exc).__name__}: {exc}"})
+            refused = "E110" in str(exc)
+            rows.append(
+                {
+                    "edit": label,
+                    "outcome": "refused" if refused else "error",
+                    "as_expected": refused and expected == "refused",
+                    "why": f"{type(exc).__name__}: {exc}"[:1200],
+                }
+            )
             continue
-        row = {"edit": label, "s": round(time.perf_counter() - t, 2)}
+        row = {
+            "edit": label,
+            "outcome": "kept",
+            "as_expected": expected == "kept",
+            "s": round(time.perf_counter() - t, 2),
+        }
         row["survival"] = [d.message for d in ref.report.diagnostics if d.code in ("W205", "E110")]
         exact = []
         for name in sorted(set(ref.record.tensors)):
@@ -149,13 +174,6 @@ def _lab_phase(report: dict) -> None:  # type: ignore[type-arg]
             )
         row["live_equals_stored"] = all(exact) if exact else None
         rows.append(row)
-    try:
-        lab.edit("scale", targets="L3.mlp.experts.gate_up_proj[2, :, 1:5]", factor=1.03)
-        rows.append({"edit": "tiny nvfp4 nudge", "refused": False})
-    except Exception as exc:
-        rows.append(
-            {"edit": "tiny nvfp4 nudge", "refused": "E110" in str(exc), "why": str(exc)[:300]}
-        )
     report["edits"] = rows
     measure("hf_edited")
 
@@ -181,10 +199,15 @@ def _lab_phase(report: dict) -> None:  # type: ignore[type-arg]
     report["export"]["unedited_layer_bytes_identical"] = bool(
         torch.equal(read(out_files, key), read(src_files, key))
     )
-    edited = "model.llm.layers.10.mlp.experts.w2_weight"
-    report["export"]["edited_layer_bytes_changed"] = not bool(
-        torch.equal(read(out_files, edited), read(src_files, edited))
-    )
+    report["export"]["edited_layers_bytes_changed"] = {
+        name: not bool(torch.equal(read(out_files, name), read(src_files, name)))
+        for name in (
+            "model.llm.layers.5.mlp.experts.w13_weight",  # nvfp4 scale
+            "model.llm.layers.21.mlp.experts.w2_weight",  # mxfp8 project_out
+            "model.llm.layers.22.mlp.experts.w13_weight",  # mxfp8 partial scale
+            "model.llm.layers.10.mlp.experts.w2_weight",  # refused: must be unchanged
+        )
+    }
     lab.__dict__.clear()
     gc.collect()
 
@@ -204,21 +227,27 @@ def run(messages):
     s = time.perf_counter() - t
     n = sum(len(o.outputs[0].token_ids) for o in outs)
     return outs, s, n
-llm.chat([{"role": "user", "content": texts[0]}], SamplingParams(max_tokens=4), use_tqdm=False)  # warm up
-res = {"load_s": round(load, 1)}
-outs, s, n = run([[{"role": "user", "content": texts[0]}]])
-res["text_single"] = {
-    "text": outs[0].outputs[0].text, "tokens": n, "s": round(s, 2), "tok_s": round(n / s, 1)
-}
+single = [[{"role": "user", "content": texts[0]}]]
 img = [[{"role": "user", "content": [
     {"type": "image_url", "image_url": {"url": data}}, {"type": "text", "text": question}
 ]}]]
+batch = [[{"role": "user", "content": t}] for t in texts] * 16
+# the first pass of each shape compiles kernels (seen: a 64-wide batch ran at 1.6k tok/s cold
+# and 4.2k warm); time it, then time a second, warm pass
+res = {"load_s": round(load, 1), "cold_s": {}}
+for key, messages in (("text_single", single), ("image_single", img), ("batch_64", batch)):
+    _, s, _ = run(messages)
+    res["cold_s"][key] = round(s, 2)
+outs, s, n = run(single)
+res["text_single"] = {
+    "text": outs[0].outputs[0].text, "tokens": n, "s": round(s, 2), "tok_s": round(n / s, 1)
+}
 outs, s, n = run(img)
 res["image_single"] = {
     "text": outs[0].outputs[0].text, "tokens": n, "s": round(s, 2), "tok_s": round(n / s, 1),
     "prompt_tokens": len(outs[0].prompt_token_ids),
 }
-outs, s, n = run([[{"role": "user", "content": t}] for t in texts] * 16)
+outs, s, n = run(batch)
 res["batch_64"] = {"tokens": n, "s": round(s, 2), "tok_s": round(n / s, 1)}
 res["answers"] = [o.outputs[0].text for o in outs[: len(texts)]]
 print("WSPX" + json.dumps(res))
