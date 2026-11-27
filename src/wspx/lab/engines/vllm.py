@@ -19,9 +19,12 @@ import json
 import math
 import os
 import pickle
+import re
 import secrets
+import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -37,7 +40,7 @@ from wspx.errors import WspxError
 from wspx.lab import analysis, checkpoint
 from wspx.lab.engines import Engine, Rows, agreement_prompts
 from wspx.lab.media import is_media
-from wspx.lab.offload import device_of
+from wspx.lab.offload import device_of, release_gpu
 from wspx.lab.text import Prompt, Text
 from wspx.lab.tree import TreeState, WorkingTree
 
@@ -168,6 +171,9 @@ class IPCTransport(Transport):
             }
             _post(http, "/weights/update", {"update_info": info})
             del keep, handles
+            # vLLM has copied this layer in: free what was exported for it now, not when the
+            # whole push ends (twelve layers of Inkling held at once ran vLLM out of memory)
+            torch.cuda.ipc_collect()  # type: ignore[no-untyped-call]
         return sent
 
 
@@ -184,8 +190,19 @@ def _incomplete(http: httpx.Client) -> tuple[list[str], list[str]]:
 def _post(http: httpx.Client, path: str, body: dict[str, Any]) -> Any:
     r = http.post(path, json=body)
     if r.status_code != 200:
-        raise WspxError(f"vLLM worker {path}: {r.status_code} {r.text[:400]}")
+        raise WspxError(f"vLLM worker {path}: {r.status_code} {_detail(r)}")
     return r.json()
+
+
+def _detail(r: httpx.Response) -> str:
+    """What went wrong in the worker, as it said it (seen live: a bare "Internal Server
+    Error" hid a CUDA out-of-memory error inside vLLM)."""
+    try:
+        body = r.json()
+    except ValueError:
+        return r.text[:1500]
+    detail = body.get("detail") if isinstance(body, dict) else None
+    return str(detail if detail is not None else body)[:1500]
 
 
 @dataclass
@@ -213,6 +230,7 @@ def plan(
     hf_bytes: int | None = None,
     resident_bytes: int | None = None,
     weightless: bool = False,
+    layer_bytes: int = 0,
 ) -> Plan:
     """Decide where vLLM runs before transformers loads (``gpus``: name and memory per GPU).
 
@@ -220,7 +238,9 @@ def plan(
     share it when transformers' copy (``hf_bytes``) leaves vLLM room for a useful KV cache;
     otherwise transformers' copy stays in host memory and only ``resident_bytes`` (what lies
     outside its layer stacks, and a layer in flight) sit on the GPU. ``weightless``: the lab
-    holds no copy at all (it reads the checkpoint), so vLLM gets all but ``resident_bytes``."""
+    holds no copy at all (it reads the checkpoint), so vLLM gets all but ``resident_bytes``.
+    ``layer_bytes`` (the checkpoint's largest layer) is kept free for pushes on a shared GPU:
+    the lab's copy of the layer in flight, and vLLM's own while it reloads it."""
     if gpus is None:
         if not torch.cuda.is_available():
             raise WspxError("the vLLM engine needs a GPU; set [lab] gpu, or use engine = 'hf'")
@@ -246,7 +266,9 @@ def plan(
             )
         return p
     name, total = gpus[0]
-    headroom = 0.08 * total + 3 * gb  # activations for probes, allocator slack
+    # activations for probes, allocator slack, and a layer being pushed: the lab's copy and
+    # vLLM's while it reloads it (vLLM's share does not cover what a reload allocates)
+    headroom = 0.08 * total + 3 * gb + 3 * layer_bytes
     if weightless:
         lab = resident_bytes or 0
         room = (total - lab - headroom) / total
@@ -415,6 +437,9 @@ class VLLMEngine(Engine):
         self.proc: subprocess.Popen[bytes] | None = None
         self.log = log
         self.plan = plan
+        self.restarts = 0
+        self._launch_args = (python, dtype, trust_remote_code)
+        self._closing = False
         if http is None:
             if plan is None:
                 raise WspxError("the vLLM engine needs a plan or a worker connection")
@@ -497,10 +522,15 @@ class VLLMEngine(Engine):
             "--",
             *argv,
         ]
-        self.proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, env=env)
-        import atexit
+        # a session of its own: closing it ends vLLM's engine process too, not only the worker
+        self.proc = subprocess.Popen(
+            cmd, stdout=out, stderr=subprocess.STDOUT, env=env, start_new_session=True
+        )
+        if not self._closing:
+            import atexit
 
-        atexit.register(self.close)  # a lab that ends any way frees vLLM's GPU memory
+            atexit.register(self.close)  # a lab that ends any way frees vLLM's GPU memory
+            self._closing = True
         return httpx.Client(
             base_url=f"http://127.0.0.1:{port}",
             headers={"authorization": f"Bearer {token}"},
@@ -543,13 +573,53 @@ class VLLMEngine(Engine):
         return "\n".join(self.log.read_text(errors="replace").splitlines()[-n:])
 
     def close(self) -> None:
-        if self.proc is not None and self.proc.poll() is None:
-            self.proc.terminate()
+        proc = self.proc
+        if proc is not None and proc.poll() is None:
+            _signal_group(proc, signal.SIGTERM)
             try:
-                self.proc.wait(timeout=30)
+                proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
-                self.proc.kill()
+                _signal_group(proc, signal.SIGKILL)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=30)
+        if proc is not None:
+            _signal_group(proc, signal.SIGKILL)  # its engine process, if it outlived it
         self.http.close()
+
+    def _failed(self, exc: BaseException) -> str:
+        """Why a push failed: the worker's own error, and what vLLM logged about it."""
+        lines = [
+            line.strip()
+            for line in self._tail(400).splitlines()
+            if re.search(r"Error|error|out of memory|Traceback", line)
+        ][-6:]
+        text = f"the push into vLLM failed: {exc}"
+        if lines:
+            text += "\nvLLM's log:\n  " + "\n  ".join(line[:300] for line in lines)
+        if "out of memory" in (text.lower()):
+            text += (
+                "\n(vLLM ran out of GPU memory reloading the layers: lower [lab.vllm] memory "
+                "to leave the lab more room)"
+            )
+        return text
+
+    def restart(self, why: str) -> None:
+        """Start vLLM again from the checkpoint: after a push failed partway, what it holds
+        is unknown (and a failed reload can leave its memory taken). It then holds the base,
+        so the next push sends only what the session has edited."""
+        if self.proc is None:
+            raise WspxError(f"vLLM needs a restart ({why}), and this lab did not start it")
+        self.close()
+        _wait_for_gpu_memory(self.plan)
+        self.http = self._launch(*self._launch_args)
+        if isinstance(self.transport, IPCTransport):
+            self.transport._inited = False
+        self.info = self._ready()
+        self.held = TreeState()
+        self.stale = False
+        self.agreement = None
+        self.restarts += 1
+        self.notes.append(f"vLLM was restarted ({why}); it holds the base checkpoint again")
 
     # ------------------------------------------------------------------ weights
 
@@ -680,8 +750,11 @@ class VLLMEngine(Engine):
         out: dict[str, torch.Tensor] = parts
         return out
 
-    def sync(self) -> dict[str, Any] | None:
-        """Push every layer whose tensors changed since the last push, then check agreement."""
+    def sync(self, *, retry: bool = False) -> dict[str, Any] | None:
+        """Push every layer whose tensors changed since the last push. A push that fails
+        restarts vLLM (it then holds the base) and is tried once more from there."""
+        if self.stale and self.proc is not None and not retry:
+            self.restart("an earlier push failed partway")
         state = self.tree.state
         changed = self.dirty(state)
         if not changed and not self.stale:
@@ -720,6 +793,7 @@ class VLLMEngine(Engine):
             )
         touched = set(changed)
         groups = list(self._groups) if self.stale else [g for g in self._groups if touched & set(g)]
+        release_gpu()  # what probes left cached: a push needs it
         outside = [g for g in self._groups if not checkpoint._LAYER.match(g[0])]
         if self.with_outside:  # this model maps tensors kept outside its layers into them
             groups += [g for g in outside if g not in groups]
@@ -765,9 +839,19 @@ class VLLMEngine(Engine):
             sent, used = self.transport.send(
                 self.http, chunks(groups), version, more, lambda need: self._supply(need, state)
             )
-        except Exception:
+        except Exception as exc:
             self.stale = True
-            raise
+            if self.proc is None or retry:  # not ours to restart, or it failed again
+                raise WspxError(self._failed(exc)) from exc
+            first = self._failed(exc)
+            print(f"wspx lab: {first}; restarting vLLM", file=sys.stderr, flush=True)
+            self.restart(f"a push failed: {str(exc)[:200]}")
+            try:
+                return self.sync(retry=True)
+            except WspxError as again:
+                raise WspxError(f"{first}\nafter restarting vLLM, again: {again}") from exc
+        finally:
+            release_gpu()
         if used:
             self.with_outside = True
             seen = ", ".join(getattr(self.transport, "reported", [])[:3])
@@ -1043,6 +1127,29 @@ class VLLMEngine(Engine):
         if self.plan is not None:
             line += "\n  " + self.plan.describe().replace("\n", "\n  ")
         return line
+
+
+def _signal_group(proc: subprocess.Popen[bytes], sig: int) -> None:
+    """Signal the worker's process group: vLLM's engine process is a child of the worker."""
+    if proc.pid <= 0:
+        return
+    with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+        os.killpg(proc.pid, sig)
+
+
+def _wait_for_gpu_memory(plan: Plan | None, timeout: float = 120.0) -> None:
+    """After vLLM stops, until its share of the GPU is free again (the driver releases a
+    process's memory a moment after it exits)."""
+    if plan is None or not torch.cuda.is_available():
+        return
+    device = torch.device("cuda", plan.vllm_gpu)
+    want = plan.memory * torch.cuda.get_device_properties(device).total_memory * 0.95
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        free, _ = torch.cuda.mem_get_info(device)
+        if free >= want:
+            return
+        time.sleep(1.0)
 
 
 def _kl(p_log: Sequence[float], q_log: Sequence[float]) -> float:

@@ -171,6 +171,12 @@ def build_app(engine_argv: list[str], token: str) -> Any:
 
     app = FastAPI(lifespan=lifespan)
 
+    @app.exception_handler(Exception)
+    async def failed(_: Request, exc: Exception) -> JSONResponse:
+        # the error itself, not a bare "Internal Server Error" (seen live: a CUDA
+        # out-of-memory error inside vLLM's reload reached the lab as that)
+        return JSONResponse({"detail": f"{type(exc).__name__}: {exc}"[:4000]}, status_code=500)
+
     @app.middleware("http")
     async def auth(request: Request, call_next: Any) -> Any:
         if request.headers.get("authorization") != f"Bearer {token}":

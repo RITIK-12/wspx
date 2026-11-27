@@ -265,6 +265,81 @@ def test_a_push_sends_only_changed_layers_and_a_failed_one_is_mended(tmp_path: P
     assert same_weights(lab.model, worker.model)
 
 
+def test_a_failed_push_restarts_vllm_and_sends_only_the_edits_from_the_base(
+    tmp_path: Path,
+) -> None:
+    """Seen live on Inkling: a push ran vLLM out of memory, each failed one left about 4 GB
+    taken, and every eval after it failed on the stale engine. A failed push now restarts
+    vLLM (it holds the base again) and is tried once more: only what is edited is sent."""
+    lab, worker, _ = vllm_lab(tmp_path, agreement_prompts=0)
+    engine: Any = lab.engine
+    base = copy.deepcopy(worker.model.state_dict())
+    lab.edit.scale("L1.mlp.down", factor=1.5)
+    lab.generate(PROMPTS, max_tokens=2)
+    lab.edit.scale("L0.mlp.down", factor=0.5)
+    failures = [1]
+
+    class Flaky(FakeTransport):
+        def send(
+            self, http: Any, chunks: Any, version: str, more: Any = (), supply: Any = None
+        ) -> tuple[int, int]:
+            if failures:
+                failures.pop()
+                next(iter(chunks))
+                raise WspxError(
+                    "vLLM worker /weights/update: 500 OutOfMemoryError: CUDA out of memory"
+                )
+            return super().send(http, chunks, version, more, supply)
+
+    restarted: list[str] = []
+
+    def restart(why: str) -> None:  # what a restart leaves: vLLM at the checkpoint
+        restarted.append(why)
+        worker.model.load_state_dict(base)
+        engine.held = type(engine.held)()
+        engine.stale = False
+
+    engine.transport = Flaky(worker)
+    engine.restart = restart
+    engine.proc = object()  # a worker this lab started
+    try:
+        lab.generate(PROMPTS, max_tokens=2)
+    finally:
+        engine.proc = None
+    assert len(restarted) == 1
+    assert "out of memory" in restarted[0]
+    pushed = engine.transport.pushes[-1]
+    assert {n.split(".layers.")[1].split(".")[0] for n in pushed} == {"0", "1"}  # the edits
+    assert same_weights(lab.model, worker.model)
+    assert not engine.stale
+
+
+def test_a_push_says_what_went_wrong_in_vllm() -> None:
+    from wspx.lab.engines.vllm import _detail
+
+    r = httpx.Response(500, json={"detail": "OutOfMemoryError: CUDA out of memory. Tried 2 GiB"})
+    assert _detail(r) == "OutOfMemoryError: CUDA out of memory. Tried 2 GiB"
+    assert _detail(httpx.Response(500, text="Internal Server Error")) == "Internal Server Error"
+
+
+def test_a_shared_gpu_keeps_room_for_a_push() -> None:
+    """vLLM's share does not cover what a reload allocates: the plan leaves room for the
+    largest layer three times over (the lab's copy, vLLM's, its repacking)."""
+    gpus = [("H100", 80 * GB)]
+    without = plan(
+        VllmSection(), checkpoint_bytes=19 * GB, gpus=gpus, resident_bytes=6 * GB, weightless=True
+    )
+    with_room = plan(
+        VllmSection(),
+        checkpoint_bytes=19 * GB,
+        gpus=gpus,
+        resident_bytes=6 * GB,
+        weightless=True,
+        layer_bytes=2 * GB,
+    )
+    assert without.memory - with_room.memory == pytest.approx(6 / 80, abs=0.011)
+
+
 def test_a_model_that_maps_outside_tensors_into_its_layers_gets_them_each_push(
     tmp_path: Path,
 ) -> None:

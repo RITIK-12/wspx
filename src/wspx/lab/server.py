@@ -28,7 +28,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
-from wspx.lab.offload import device_of
+from wspx.lab.offload import device_of, release_gpu
 from wspx.lab.session import Lab
 from wspx.store import Store
 from wspx.store.overlay import OverlayStore
@@ -142,6 +142,7 @@ class LabServer:
         finally:
             model_io = self.lab.io.drain()
             attachments = self.lab.take_attachments()
+            release_gpu()  # what the call left cached is vLLM's room for its next push
         self.calls += 1
         return {
             "summary": result.budgeted(),
@@ -529,12 +530,20 @@ def _plan_engines(config: Any, args: Any) -> tuple[Any, str, tuple[int, int, int
             hf_bytes=None,
             resident_bytes=outside + 2 * largest,
             weightless=True,
+            layer_bytes=_layer_bytes(path),
         )
     except WspxError as exc:
         if config.lab.engine == "vllm":
             raise
         return None, str(exc), sizes, on_disk
     return engine_plan, "", sizes, on_disk
+
+
+def _layer_bytes(path: Any) -> int:
+    """The checkpoint's largest layer as stored: the plan keeps room for pushing it."""
+    from wspx.lab import checkpoint
+
+    return checkpoint.largest_layer_bytes(checkpoint.read_source(path))
 
 
 def _start_vllm(
@@ -560,6 +569,7 @@ def _start_vllm(
             hf_bytes=None,
             resident_bytes=torch.cuda.memory_allocated(0) + 2 * sizes[2],
             weightless=True,
+            layer_bytes=_layer_bytes(loaded.path),
         )
     print(engine_plan.describe(), file=sys.stderr, flush=True)
     engine = VLLMEngine(

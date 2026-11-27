@@ -98,6 +98,27 @@ def names_in_checkpoint(model: torch.nn.Module, name: str, shape: tuple[int, ...
     return sorted(to_checkpoint(model, {name: meta}))
 
 
+_DTYPE_BYTES = {"F64": 8, "I64": 8, "U64": 8, "F32": 4, "I32": 4, "U32": 4, "F16": 2, "BF16": 2}
+_DTYPE_BYTES.update({"I16": 2, "U16": 2, "F8_E4M3": 1, "F8_E5M2": 1, "F8_E8M0": 1, "I8": 1})
+_DTYPE_BYTES.update({"U8": 1, "BOOL": 1})
+
+
+def largest_layer_bytes(src: Source | None) -> int:
+    """Bytes of the checkpoint's largest layer, as stored (what one layer's push carries)."""
+    if src is None:
+        return 0
+    by: dict[str, int] = {}
+    for name, (dtype, shape) in src.tensors.items():
+        m = _LAYER.match(name)
+        if m is None:
+            continue
+        n = 1
+        for d in shape:
+            n *= d
+        by[m.group(1)] = by.get(m.group(1), 0) + n * _DTYPE_BYTES.get(dtype, 2)
+    return max(by.values(), default=0)
+
+
 def groups(names: list[str]) -> list[list[str]]:
     """Names grouped by layer (everything outside a layer stack is one group), so a
     conversion that combines tensors sees all of them, one layer's worth at a time."""
