@@ -7,6 +7,7 @@ of a truncated SVD otherwise.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -20,23 +21,12 @@ import torch
 from safetensors.torch import save_file
 
 from wspx.errors import WspxError
+from wspx.lab import checkpoint
 from wspx.lab.ir.model_ir import ModelIR
 from wspx.lab.patch import TensorDelta
-from wspx.lab.tensors import tensor_hash
 from wspx.lab.tree import WorkingTree
 
 SHARD_BYTES = 5 * 1024**3
-CONFIG_FILES = (
-    "config.json",
-    "generation_config.json",
-    "tokenizer.json",
-    "tokenizer_config.json",
-    "special_tokens_map.json",
-    "tokenizer.model",
-    "vocab.json",
-    "merges.txt",
-    "chat_template.jinja",
-)
 
 
 def export_merged(
@@ -45,63 +35,99 @@ def export_merged(
     out: Path,
     *,
     source: Path | None = None,
+    tokenizer: Any = None,
+    processor: Any = None,
     shard_bytes: int = SHARD_BYTES,
 ) -> dict[str, Any]:
-    """Sharded safetensors of the live weights, plus config and tokenizer files."""
+    """Sharded safetensors of the live weights under the checkpoint's own names and layouts
+    (what transformers renamed or fused on load is turned back), plus every non-weight file
+    of the source checkpoint: config, tokenizer, chat template, processor."""
     out.mkdir(parents=True, exist_ok=True)
-    tensors = {name: p.detach().contiguous().cpu() for name, p in model.named_parameters()}
-    tensors.update(
-        {
-            name: b.detach().contiguous().cpu()
-            for name, b in model.named_buffers()
-            if name in _persistent_buffers(model)
-        }
-    )
-    shards: list[dict[str, torch.Tensor]] = [{}]
-    size = 0
-    for name in sorted(tensors):
-        t = tensors[name]
-        nbytes = t.numel() * t.element_size()
-        if shards[-1] and size + nbytes > shard_bytes:
-            shards.append({})
-            size = 0
-        shards[-1][name] = t
-        size += nbytes
+    for stale in out.glob("*.safetensors"):
+        stale.unlink()
+    persistent = _persistent_buffers(model)
+    live: dict[str, torch.Tensor] = dict(model.named_parameters())
+    live.update({n: b for n, b in model.named_buffers() if n in persistent})
+    promoted = [
+        n
+        for n, t in live.items()
+        if t.dtype == torch.float32 and ir.params.get(n) and ir.params[n].dtype != "float32"
+    ]
+    src = checkpoint.read_source(source)
+    dequantized = bool(src and src.quantized and getattr(model, "hf_quantizer", None) is None)
+    written: dict[str, tuple[str, tuple[int, ...]]] = {}
+    shards: list[list[str]] = []
     weight_map: dict[str, str] = {}
+    pending: dict[str, torch.Tensor] = {}
+    size = total = 0
+
+    def flush() -> None:
+        nonlocal pending, size
+        if pending:
+            tmp = f"part-{len(shards):05d}.safetensors"
+            save_file(pending, str(out / tmp), metadata={"format": "pt", "wspx": ir.fingerprint})
+            shards.append(sorted(pending))
+            pending, size = {}, 0
+
+    for batch in checkpoint.stream(model, live):
+        for name, t in batch.items():
+            nbytes = t.numel() * t.element_size()
+            if pending and size + nbytes > shard_bytes:
+                flush()
+            pending[name] = t
+            size += nbytes
+            total += nbytes
+            written[name] = (checkpoint.st_dtype(t), tuple(t.shape))
+    flush()
     files = []
-    for i, shard in enumerate(shards):
+    for i, names in enumerate(shards):
         fname = (
             "model.safetensors"
             if len(shards) == 1
             else f"model-{i + 1:05d}-of-{len(shards):05d}.safetensors"
         )
-        save_file(shard, str(out / fname), metadata={"format": "pt", "wspx": ir.fingerprint})
+        (out / f"part-{i:05d}.safetensors").rename(out / fname)
         files.append(fname)
-        weight_map.update(dict.fromkeys(shard, fname))
-    if len(shards) > 1:
-        total = sum(t.numel() * t.element_size() for t in tensors.values())
+        weight_map.update(dict.fromkeys(names, fname))
+    warnings = []
+    extras = sorted(src.extra_files) if src else []
+    for name in extras:  # draft heads and the like: not loaded, so never edited
+        shutil.copy2(src.path / name, out / name)  # type: ignore[union-attr]
+    if len(shards) > 1 or extras:
         (out / "model.safetensors.index.json").write_text(
             json.dumps({"metadata": {"total_size": total}, "weight_map": weight_map}, indent=2)
         )
-    _copy_configs(model, out, source)
-    promoted = [
-        n
-        for n, t in tensors.items()
-        if t.dtype == torch.float32 and ir.params.get(n) and ir.params[n].dtype != "float32"
-    ]
-    warnings = []
+    _copy_configs(
+        model, out, src, dequantized=dequantized, tokenizer=tokenizer, processor=processor
+    )
+    if extras:
+        warnings.append(f"copied unedited (not part of the loaded model): {', '.join(extras)}")
     if promoted:
         warnings.append(
             f"{len(promoted)} tensor(s) stored in fp32 (promote mode); runtimes that cast the "
             f"whole model to one dtype will round them: {', '.join(promoted[:4])}"
         )
-    hashes = {name: tensor_hash(t) for name, t in tensors.items() if name in ir.params}
+    if src and dequantized:
+        lowered = sorted(
+            k
+            for k, (dtype, _) in written.items()
+            if k in src.tensors and src.tensors[k][0] != dtype
+        )
+        method = (src.quantization or {}).get("quant_method", "hf_quant_config.json")
+        warnings.append(
+            f"the source checkpoint is quantized ({method}) and was dequantized on load: "
+            f"{len(lowered)} tensor(s) are written in their loaded dtype instead "
+            f"({', '.join(lowered[:2])}{', …' if len(lowered) > 2 else ''}) and the "
+            "quantization config is left out, so loaders read the export unquantized"
+        )
+    if src:
+        warnings += checkpoint.compare(written, src, dequantized=dequantized)
     return {
         "path": str(out),
         "files": files,
-        "tensors": len(tensors),
+        "tensors": len(written),
         "warnings": warnings,
-        "hashes": hashes,
+        "names": "checkpoint" if src and src.tensors else "loaded",
     }
 
 
@@ -114,18 +140,63 @@ def _persistent_buffers(model: torch.nn.Module) -> set[str]:
     return out
 
 
-def _copy_configs(model: torch.nn.Module, out: Path, source: Path | None) -> None:
-    copied = False
-    if source is not None:
-        for name in CONFIG_FILES:
-            if (source / name).is_file():
-                shutil.copy2(source / name, out / name)
-                copied = True
+WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth", ".gguf", ".ckpt", ".h5", ".msgpack")
+
+
+def _copy_configs(
+    model: torch.nn.Module,
+    out: Path,
+    src: checkpoint.Source | None,
+    *,
+    dequantized: bool = False,
+    tokenizer: Any = None,
+    processor: Any = None,
+) -> None:
+    """Every non-weight file of the source (config, tokenizer, templates, processor), or,
+    without one, what the loaded objects can save."""
+    if src is not None:
+        for path in sorted(src.path.rglob("*")):
+            rel = path.relative_to(src.path)
+            if (
+                not path.is_file()
+                or rel.parts[0].startswith(".")
+                or path.name.endswith(WEIGHT_SUFFIXES)
+                or path.name in ("model.safetensors.index.json", "pytorch_model.bin.index.json")
+                or (dequantized and path.name == "hf_quant_config.json")
+            ):
+                continue
+            (out / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, out / rel)
+        if dequantized and (out / "config.json").is_file():
+            config = json.loads((out / "config.json").read_text())
+            config.pop("quantization_config", None)
+            for sub in config.values():  # a VLM's text config can carry its own
+                if isinstance(sub, dict):
+                    sub.pop("quantization_config", None)
+            (out / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     config = getattr(model, "config", None)
     if config is not None and not (out / "config.json").exists():
         config.save_pretrained(str(out))
-        copied = True
-    del copied
+        if getattr(model, "hf_quantizer", None) is None:  # the weights are not quantized
+            saved = json.loads((out / "config.json").read_text())
+            if saved.pop("quantization_config", None) is not None:
+                (out / "config.json").write_text(json.dumps(saved, indent=2) + "\n")
+    generation = getattr(model, "generation_config", None)
+    if generation is not None and not (out / "generation_config.json").exists():
+        # a generation config that does not validate is not worth failing the export over
+        with contextlib.suppress(Exception):
+            generation.save_pretrained(str(out))
+    saved_by = (
+        (tokenizer, ("tokenizer.json", "tokenizer_config.json", "tokenizer.model")),
+        (processor, ("preprocessor_config.json", "processor_config.json")),
+    )
+    for obj, files in saved_by:
+        if obj is None or not hasattr(obj, "save_pretrained"):
+            continue
+        if not any((out / f).exists() for f in files):
+            # one that cannot save leaves the rest of the export usable
+            with contextlib.suppress(Exception):
+                obj.save_pretrained(str(out))
 
 
 def export_peft(

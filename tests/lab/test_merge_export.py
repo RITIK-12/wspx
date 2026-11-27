@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
+from safetensors.torch import save_file
 
 from tests.lab.test_edit import make
-from wspx.lab import merge, patch
+from wspx.lab import checkpoint, merge, patch
 from wspx.lab.export import export_bundle, export_merged, export_peft
 from wspx.lab.ops import get
 from wspx.lab.tensors import tensor_hash
@@ -132,3 +135,86 @@ class TestExport:
         tree.stage(get("ablate")(ctx, "L0.mlp.down[:, 0]"))
         tree.checkout(TreeState())
         assert tensor_hash(model.blocks[0].w_out.weight) == before
+
+
+def _collapse(name: str) -> str:
+    return re.sub(r"\.\d+$", ".N", re.sub(r"\.\d+\.", ".N.", name))
+
+
+def _written(out: Path) -> dict[str, torch.Tensor]:
+    from safetensors.torch import load_file
+
+    tensors: dict[str, torch.Tensor] = {}
+    for f in sorted(out.glob("model*.safetensors")):
+        tensors.update(load_file(str(f)))
+    return tensors
+
+
+class TestCheckpointNames:
+    """Seen in a review: merged exports kept transformers' in-memory names, so a model it
+    renames or fuses on load (Inkling loads its interleaved ``w13_weight`` as ``gate_up_proj``)
+    exported files that nothing else could load."""
+
+    IR = SimpleNamespace(params={}, fingerprint="test")
+
+    @staticmethod
+    def _hub_like(model: torch.nn.Module, path: Path) -> None:
+        """A source checkpoint shaped like Inkling's on the Hub: an index, a quantization
+        config, draft heads outside the index, a tokenizer folder and a chat template."""
+        model.save_pretrained(str(path), max_shard_size="100KB")  # the checkpoint's own names
+        config = json.loads((path / "config.json").read_text())
+        config["quantization_config"] = {"quant_method": "modelopt", "quant_algo": "NVFP4"}
+        (path / "config.json").write_text(json.dumps(config))
+        (path / "hf_quant_config.json").write_text("{}")
+        save_file({"fuse_weight": torch.ones(2)}, str(path / "mtp.safetensors"))
+        (path / "tiktoken").mkdir()
+        (path / "tiktoken" / "tokenizer.model").write_text("tokens")
+        (path / "chat_template.jinja").write_text("{{ messages }}")
+
+    def test_inkling_round_trips_under_its_checkpoint_names(self, tmp_path: Path) -> None:
+        from tests.lab.test_conformance import _tiny_inkling
+
+        model = _tiny_inkling()
+        self._hub_like(model, tmp_path / "src")
+        with torch.no_grad():  # edits to a fused tensor and to a merged one
+            model.model.language_model.layers[7].mlp.experts.gate_up_proj[3, :5] += 1.0
+            model.model.language_model.message_input.query[2, 1] -= 0.5
+        info = export_merged(model, self.IR, tmp_path / "out", source=tmp_path / "src")  # type: ignore[arg-type]
+        out = tmp_path / "out"
+        index = tmp_path / "src" / "model.safetensors.index.json"
+        source = set(json.loads(index.read_text())["weight_map"])
+        assert set(_written(out)) == source
+        assert info["names"] == "checkpoint"
+        config = json.loads((out / "config.json").read_text())
+        assert "quantization_config" not in config
+        assert not (out / "hf_quant_config.json").exists()
+        assert any("dequantized on load" in w for w in info["warnings"])
+        assert (out / "mtp.safetensors").is_file()
+        index = json.loads((out / "model.safetensors.index.json").read_text())
+        assert "fuse_weight" not in index["weight_map"]
+        assert (out / "tiktoken" / "tokenizer.model").read_text() == "tokens"
+        assert (out / "chat_template.jinja").is_file()
+        assert not any("differs" in w or "not written" in w for w in info["warnings"])
+
+        again = transformers.AutoModelForImageTextToText.from_pretrained(
+            str(out), dtype=torch.float32
+        )
+        live = dict(model.named_parameters())
+        for name, param in again.named_parameters():
+            assert torch.equal(param, live[name]), name
+
+    def test_names_match_the_real_inkling_checkpoint(self, tmp_path: Path) -> None:
+        """The real checkpoint's names (from its safetensors header) minus the NVFP4/MXFP8
+        scales, which a dequantized export has no use for."""
+        from tests.lab.test_conformance import _tiny_inkling
+
+        export_merged(_tiny_inkling(), self.IR, tmp_path / "out")  # type: ignore[arg-type]
+        real = {
+            line
+            for line in (Path(__file__).parent / "data" / "inkling2_mini_names.txt")
+            .read_text()
+            .splitlines()
+            if line and not line.startswith("#")
+        }
+        real = {n for n in real if not checkpoint.QUANT_AUX.search(n)}
+        assert {_collapse(n) for n in _written(tmp_path / "out")} == real

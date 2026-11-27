@@ -1,0 +1,178 @@
+"""The checkpoint's own tensor names and layouts, which transformers changes on load.
+
+transformers renames, splits and fuses tensors when it loads many models: Inkling's
+checkpoint stores ``model.llm.layers.N.mlp.experts.w13_weight`` (gate and up rows
+interleaved), which it loads as ``model.language_model.layers.N.mlp.experts.gate_up_proj``.
+Anything another runtime reads (a merged export, weights pushed to vLLM) has to be in the
+checkpoint's form, so this module turns live tensors back into it with transformers' own
+reverse conversion, the one ``save_pretrained`` uses.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Iterator
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import torch
+
+_LAYER = re.compile(r"^(.*?\.(?:layers|h|blocks|block)\.\d+)\.")
+QUANT_AUX = re.compile(
+    r"(_scale|_scale_inv|_scale_2|_amax|_outer_scale_denominator|\.scales|\.qzeros|\.g_idx"
+    r"|_zero_point|\.absmax|\.quant_map|\.quant_state\..*|\.SCB)$"
+)
+"""Checkpoint tensors that only carry a quantized tensor's scales or packing metadata."""
+
+
+def _converts(model: torch.nn.Module) -> bool:
+    try:
+        from transformers import PreTrainedModel
+    except ImportError:  # pragma: no cover - lab dependency
+        return False
+    return isinstance(model, PreTrainedModel)
+
+
+def to_checkpoint(
+    model: torch.nn.Module, tensors: dict[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
+    """In-memory names and layouts → the checkpoint's (identity for plain ``nn.Module`` s)."""
+    if not tensors or not _converts(model):
+        return dict(tensors)
+    from transformers.core_model_loading import revert_weight_conversion
+
+    out: dict[str, torch.Tensor] = revert_weight_conversion(model, dict(tensors))  # type: ignore[arg-type]
+    return out
+
+
+def groups(names: list[str]) -> list[list[str]]:
+    """Names grouped by layer (everything outside a layer stack is one group), so a
+    conversion that combines tensors sees all of them, one layer's worth at a time."""
+    by: dict[str, list[str]] = {}
+    for name in names:
+        m = _LAYER.match(name)
+        by.setdefault(m.group(1) if m else "", []).append(name)
+    return [by[k] for k in sorted(by, key=lambda k: (k != "", _natural(k)))]
+
+
+def _natural(s: str) -> list[Any]:
+    return [int(p) if p.isdigit() else p for p in re.split(r"(\d+)", s)]
+
+
+def stream(
+    model: torch.nn.Module, live: dict[str, torch.Tensor]
+) -> Iterator[dict[str, torch.Tensor]]:
+    """``to_checkpoint`` one layer at a time, on the CPU, so a large model is never held twice
+    (on the GPU or off it). A layer whose conversion needs tensors from elsewhere is kept
+    back and converted with the others like it at the end."""
+    deferred: list[str] = []
+    for group in groups(sorted(live, key=_natural)):
+        try:
+            batch = to_checkpoint(model, {n: live[n].detach().cpu() for n in group})
+        except Exception:
+            deferred += group
+            continue
+        yield {k: v.contiguous() for k, v in batch.items()}
+    if deferred:
+        batch = to_checkpoint(model, {n: live[n].detach().cpu() for n in deferred})
+        yield {k: v.contiguous() for k, v in batch.items()}
+
+
+@dataclass
+class Source:
+    """What the original checkpoint folder holds, read from safetensors headers only."""
+
+    path: Path
+    tensors: dict[str, tuple[str, tuple[int, ...]]] = field(default_factory=dict)
+    """Model tensor name → (dtype, shape)."""
+    weight_files: set[str] = field(default_factory=set)
+    """Safetensors files holding the model's tensors (the index's, or every one)."""
+    extra_files: set[str] = field(default_factory=set)
+    """Safetensors files the index does not list, such as draft heads (``mtp.safetensors``)."""
+    quantization: dict[str, Any] | None = None
+    """``config.json``'s ``quantization_config``."""
+    quant_config_file: bool = False
+    """Whether ``hf_quant_config.json`` (ModelOpt-style) is present."""
+
+    @property
+    def quantized(self) -> bool:
+        return self.quantization is not None or self.quant_config_file
+
+
+def read_source(path: Path | None) -> Source | None:
+    if path is None or not Path(path).is_dir():
+        return None
+    path = Path(path)
+    src = Source(path)
+    every = {p.name for p in path.glob("*.safetensors")}
+    index = path / "model.safetensors.index.json"
+    if index.is_file():
+        listed = set(json.loads(index.read_text()).get("weight_map", {}).values())
+        src.weight_files = listed & every
+        src.extra_files = every - listed
+    else:
+        src.weight_files = every
+    try:
+        from safetensors import safe_open
+
+        for fname in sorted(src.weight_files):
+            with safe_open(str(path / fname), framework="pt") as fh:
+                for key in fh.keys():  # noqa: SIM118 - safe_open is not a mapping
+                    sl = fh.get_slice(key)
+                    src.tensors[key] = (str(sl.get_dtype()), tuple(sl.get_shape()))
+    except Exception:  # unreadable headers only cost the comparison
+        src.tensors = {}
+    config = path / "config.json"
+    if config.is_file():
+        src.quantization = json.loads(config.read_text()).get("quantization_config")
+    src.quant_config_file = (path / "hf_quant_config.json").is_file()
+    return src
+
+
+_DTYPES = {
+    torch.float32: "F32",
+    torch.float16: "F16",
+    torch.bfloat16: "BF16",
+    torch.float64: "F64",
+    torch.int8: "I8",
+    torch.uint8: "U8",
+    torch.int32: "I32",
+    torch.int64: "I64",
+    torch.bool: "BOOL",
+}
+for _name, _code in (("float8_e4m3fn", "F8_E4M3"), ("float8_e5m2", "F8_E5M2")):
+    if hasattr(torch, _name):
+        _DTYPES[getattr(torch, _name)] = _code
+
+
+def st_dtype(t: torch.Tensor) -> str:
+    return _DTYPES.get(t.dtype, str(t.dtype))
+
+
+def compare(
+    written: dict[str, tuple[str, tuple[int, ...]]], src: Source, *, dequantized: bool
+) -> list[str]:
+    """How the written tensors differ from the source checkpoint's, as warnings."""
+    if not src.tensors:
+        return []
+    out = []
+    missing = sorted(
+        k for k in set(src.tensors) - set(written) if not (dequantized and QUANT_AUX.search(k))
+    )
+    extra = sorted(set(written) - set(src.tensors))
+    changed = sorted(
+        k
+        for k in set(written) & set(src.tensors)
+        if written[k] != src.tensors[k] and not (dequantized and src.tensors[k][0] != written[k][0])
+    )
+    for label, names in (
+        ("not written (the source has them)", missing),
+        ("not in the source checkpoint", extra),
+        ("shape or dtype differs from the source", changed),
+    ):
+        if names:
+            shown = ", ".join(names[:4]) + (f", … {len(names) - 4} more" if len(names) > 4 else "")
+            out.append(f"{len(names)} tensor(s) {label}: {shown}")
+    return out

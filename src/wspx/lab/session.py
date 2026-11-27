@@ -113,8 +113,11 @@ class Lab:
         cache_bytes: int | None = None,
         processor: Any = None,
         scratch: bool = False,
+        source_dir: Path | None = None,
     ) -> None:
         self.model = model
+        self.source_dir = source_dir
+        """The checkpoint folder the model was loaded from (exports copy its non-weight files)."""
         self.ir = ir
         self.store = store
         self.session = session
@@ -123,6 +126,7 @@ class Lab:
         self.scratch = scratch
         """The working directory is an unpacked copy of the project, deleted with the lab."""
         self.repo = Repo(store, ir.fingerprint)
+        self.processor = processor
         media = None
         if processor is not None:
             media = Media(
@@ -1968,15 +1972,20 @@ class Lab:
         self, kind: str, path: str, *, base_model: str | None = None, max_rank: int = 64
     ) -> ToolResult:
         out = (self.workdir / path).resolve()
+        files = {
+            "source": self.source_dir,
+            "tokenizer": self.text.tokenizer,
+            "processor": self.processor,
+        }
         if kind == "merged":
-            info = export.export_merged(self.model, self.ir, out)
+            info = export.export_merged(self.model, self.ir, out, **files)
         elif kind == "peft":
             info = export.export_peft(
                 self.model, self.ir, self.tree, out, base_model=base_model, max_rank=max_rank
             )
         elif kind == "gguf":
             tmp = out.with_suffix(".merged")
-            export.export_merged(self.model, self.ir, tmp)
+            export.export_merged(self.model, self.ir, tmp, **files)
             info = export.export_gguf(tmp, out)
         elif kind == "bundle":
             info = self._bundle(out)

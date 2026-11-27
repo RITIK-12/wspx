@@ -71,6 +71,7 @@ def open_lab(
     base_reader = None
     hashes = None
     fingerprint = None
+    source_dir = None
     if isinstance(model, str):
         from wspx.lab.loader import load_hf
 
@@ -78,6 +79,7 @@ def open_lab(
         module, tokenizer = loaded.model, tokenizer or loaded.tokenizer
         processor = processor or loaded.processor
         fingerprint = loaded.fingerprint
+        source_dir = loaded.path
         readable = loaded.readable
         if readable:
             base_reader = loaded.base_reader
@@ -105,6 +107,7 @@ def open_lab(
         base_reader=base_reader,
         workdir=Path(workdir) if workdir else None,
         processor=processor,
+        source_dir=source_dir,
     )
 
 
