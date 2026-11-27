@@ -204,14 +204,15 @@ token = true                # `wspx keys set mcp:papers`; the control plane hold
 gpu = "L4"
 grace = "15m"               # keep the lab warm this long after the session goes idle
 max_gpu_time = "2h"         # then the session's agent and lab stop
-engine = "hf"               # or "vllm": generation (generate, tests, check, run batches) by vLLM
+engine = "auto"             # vLLM serves wherever it can (edits reach it live); "hf" or "vllm" to pick
 cpu = 8                     # cores for the lab (default 4 with a GPU)
 memory = 65536              # MiB
 packages = ["scikit-learn==1.8.0"]   # built into the lab image; the lab stays offline
 
-[lab.vllm]                  # with engine = "vllm"; each edit reaches vLLM before it generates
-memory = 0.45               # share of its GPU; unset, planned from what transformers holds
+[lab.vllm]                  # vLLM holds the only copy; the lab reads the checkpoint as it needs it
+memory = 0.85               # share of its GPU; unset, all but what the lab keeps there
 max_model_len = 8192
+check_pushes = false        # compare transformers and vLLM after every push of edited weights
 
 [check]
 max_rel_norm = 0.05

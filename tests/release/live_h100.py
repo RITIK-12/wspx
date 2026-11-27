@@ -33,13 +33,15 @@ CASES = [
     timeout=3 * 3600,
     volumes={"/models": models_volume.read_only()},
 )
-def live() -> list[dict]:  # type: ignore[type-arg]
+def live(only: str = "") -> list[dict]:  # type: ignore[type-arg]
     import subprocess
     import sys
     from pathlib import Path
 
     out = []
     for i, (model, edits) in enumerate(CASES):
+        if only and only not in model:
+            continue
         path = f"/tmp/live-{i}.json"
         child = (
             "import json, sys; sys.path.insert(0, '/root'); import live_phases as m\n"
@@ -56,5 +58,5 @@ def live() -> list[dict]:  # type: ignore[type-arg]
 
 
 @app.local_entrypoint()
-def main() -> None:
-    print(json.dumps(live.remote(), indent=2, default=str))
+def main(only: str = "") -> None:
+    print(json.dumps(live.remote(only), indent=2, default=str))

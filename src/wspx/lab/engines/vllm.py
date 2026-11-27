@@ -65,12 +65,23 @@ UNSERVED: dict[str, str] = {}
 the vLLM lab image; vLLM 0.34.0 itself does not have it)."""
 
 
+Chunks = Iterable[dict[str, torch.Tensor]]
+
+
 class Transport:
-    """How tensors reach the worker. Over CUDA IPC normally; tests swap in their own."""
+    """How tensors reach the worker. Over CUDA IPC normally; tests swap in their own.
+
+    ``more``: further chunks, in order, sent before the update finishes while vLLM reports
+    modules it has given only part of their tensors; returns the bytes sent and how many
+    of ``more`` it took."""
 
     def send(
-        self, http: httpx.Client, chunks: Iterable[dict[str, torch.Tensor]], version: str
-    ) -> int:
+        self,
+        http: httpx.Client,
+        chunks: Chunks,
+        version: str,
+        more: Sequence[Callable[[], Chunks]] = (),
+    ) -> tuple[int, int]:
         raise NotImplementedError
 
 
@@ -84,42 +95,31 @@ class IPCTransport(Transport):
     _inited: bool = False
 
     def send(
-        self, http: httpx.Client, chunks: Iterable[dict[str, torch.Tensor]], version: str
-    ) -> int:
-        from torch.multiprocessing.reductions import reduce_tensor
-
+        self,
+        http: httpx.Client,
+        chunks: Chunks,
+        version: str,
+        more: Sequence[Callable[[], Chunks]] = (),
+    ) -> tuple[int, int]:
         uuid = str(torch.cuda.get_device_properties(self.device).uuid)
         if not self._inited:
             _post(http, "/weights/init", {"packed": False})
             self._inited = True
         _post(http, "/weights/start", {})
-        sent = 0
+        sent = used = 0
         try:
-            for chunk in chunks:
-                if not chunk:
-                    continue
-                keep: list[torch.Tensor] = []  # exported memory lives until the update returns
-                names: list[str] = []
-                dtypes: list[str] = []
-                shapes: list[list[int]] = []
-                handles: list[dict[str, Any]] = []
-                for name, tensor in chunk.items():
-                    t = tensor.detach().to(self.device, non_blocking=True).contiguous()
-                    keep.append(t)
-                    names.append(name)
-                    dtypes.append(str(t.dtype).removeprefix("torch."))
-                    shapes.append(list(t.shape))
-                    handles.append({uuid: reduce_tensor(t)[1]})  # type: ignore[no-untyped-call]
-                    sent += t.numel() * t.element_size()
-                torch.cuda.synchronize(self.device)  # the copies land before the worker reads
-                info = {
-                    "names": names,
-                    "dtype_names": dtypes,
-                    "shapes": shapes,
-                    "ipc_handles_pickled": base64.b64encode(pickle.dumps(handles)).decode(),
-                }
-                _post(http, "/weights/update", {"update_info": info})
-                del keep, handles
+            sent += self._updates(http, chunks, uuid)
+            while True:
+                missing = _incomplete(http)
+                if not missing:
+                    break
+                if used == len(more):
+                    raise WspxError(
+                        "vLLM has only part of the tensors of "
+                        f"{', '.join(missing[:3])}{' …' if len(missing) > 3 else ''}"
+                    )
+                sent += self._updates(http, more[used](), uuid)
+                used += 1
         except BaseException:
             # end vLLM's update so it serves again; what it holds is now unknown
             with contextlib.suppress(Exception):
@@ -127,7 +127,45 @@ class IPCTransport(Transport):
             raise
         _post(http, "/weights/finish", {"version": version})
         torch.cuda.ipc_collect()  # type: ignore[no-untyped-call]
+        return sent, used
+
+    def _updates(self, http: httpx.Client, chunks: Chunks, uuid: str) -> int:
+        from torch.multiprocessing.reductions import reduce_tensor
+
+        sent = 0
+        for chunk in chunks:
+            if not chunk:
+                continue
+            keep: list[torch.Tensor] = []  # exported memory lives until the update returns
+            names: list[str] = []
+            dtypes: list[str] = []
+            shapes: list[list[int]] = []
+            handles: list[dict[str, Any]] = []
+            for name, tensor in chunk.items():
+                t = tensor.detach().to(self.device, non_blocking=True).contiguous()
+                keep.append(t)
+                names.append(name)
+                dtypes.append(str(t.dtype).removeprefix("torch."))
+                shapes.append(list(t.shape))
+                handles.append({uuid: reduce_tensor(t)[1]})  # type: ignore[no-untyped-call]
+                sent += t.numel() * t.element_size()
+            torch.cuda.synchronize(self.device)  # the copies land before the worker reads
+            info = {
+                "names": names,
+                "dtype_names": dtypes,
+                "shapes": shapes,
+                "ipc_handles_pickled": base64.b64encode(pickle.dumps(handles)).decode(),
+            }
+            _post(http, "/weights/update", {"update_info": info})
+            del keep, handles
         return sent
+
+
+def _incomplete(http: httpx.Client) -> list[str]:
+    r = http.get("/weights/incomplete")
+    if r.status_code != 200:  # a worker without the check: nothing to say
+        return []
+    return list(r.json().get("modules", []))
 
 
 def _post(http: httpx.Client, path: str, body: dict[str, Any]) -> Any:
@@ -355,6 +393,9 @@ class VLLMEngine(Engine):
         self.survival: dict[str, Any] = {}
         """Adapter edits on tensors stored quantized, as vLLM serves them (merged)."""
         self._by_layer: dict[str, list[str]] | None = None
+        self.with_outside = False
+        """Pushes also send what lies outside the layer stacks (a model whose vLLM loader
+        maps such tensors into every layer), learned from vLLM on the first push."""
         self.agreement: dict[str, Any] | None = None
         self.proc: subprocess.Popen[bytes] | None = None
         self.log = log
@@ -613,9 +654,12 @@ class VLLMEngine(Engine):
             )
         touched = set(changed)
         groups = list(self._groups) if self.stale else [g for g in self._groups if touched & set(g)]
+        outside = [g for g in self._groups if not checkpoint._LAYER.match(g[0])]
+        if self.with_outside:  # this model maps tensors kept outside its layers into them
+            groups += [g for g in outside if g not in groups]
         started = time.perf_counter()
 
-        def chunks() -> Iterator[dict[str, torch.Tensor]]:
+        def chunks(groups: list[list[str]]) -> Iterator[dict[str, torch.Tensor]]:
             for group in groups:
                 plain: dict[str, torch.Tensor] = {}
                 stored: dict[str, torch.Tensor] = {}
@@ -637,12 +681,23 @@ class VLLMEngine(Engine):
                 batch = {**as_stored, **stored}
                 yield {**batch, **self._rest_of_layers(batch)}
 
+        def these(gs: list[list[str]]) -> Callable[[], Chunks]:
+            return lambda: chunks(gs)
+
+        more = [these([g for g in outside if g not in groups]), these(list(self._groups))]
         version = self.state_key(state) or f"sync-{len(self.syncs) + 1}"
         try:
-            sent = self.transport.send(self.http, chunks(), version)
+            sent, used = self.transport.send(self.http, chunks(groups), version, more)
         except Exception:
             self.stale = True
             raise
+        if used:
+            self.with_outside = True
+            if used == 1:
+                self.notes.append(
+                    "vLLM maps tensors kept outside the layer stack into every layer: each "
+                    "push sends them too"
+                )
         self.stale = False
         self.held = state
         record = {

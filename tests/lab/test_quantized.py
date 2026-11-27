@@ -220,10 +220,10 @@ def test_vllm_gets_the_edited_layer_in_its_stored_format(lab: Any) -> None:
     pushed: dict[str, torch.Tensor] = {}
 
     class Record(Transport):
-        def send(self, http: Any, chunks: Any, version: str) -> int:
+        def send(self, http: Any, chunks: Any, version: str, more: Any = ()) -> tuple[int, int]:
             for chunk in chunks:
                 pushed.update(chunk)
-            return 0
+            return 0, 0
 
     ready = httpx.MockTransport(lambda r: httpx.Response(200, json={"vllm": "0.34.0"}))
     engine = VLLMEngine(

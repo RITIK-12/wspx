@@ -72,25 +72,43 @@ class FakeWorker:
 
 
 class FakeTransport(Transport):
-    """Loads pushed tensors into the fake worker's model by checkpoint name."""
+    """Loads pushed tensors into the fake worker's model by checkpoint name. ``with_every``:
+    tensors the fake vLLM maps into every layer, so a push without them leaves modules
+    incomplete (as vLLM's Inkling2Loop does with its message queries)."""
 
-    def __init__(self, worker: FakeWorker) -> None:
+    def __init__(self, worker: FakeWorker, with_every: tuple[str, ...] = ()) -> None:
         self.worker = worker
         self.pushes: list[list[str]] = []
+        self.with_every = with_every
 
     def send(
-        self, http: httpx.Client, chunks: Iterable[dict[str, torch.Tensor]], version: str
-    ) -> int:
+        self,
+        http: httpx.Client,
+        chunks: Iterable[dict[str, torch.Tensor]],
+        version: str,
+        more: Any = (),
+    ) -> tuple[int, int]:
         state = self.worker.model.state_dict()
-        names, sent = [], 0
-        for chunk in chunks:
-            for name, t in chunk.items():
-                with torch.no_grad():
-                    state[name].copy_(t)
-                names.append(name)
-                sent += t.numel() * t.element_size()
+        names: list[str] = []
+        sent = used = 0
+
+        def load(cs: Iterable[dict[str, torch.Tensor]]) -> None:
+            nonlocal sent
+            for chunk in cs:
+                for name, t in chunk.items():
+                    with torch.no_grad():
+                        state[name].copy_(t)
+                    names.append(name)
+                    sent += t.numel() * t.element_size()
+
+        load(chunks)
+        while self.with_every and not set(self.with_every) <= set(names):
+            if used == len(more):
+                raise WspxError("vLLM has only part of the tensors of a module")
+            load(more[used]())
+            used += 1
         self.pushes.append(names)
-        return sent
+        return sent, used
 
 
 def vllm_lab(tmp_path: Path, **settings: Any) -> tuple[Lab, FakeWorker, FakeTransport]:
@@ -227,7 +245,7 @@ def test_a_push_sends_only_changed_layers_and_a_failed_one_is_mended(tmp_path: P
     assert all(".layers.1." in n for n in transport.pushes[-1])
 
     class Flaky(FakeTransport):
-        def send(self, http: Any, chunks: Any, version: str) -> int:
+        def send(self, http: Any, chunks: Any, version: str, more: Any = ()) -> tuple[int, int]:
             next(iter(chunks))
             raise WspxError("vLLM worker /weights/update: 500 out of memory")
 
@@ -241,6 +259,26 @@ def test_a_push_sends_only_changed_layers_and_a_failed_one_is_mended(tmp_path: P
     every = {n for n, _ in lab.model.named_parameters()}
     assert set(transport.pushes[-1]) >= every - {"lm_head.weight"}
     assert not lab.engine.stale  # type: ignore[attr-defined]
+    assert same_weights(lab.model, worker.model)
+
+
+def test_a_model_that_maps_outside_tensors_into_its_layers_gets_them_each_push(
+    tmp_path: Path,
+) -> None:
+    """vLLM's Inkling2Loop gives each layer a slice of two tensors kept outside the layer
+    stack; a push of one layer alone leaves that layer's module incomplete. vLLM says so,
+    the engine sends what lies outside the layers, and remembers to from then on."""
+    lab, worker, _ = vllm_lab(tmp_path, agreement_prompts=0)
+    transport = FakeTransport(worker, with_every=("model.norm.weight",))
+    lab.engine.transport = transport  # type: ignore[attr-defined]
+    lab.edit.scale("L1.mlp.down", factor=1.5)
+    lab.generate(PROMPTS, max_tokens=2)
+    assert "model.norm.weight" in transport.pushes[-1]
+    assert lab.engine.with_outside  # type: ignore[attr-defined]
+    assert not any(".layers.0." in n for n in transport.pushes[-1])  # not everything
+    lab.edit.scale("L0.mlp.down", factor=0.5)
+    lab.generate(PROMPTS, max_tokens=2)
+    assert "model.norm.weight" in transport.pushes[-1]
     assert same_weights(lab.model, worker.model)
 
 

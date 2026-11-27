@@ -78,3 +78,23 @@ class WspxWorkerExtension:
 
     def wspx_patched_loaders(self) -> list[str]:
         return list(PATCHED)
+
+    def wspx_incomplete(self) -> list[str]:
+        """Modules an update running now has given only part of their tensors: finishing
+        would process them with the rest missing. A model can map a checkpoint tensor kept
+        outside the layer stack into every layer (Inkling2Loop's message queries)."""
+        from vllm.model_executor.model_loader.reload.layerwise import LAYERWISE_INFO
+
+        runner = getattr(self, "model_runner", None)
+        model = getattr(runner, "model", None)
+        if model is None:
+            return []
+        out = []
+        for name, module in model.named_modules():
+            info = LAYERWISE_INFO.get(module)
+            if info is None or not info.can_load():
+                continue
+            loaded, total = info.load_numel, info.load_numel_total
+            if total and 0 < loaded < total:
+                out.append(f"{name} ({type(module).__name__}: {loaded}/{total})")
+        return out

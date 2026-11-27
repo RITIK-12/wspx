@@ -272,6 +272,12 @@ def build_app(engine_argv: list[str], token: str) -> Any:
             raise HTTPException(404, f"no weight phase {phase!r}")
         return {"ok": True}
 
+    @app.get("/weights/incomplete")
+    async def incomplete() -> dict[str, Any]:
+        """Modules the running update has given only part of their tensors."""
+        out = await engine().collective_rpc("wspx_incomplete")
+        return {"modules": sorted({m for rank in out or [] for m in rank or []})}
+
     @app.get("/checksums")
     async def checksums() -> Any:
         return await engine().compute_weight_checksums()

@@ -129,6 +129,11 @@ def run(model: str, edits: list[dict[str, Any]], out: str) -> None:
         report["vllm_log"] = [
             x for x in lines if "Injected" in x or "Failed to load" in x or "rror" in x
         ][-20:]
+        if "error" in report:  # the worker's own traceback
+            start = max(
+                (i for i, x in enumerate(lines) if "Traceback" in x), default=len(lines) - 80
+            )
+            report["vllm_tail"] = lines[max(start - 30, 0) : start + 80]
     Path(out).write_text(json.dumps(report, default=str))
 
 

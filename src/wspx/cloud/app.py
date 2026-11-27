@@ -131,12 +131,22 @@ branch after 0.34.0, and no release has it yet."""
 # vLLM pins its own torch and transformers, so it gets an environment of its own; the lab's
 # vLLM worker runs with /opt/vllm/bin/python and talks to the lab over localhost. It sits
 # below wspx, so a new wspx release does not rebuild it.
+ARCHS = (
+    "/opt/vllm/bin/python -P -c 'import json; from vllm import ModelRegistry; "
+    "print(json.dumps(sorted(ModelRegistry.get_supported_archs())))' "
+    "> /opt/vllm/wspx-archs.json || rm -f /opt/vllm/wspx-archs.json"
+)
+"""The architectures this vLLM serves, recorded once (``[lab] engine = "auto"`` reads it)."""
 vllm_lab_image = _image(
     "lab",
-    below=lambda image: image.run_commands(
-        "python -m venv /opt/vllm",
-        f"/opt/vllm/bin/pip install --no-cache-dir '{VLLM_WHEEL}'",
-    ).env({"WSPX_VLLM_PYTHON": "/opt/vllm/bin/python"}),
+    below=lambda image: (
+        image.run_commands(
+            "python -m venv /opt/vllm",
+            f"/opt/vllm/bin/pip install --no-cache-dir '{VLLM_WHEEL}'",
+        )
+        .run_commands(ARCHS)
+        .env({"WSPX_VLLM_PYTHON": "/opt/vllm/bin/python"})
+    ),
 )
 
 
