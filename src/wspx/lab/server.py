@@ -28,6 +28,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
+from wspx.lab.offload import device_of
 from wspx.lab.session import Lab
 from wspx.store import Store
 from wspx.store.overlay import OverlayStore
@@ -407,16 +408,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.snapshot:
         extract(store.objects.get(args.snapshot), workdir)
     config = WspxConfig.discover(workdir)
-    engine_plan = None
-    if config.lab.engine == "vllm":  # where each engine runs is decided before either loads
-        from wspx.lab.engines.vllm import plan as plan_engine
-        from wspx.lab.loader import resolve_source
-
-        on_disk = sum(
-            f.stat().st_size
-            for f in resolve_source(args.model, local_only=True).glob("*.safetensors")
-        )
-        engine_plan = plan_engine(config.lab.vllm, checkpoint_bytes=on_disk)
+    engine_plan, why_not, sizes, on_disk = _plan_engines(config, args)
     loaded = load_hf(
         args.model,
         dtype=args.dtype,
@@ -426,13 +418,18 @@ def main(argv: list[str] | None = None) -> None:
         attn_implementation=config.model.attn_implementation,
         experts_implementation=config.model.experts_implementation,
     )
+    if engine_plan is not None and engine_plan.stream:
+        from wspx.lab.offload import stream
+
+        streamed = stream(loaded.model, "cuda:0")
+        print(f"wspx lab: {streamed.describe()}", file=sys.stderr, flush=True)
     ir = _cached_ir(store, loaded.fingerprint)
     if ir is None:
         ir = build_ir(
             loaded.model,
             fingerprint=loaded.fingerprint,
             hash_params=False,
-            vision_inputs=probe_inputs(loaded.processor, next(loaded.model.parameters()).device),
+            vision_inputs=probe_inputs(loaded.processor, device_of(loaded.model)),
         )
         _save_ir(store, ir)
     lab = Lab(
@@ -450,7 +447,18 @@ def main(argv: list[str] | None = None) -> None:
         source_dir=loaded.path,
     )
     if engine_plan is not None and loaded.path is not None:
-        lab.engine = _start_vllm(lab, loaded, config, engine_plan, on_disk, args)
+        try:
+            lab.engine = _start_vllm(lab, loaded, config, engine_plan, on_disk, sizes, args)
+        except Exception as exc:
+            if config.lab.engine == "vllm":
+                raise
+            why_not = f"vLLM did not start ({type(exc).__name__}: {str(exc)[:300]})"
+            from wspx.lab.offload import unstream
+
+            unstream(loaded.model)
+    if why_not:
+        lab.engine.notes.append(why_not)
+        print(f"wspx lab: transformers generates: {why_not}", file=sys.stderr, flush=True)
     server = LabServer(lab, lease_s=args.lease, token=os.environ.get("WSPX_LAB_TOKEN"))
     server.network = network_check()
     print(f"wspx lab: outbound network {server.network}", file=sys.stderr, flush=True)
@@ -458,8 +466,49 @@ def main(argv: list[str] | None = None) -> None:
     uvicorn.run(server.app(), host="0.0.0.0", port=args.port, log_level="warning")
 
 
+def _plan_engines(config: Any, args: Any) -> tuple[Any, str, tuple[int, int, int], int]:
+    """Whether vLLM serves this lab and where each engine runs, decided before either loads:
+    the plan (``None``: transformers generates), why not, transformers' sizes and the
+    checkpoint's bytes on disk."""
+    if config.lab.engine == "hf":
+        return None, "", (0, 0, 0), 0
+    from wspx.errors import WspxError
+    from wspx.lab.engines.vllm import can_serve
+    from wspx.lab.engines.vllm import plan as plan_engine
+    from wspx.lab.loader import float_sizes, resolve_source
+
+    path = resolve_source(args.model, local_only=True)
+    if config.lab.engine == "auto":
+        ok, why = can_serve(path)
+        if not ok:
+            return None, why, (0, 0, 0), 0
+    on_disk = sum(f.stat().st_size for f in path.glob("*.safetensors"))
+    sizes = float_sizes(
+        args.model, dtype=args.dtype, trust_remote_code=args.trust_remote_code, local_only=True
+    )
+    total, outside, largest = sizes
+    try:
+        engine_plan = plan_engine(
+            config.lab.vllm,
+            checkpoint_bytes=on_disk,
+            hf_bytes=total,
+            resident_bytes=outside + 2 * largest,
+        )
+    except WspxError as exc:
+        if config.lab.engine == "vllm":
+            raise
+        return None, str(exc), sizes, on_disk
+    return engine_plan, "", sizes, on_disk
+
+
 def _start_vllm(
-    lab: Any, loaded: Any, config: Any, engine_plan: Any, on_disk: int, args: Any
+    lab: Any,
+    loaded: Any,
+    config: Any,
+    engine_plan: Any,
+    on_disk: int,
+    sizes: tuple[int, int, int],
+    args: Any,
 ) -> Any:
     """The vLLM worker beside this lab, once transformers holds its share of the GPU."""
     import atexit
@@ -468,9 +517,13 @@ def _start_vllm(
 
     from wspx.lab.engines.vllm import VLLMEngine, plan
 
-    if engine_plan.hf_device is None:  # one GPU: plan again with what transformers took
+    if engine_plan.vllm_gpu == 0:  # one GPU: plan again with what transformers took
+        held = torch.cuda.memory_allocated(0)
         engine_plan = plan(
-            config.lab.vllm, checkpoint_bytes=on_disk, hf_bytes=torch.cuda.memory_allocated(0)
+            config.lab.vllm,
+            checkpoint_bytes=on_disk,
+            hf_bytes=sizes[0] if engine_plan.stream else held,
+            resident_bytes=held if engine_plan.stream else None,
         )
     print(engine_plan.describe(), file=sys.stderr, flush=True)
     engine = VLLMEngine(

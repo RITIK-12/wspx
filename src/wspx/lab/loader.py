@@ -136,6 +136,26 @@ def load_hf(
     )
 
 
+def float_sizes(
+    source: str,
+    *,
+    dtype: str = "bfloat16",
+    trust_remote_code: bool = False,
+    local_only: bool = False,
+) -> tuple[int, int, int]:
+    """Bytes the model takes loaded in ``dtype``: in all, outside its layer stacks, and its
+    largest layer (from a skeleton on the meta device, before anything is loaded)."""
+    from transformers import AutoConfig
+
+    from wspx.lab.offload import sizes
+
+    path = resolve_source(source, local_only=local_only)
+    config = AutoConfig.from_pretrained(str(path), trust_remote_code=trust_remote_code)
+    with torch.device("meta"):
+        skeleton = _auto_class(config).from_config(config, trust_remote_code=trust_remote_code)
+    return sizes(skeleton, DTYPES.get(dtype, torch.bfloat16))
+
+
 def _processor(path: Path, auto: Any, trust_remote_code: bool) -> Any:
     """The checkpoint's image/video processor, when it is a vision-language model."""
     from transformers import AutoModelForImageTextToText, AutoProcessor

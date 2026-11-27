@@ -15,6 +15,7 @@ from wspx.lab.check import perplexity, token_kl
 from wspx.lab.engines import Engine
 from wspx.lab.ir.model_ir import ModelIR
 from wspx.lab.media import is_media
+from wspx.lab.offload import device_of
 from wspx.lab.text import Prompt, Text
 
 
@@ -116,7 +117,7 @@ class SuiteModel:
         return out
 
     def _logits(self, prompts: Sequence[Prompt]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        device = next(self._model.parameters()).device
+        device = device_of(self._model)
         batch = self._text.batch(prompts, device)
         ids, mask = batch
         with torch.no_grad():

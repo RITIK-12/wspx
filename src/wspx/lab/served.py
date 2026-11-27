@@ -106,12 +106,27 @@ class Served:
         return out
 
     def apply(self, name: str, base: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
-        """What loading the checkpoint with this edit written in its format gives ``name``."""
-        delta = value.float() - base.float()
-        if not bool(delta.ne(0).any()):
+        """What loading the checkpoint with this edit written in its format gives ``name``;
+        the stored tensors and the survival report are kept for export and vLLM."""
+        encoded = self.encode(name, base, value)
+        if encoded is None:
             self.parts.pop(name, None)
             self.last.pop(name, None)
             return base
+        parts, survival, live = encoded
+        self.parts[name] = parts
+        self.last[name] = survival
+        return live
+
+    def encode(
+        self, name: str, base: torch.Tensor, value: torch.Tensor
+    ) -> tuple[dict[str, torch.Tensor], Survival, torch.Tensor] | None:
+        """``value`` written in the stored format (changing nothing here): the checkpoint
+        tensors, how much of ``value - base`` survived, and what loading them gives.
+        ``None`` when ``value`` equals ``base``."""
+        delta = value.float() - base.float()
+        if not bool(delta.ne(0).any()):
+            return None
         ck_delta = checkpoint.to_checkpoint(self.model, {name: delta})
         plain = checkpoint.to_checkpoint(self.model, {name: value})
         parts: dict[str, torch.Tensor] = {}
@@ -139,19 +154,19 @@ class Served:
         cos = float(
             (served.flatten() @ delta.flatten()) / (served.norm() * delta.norm()).clamp_min(1e-30)
         )
-        self.parts[name] = parts
-        self.last[name] = Survival(
+        cos = 0.0 if math.isnan(cos) else cos
+        survival = Survival(
             name,
             "/".join(sorted(kinds)),
             ratio,
-            0.0 if math.isnan(cos) else cos,
+            cos,
             blocks,
             values,
             clipped,
             rescaled,
-            0.0 if math.isnan(cos) else ratio * cos,
+            ratio * cos,
         )
-        return live
+        return parts, survival, live
 
     def stored(self, name: str) -> dict[str, torch.Tensor] | None:
         """The checkpoint tensors ``name`` is stored as with its edit, or ``None`` when it is
@@ -167,3 +182,32 @@ class Served:
             fmt = self.formats.get(ck)
             wanted += fmt.parts if fmt else [ck]
         return self._read(wanted, device)
+
+
+QUANTIZED_DTYPES = ("U8", "I8", "I32", "F8_E4M3", "F8_E5M2", "F4", "U4", "I4")
+
+
+def unwritable(src: checkpoint.Source | None) -> str:
+    """Why wspx cannot write edits in this checkpoint's stored format ("" when it can, or
+    when the checkpoint is not quantized)."""
+    if src is None or not src.quantized or not src.tensors:
+        return ""
+    rules: dict[str, str] = {}
+    qc = src.path / "hf_quant_config.json"
+    if qc.is_file():
+        rules = quant.rules_from(json.loads(qc.read_text()))
+    formats = quant.formats(src.tensors, rules)
+    covered = {part for fmt in formats.values() for part in fmt.parts}
+    stray = sorted(
+        name
+        for name, (dtype, _) in src.tensors.items()
+        if name not in covered
+        and (dtype in QUANTIZED_DTYPES or checkpoint.QUANT_AUX.search(name) is not None)
+    )
+    if not stray:
+        return ""
+    method = (src.quantization or {}).get("quant_method") or "a quantized format"
+    return (
+        f"its weights are stored {method} in a layout wspx cannot write edits in yet "
+        f"({len(stray)} tensor(s), e.g. {stray[0]})"
+    )

@@ -59,6 +59,7 @@ from wspx.lab.index import ModelIndex, build_index
 from wspx.lab.ir.model_ir import ModelIR, Target
 from wspx.lab.media import Media, canary_inputs, is_media
 from wspx.lab.model_io import ModelIO
+from wspx.lab.offload import device_of
 from wspx.lab.ops import OpContext
 from wspx.lab.patch import TensorDelta, materialize
 from wspx.lab.probe import Probe
@@ -175,7 +176,7 @@ class Lab:
 
     @property
     def device(self) -> torch.device:
-        return next(self.model.parameters()).device
+        return device_of(self.model)
 
     @property
     def params(self) -> dict[str, torch.nn.Parameter]:
@@ -1370,6 +1371,8 @@ class Lab:
         if self.engine.name != "hf":
             lines.append(self.engine.describe())  # type: ignore[attr-defined]
             lines += [f"  ! {n}" for n in self.engine.notes]
+        elif self.engine.notes:  # why vLLM does not serve this lab
+            lines += [f"engine: transformers ({n})" for n in self.engine.notes]
         if not self.staged:
             lines.append("nothing staged")
         for r in self.staged:

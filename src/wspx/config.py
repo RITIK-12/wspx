@@ -130,7 +130,8 @@ class DriverSection(_Section):
 
 
 class VllmSection(_Section):
-    """The vLLM engine (``[lab] engine = "vllm"``), run next to the lab on the same machine."""
+    """The vLLM engine (``[lab] engine``, the default where vLLM serves the model), run next
+    to the lab on the same machine."""
 
     memory: float | None = Field(default=None, gt=0, lt=1)
     """Share of its GPU vLLM may use (weights, KV cache, graphs). Unset: planned at start
@@ -148,11 +149,13 @@ class VllmSection(_Section):
 
 
 class LabSection(_Section):
-    engine: Literal["hf", "vllm"] = "hf"
+    engine: Literal["auto", "hf", "vllm"] = "auto"
     """What generates: ``generate``, test suites, check's smoke prompts and ``run`` scripts'
-    batches. ``hf`` is transformers in the lab; ``vllm`` serves the same weights, so what is
-    tested is what vLLM serves. Probes (trace, activations, contrast, grep) always use
-    transformers."""
+    batches. ``vllm`` serves the lab's weights and takes every edit as it is made, so what is
+    tested is what vLLM serves; ``hf`` is transformers in the lab. ``auto`` is vLLM wherever
+    it can serve the model (a GPU, an architecture this vLLM has, and weights wspx can write
+    edits in) and transformers otherwise, saying why. Probes (trace, activations, contrast,
+    grep) always use transformers."""
     vllm: VllmSection = Field(default_factory=VllmSection)
     cpu: float | None = Field(default=None, gt=0)
     """CPU cores reserved for the lab (transformers decoding is CPU-bound: one kernel launch

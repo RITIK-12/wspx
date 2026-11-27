@@ -16,6 +16,7 @@ from typing import Any
 import torch
 
 from wspx.lab import analysis
+from wspx.lab.offload import device_of
 from wspx.lab.text import Prompt, Text
 
 Rows = list[tuple[list[int], list[list[float]]]]
@@ -135,7 +136,7 @@ class Engine:
             "engine": self.name,
             "transformers": transformers.__version__,
             "torch": torch.__version__,
-            "gpu": gpu_name(next(self.model.parameters()).device),
+            "gpu": gpu_name(device_of(self.model)),
         }
 
     def label(self) -> str:

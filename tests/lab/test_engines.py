@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -216,23 +217,73 @@ def test_plan_shares_one_gpu_or_says_why_not() -> None:
         )
 
 
-def test_a_loader_that_takes_only_whole_models_gets_the_whole_model(tmp_path: Path) -> None:
-    """vLLM's Inkling2 refuses an update missing any tensor; the engine then sends all."""
-    lab, worker, _ = vllm_lab(tmp_path, agreement_prompts=0)
-    total = len(list(lab.model.named_parameters()))
-
-    class Strict(FakeTransport):
-        def send(self, http: Any, chunks: Any, version: str) -> int:
-            chunks = list(chunks)
-            names = [n for c in chunks for n in c]
-            if len(names) < total:
-                raise WspxError(
-                    "vLLM worker /weights/update: 500 Missing checkpoint tensors: [...]"
-                )
-            return super().send(http, iter(chunks), version)
-
-    lab.engine.transport = Strict(worker)  # type: ignore[attr-defined]
+def test_a_push_sends_only_changed_layers_and_a_failed_one_is_mended(tmp_path: Path) -> None:
+    """vLLM reloads layer by layer and keeps what a push leaves out; after a push fails
+    partway, what it holds is unknown, and the next push sends every layer."""
+    lab, worker, transport = vllm_lab(tmp_path, agreement_prompts=0)
     lab.edit.scale("L1.mlp.down", factor=1.5)
     lab.generate(PROMPTS, max_tokens=2)
-    assert lab.engine.full_resync  # type: ignore[attr-defined]
+    assert transport.pushes[-1]
+    assert all(".layers.1." in n for n in transport.pushes[-1])
+
+    class Flaky(FakeTransport):
+        def send(self, http: Any, chunks: Any, version: str) -> int:
+            next(iter(chunks))
+            raise WspxError("vLLM worker /weights/update: 500 out of memory")
+
+    lab.engine.transport = Flaky(worker)  # type: ignore[attr-defined]
+    lab.edit.scale("L0.mlp.down", factor=0.5)
+    with pytest.raises(WspxError, match="out of memory"):
+        lab.generate(PROMPTS, max_tokens=2)
+    assert lab.engine.stale  # type: ignore[attr-defined]
+    lab.engine.transport = transport  # type: ignore[attr-defined]
+    lab.generate(PROMPTS, max_tokens=2)
+    every = {n for n, _ in lab.model.named_parameters()}
+    assert set(transport.pushes[-1]) >= every - {"lm_head.weight"}
+    assert not lab.engine.stale  # type: ignore[attr-defined]
     assert same_weights(lab.model, worker.model)
+
+
+def test_the_worker_runs_from_its_own_folder_with_the_extension() -> None:
+    """Next to wspx's engine module, ``import vllm`` would find wspx's ``vllm.py``."""
+    from wspx.lab.engines import vllm as engine
+
+    assert engine.WORKER.parent == engine.EXTENSION.parent
+    assert (engine.WORKER.parent / "vllm.py").exists()  # why it cannot run from there
+    source = engine.EXTENSION.read_text()
+    assert not re.search(r"^\s*(import|from) wspx", source, re.M)
+    assert engine.EXTENSION_CLS == "wspx_vllm_ext.WspxWorkerExtension"
+
+
+def test_the_extension_lets_strict_loaders_take_part_of_a_checkpoint() -> None:
+    import sys
+    import types
+
+    from wspx.lab.engines import vllm_ext
+
+    active = {"on": False}
+    reload = types.ModuleType("vllm.model_executor.model_loader.reload")
+    reload.weight_update_active = lambda: active["on"]  # type: ignore[attr-defined]
+    saved = {k: sys.modules.get(k) for k in ("vllm.model_executor.model_loader.reload",)}
+    sys.modules["vllm.model_executor.model_loader.reload"] = reload
+
+    class Strict:
+        def load_weights(self, weights: Any) -> set[str]:
+            names = {n for n, _ in weights}
+            if names != {"a", "b"}:
+                raise ValueError(f"Missing checkpoint tensors: {sorted({'a', 'b'} - names)}")
+            return names
+
+    try:
+        vllm_ext._partial_ok(Strict)
+        with pytest.raises(ValueError, match="Missing"):
+            Strict().load_weights([("a", 1)])  # cold start: still strict
+        active["on"] = True
+        assert Strict().load_weights([("a", 1)]) == {"a"}  # an update: part is fine
+        assert Strict().load_weights([("a", 1), ("b", 2)]) == {"a", "b"}
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v

@@ -123,7 +123,7 @@ class SessionManager:
         revision: str | None = None,
         dtype: str = "bfloat16",
         trust_remote_code: bool = False,
-        engine: str = "hf",
+        engine: str = "auto",
         driver_images: str = "auto",
         cpu: float | None = None,
         memory: int | None = None,
@@ -990,21 +990,36 @@ GPU_CAPABILITY = {
 VLLM_MIN_CAPABILITY = 8.0
 
 
+def _capability(gpu: str) -> float | None:
+    kind = gpu.split(":", maxsplit=1)[0]
+    return GPU_CAPABILITY.get(kind.upper()) or GPU_CAPABILITY.get(kind)
+
+
 def check_engine_gpu(engine: str, gpu: str | None) -> None:
     """Refuse at creation what the lab could only fail at minutes later."""
-    if engine not in ("hf", "vllm"):
-        raise WspxError(f"unknown engine {engine!r}; use 'hf' or 'vllm'")
+    if engine not in ("auto", "hf", "vllm"):
+        raise WspxError(f"unknown engine {engine!r}; use 'auto', 'hf' or 'vllm'")
     if engine != "vllm":
         return
     if not gpu:
         raise WspxError("engine = 'vllm' needs a GPU: set [lab] gpu, e.g. 'H100' or 'H100:2'")
-    kind = gpu.split(":")[0].upper()
-    capability = GPU_CAPABILITY.get(kind) or GPU_CAPABILITY.get(gpu.split(":")[0])
+    capability = _capability(gpu)
     if capability is not None and capability < VLLM_MIN_CAPABILITY:
         raise WspxError(
             f"engine = 'vllm' needs compute capability {VLLM_MIN_CAPABILITY} or newer, and a "
-            f"{kind} has {capability}; use an L4, A100, L40S, H100 or newer"
+            f"{gpu.split(':')[0].upper()} has {capability}; use an L4, A100, L40S, H100 or newer"
         )
+
+
+def wants_vllm(engine: str, gpu: str | None) -> bool:
+    """Whether the lab starts from the vLLM lab image: ``vllm``, or ``auto`` on a GPU vLLM
+    runs on (the lab then decides whether vLLM serves this model)."""
+    if engine == "vllm":
+        return True
+    if engine != "auto" or not gpu:
+        return False
+    capability = _capability(gpu)
+    return capability is None or capability >= VLLM_MIN_CAPABILITY
 
 
 _PACKAGE = re.compile(

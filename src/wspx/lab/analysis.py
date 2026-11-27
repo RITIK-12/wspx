@@ -19,6 +19,7 @@ from wspx.errors import WspxError
 from wspx.lab.index import tensor_stats
 from wspx.lab.ir.model_ir import ModelIR, Target
 from wspx.lab.media import is_media
+from wspx.lab.offload import device_of
 from wspx.lab.probe import (
     ExpertWrites,
     Probe,
@@ -342,7 +343,7 @@ def _residuals(
     position: str,
     batch_size: int,
 ) -> torch.Tensor:
-    device = next(model.parameters()).device
+    device = device_of(model)
     rows = []
     if any(is_media(p) for p in prompts):
         batch_size = min(batch_size, MEDIA_BATCH)
@@ -405,7 +406,7 @@ def generate_scored(
     after its configured processors, such as a repetition penalty), so a suite can score how
     sure the model was of an answer it wrote. Only the watched tokens are kept, step by step.
     """
-    device = next(model.parameters()).device
+    device = device_of(model)
     b = text.batch(prompts, device)
     ids, mask = b
     torch.manual_seed(seed)
@@ -515,7 +516,7 @@ def forward_trace(
     """One row per layer call in run order: the residual norm, the logit lens and, on a
     mixture-of-experts model, the experts routed at the last token. A layer that runs more
     than once has a row per pass (``L6@2``)."""
-    device = next(model.parameters()).device
+    device = device_of(model)
     batch = text.batch([prompt], device)
     ids, mask = batch
     calls = layer_calls(ir)
@@ -828,7 +829,7 @@ def diff_trace(
     top: int = 5,
 ) -> Trace:
     """The same input on two weight states. ``switch`` is a context manager that swaps to the other state."""
-    device = next(model.parameters()).device
+    device = device_of(model)
     batch = text.batch([prompt], device)
     ids, mask = batch
     calls = layer_calls(ir)
@@ -944,7 +945,7 @@ def attribution_trace(
     top: int = 10,
 ) -> Trace:
     """Score writer units by (activation difference) × (gradient) on the failing input: a stack trace."""
-    device = next(model.parameters()).device
+    device = device_of(model)
     units = writer_units(ir)
     batch_f = text.batch([failing], device)
     batch_r = text.batch([reference], device)

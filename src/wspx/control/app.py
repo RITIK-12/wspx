@@ -89,7 +89,7 @@ class NewSession(BaseModel):
     revision: str | None = None
     dtype: str = "bfloat16"
     trust_remote_code: bool = False
-    engine: Literal["hf", "vllm"] = "hf"
+    engine: Literal["auto", "hf", "vllm"] = "auto"
     driver_images: Literal["auto", "off"] = "auto"
     cpu: float | None = Field(None, gt=0, le=64)
     memory: int | None = Field(None, gt=0, le=1_048_576)

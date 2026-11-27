@@ -7,7 +7,9 @@ talks to it on localhost only:
 - ``POST /generate`` takes token ids (or a rendered prompt with its images and videos) and
   streams one JSON line per finished request, so the lab can report progress;
 - ``POST /weights/{init,start,update,finish}`` take the lab's edited tensors over CUDA IPC
-  through vLLM's own weight-transfer engine, under the checkpoint's tensor names;
+  through vLLM's own weight-transfer engine, under the checkpoint's tensor names, one layer
+  per update (vLLM reloads layer by layer and keeps the layers not sent; ``wspx_vllm_ext``,
+  copied next to this file, lets strict model loaders take part of a checkpoint);
 - ``GET /ready``, ``GET /info`` and ``GET /checksums`` say what it is serving.
 """
 
@@ -16,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import contextlib
 import io
 import json
 import math
@@ -193,6 +196,8 @@ def build_app(engine_argv: list[str], token: str) -> Any:
             "weight_version": await e.get_weight_version(),
             "gpu": _gpu(),
             "speculative": e.vllm_config.speculative_config is not None,
+            "reload_mode": os.environ.get("VLLM_RELOAD_MODE", "auto"),
+            "extension": e.vllm_config.parallel_config.worker_extension_cls,
         }
 
     @app.post("/generate")
@@ -244,6 +249,13 @@ def build_app(engine_argv: list[str], token: str) -> Any:
             await e.update_weights(WeightTransferUpdateRequest(update_info=body["update_info"]))
         elif phase == "finish":
             await e.finish_weight_update(body.get("version"))
+            # cached KV blocks (and encoded images) were computed with the old weights; a
+            # prompt sharing a prefix with an earlier one must not reuse them
+            for reset in ("reset_prefix_cache", "reset_mm_cache", "reset_encoder_cache"):
+                fn = getattr(e, reset, None)
+                if fn is not None:
+                    with contextlib.suppress(Exception):  # a cache this build lacks
+                        await fn()
         else:
             raise HTTPException(404, f"no weight phase {phase!r}")
         return {"ok": True}

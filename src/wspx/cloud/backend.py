@@ -73,6 +73,7 @@ class ModalBackend:
         self, record: SessionRecord, cancelled: Callable[[], bool] = lambda: False
     ) -> ModalLab:
         from wspx.cloud.app import app, lab_image, models_volume, vllm_lab_image
+        from wspx.control.sessions import wants_vllm
 
         path = self._fn("download").remote(record.model, record.revision)
         if cancelled():
@@ -103,7 +104,9 @@ class ModalBackend:
         sandbox = self.modal.Sandbox.create(
             *args,
             app=app,
-            image=_with_packages(vllm_lab_image if record.engine == "vllm" else lab_image, record),
+            image=_with_packages(
+                vllm_lab_image if wants_vllm(record.engine, record.gpu) else lab_image, record
+            ),
             gpu=record.gpu,
             cpu=record.cpu or (LAB_GPU_CPUS if record.gpu else None),
             memory=record.memory,

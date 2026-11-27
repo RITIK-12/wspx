@@ -3,14 +3,17 @@
 The worker (:mod:`wspx.lab.engines.vllm_worker`) runs with vLLM's own Python, since vLLM
 pins its own torch. Before each generation the lab pushes every layer an edit, checkout,
 discard or merge changed since the last push, under the checkpoint's tensor names
-(:mod:`wspx.lab.checkpoint`), through vLLM's weight-transfer engine over CUDA IPC. vLLM
-fuses and shards them itself. A whole layer goes at once: vLLM reloads per module, and a
-module that receives only some of its tensors would be left with the rest uninitialized.
+(:mod:`wspx.lab.checkpoint`) and in the checkpoint's own format (quantized tensors as
+their codes and scales, :mod:`wspx.lab.served`), through vLLM's weight-transfer engine
+over CUDA IPC. vLLM reloads layer by layer and keeps every layer a push leaves out, so a
+push costs the layers it changes, not the model. A whole layer goes at once: a module that
+received only some of its tensors would be left with the rest uninitialized.
 """
 
 from __future__ import annotations
 
 import base64
+import contextlib
 import io
 import json
 import math
@@ -34,13 +37,15 @@ from wspx.errors import WspxError
 from wspx.lab import analysis, checkpoint
 from wspx.lab.engines import Engine, Rows, agreement_prompts
 from wspx.lab.media import is_media
+from wspx.lab.offload import device_of
 from wspx.lab.text import Prompt, Text
 from wspx.lab.tree import TreeState, WorkingTree
 
 WORKER = Path(__file__).with_name("vllm_worker.py")
+EXTENSION = Path(__file__).with_name("vllm_ext.py")
+EXTENSION_CLS = "wspx_vllm_ext.WspxWorkerExtension"
 VLLM_PYTHON = os.environ.get("WSPX_VLLM_PYTHON", "/opt/vllm/bin/python")
 READY_TIMEOUT_S = 45 * 60
-BUFFER_BYTES = 512 * 2**20
 AGREEMENT_TOKENS = 16
 AGREEMENT_TOP = 20
 
@@ -71,11 +76,11 @@ class Transport:
 
 @dataclass
 class IPCTransport(Transport):
-    """vLLM's documented "trainer without vLLM over HTTP" IPC contract, packed: tensors are
-    copied into one exported GPU buffer and sent a chunk at a time."""
+    """vLLM's "trainer without vLLM over HTTP" IPC contract, unpacked: every tensor of a
+    chunk (one layer) goes as its own CUDA IPC handle in one update, so each update is one
+    ``load_weights`` call on whole layers."""
 
     device: torch.device
-    buffer_bytes: int = BUFFER_BYTES
     _inited: bool = False
 
     def send(
@@ -85,58 +90,42 @@ class IPCTransport(Transport):
 
         uuid = str(torch.cuda.get_device_properties(self.device).uuid)
         if not self._inited:
-            _post(http, "/weights/init", {"packed": True})
+            _post(http, "/weights/init", {"packed": False})
             self._inited = True
         _post(http, "/weights/start", {})
-        keep: list[torch.Tensor] = []  # exported memory lives until finish returns
-        buffer: torch.Tensor | None = None
-        handle = ""
-        names: list[str] = []
-        dtypes: list[str] = []
-        shapes: list[list[int]] = []
-        sizes: list[int] = []
         sent = 0
-
-        def flush() -> None:
-            if not names:
-                return
-            torch.cuda.synchronize(self.device)  # the copies must land before the worker reads
-            info = {
-                "names": list(names),
-                "dtype_names": list(dtypes),
-                "shapes": list(shapes),
-                "ipc_handles_pickled": handle,
-                "tensor_sizes": list(sizes),
-            }
-            _post(http, "/weights/update", {"update_info": info})
-            for done in (names, dtypes, shapes, sizes):
-                done.clear()
-
-        for chunk in chunks:
-            for name, tensor in chunk.items():
-                t = tensor.detach().to(self.device).contiguous()
-                nbytes = t.numel() * t.element_size()
-                if buffer is None or nbytes > buffer.numel():
-                    flush()
-                    buffer = torch.empty(
-                        max(self.buffer_bytes, nbytes), dtype=torch.uint8, device=self.device
-                    )
-                    keep.append(buffer)
-                    exported = {uuid: reduce_tensor(buffer)[1]}  # type: ignore[no-untyped-call]
-                    handle = base64.b64encode(pickle.dumps(exported)).decode()
-                offset = sum(sizes)
-                if names and offset + nbytes > buffer.numel():  # close before overflowing
-                    flush()
-                    offset = 0
-                buffer[offset : offset + nbytes].copy_(t.view(-1).view(torch.uint8))
-                names.append(name)
-                dtypes.append(str(t.dtype).removeprefix("torch."))
-                shapes.append(list(t.shape))
-                sizes.append(nbytes)
-                sent += nbytes
-        flush()
+        try:
+            for chunk in chunks:
+                if not chunk:
+                    continue
+                keep: list[torch.Tensor] = []  # exported memory lives until the update returns
+                names: list[str] = []
+                dtypes: list[str] = []
+                shapes: list[list[int]] = []
+                handles: list[dict[str, Any]] = []
+                for name, tensor in chunk.items():
+                    t = tensor.detach().to(self.device, non_blocking=True).contiguous()
+                    keep.append(t)
+                    names.append(name)
+                    dtypes.append(str(t.dtype).removeprefix("torch."))
+                    shapes.append(list(t.shape))
+                    handles.append({uuid: reduce_tensor(t)[1]})  # type: ignore[no-untyped-call]
+                    sent += t.numel() * t.element_size()
+                torch.cuda.synchronize(self.device)  # the copies land before the worker reads
+                info = {
+                    "names": names,
+                    "dtype_names": dtypes,
+                    "shapes": shapes,
+                    "ipc_handles_pickled": base64.b64encode(pickle.dumps(handles)).decode(),
+                }
+                _post(http, "/weights/update", {"update_info": info})
+                del keep, handles
+        except BaseException:
+            # end vLLM's update so it serves again; what it holds is now unknown
+            with contextlib.suppress(Exception):
+                _post(http, "/weights/finish", {"version": f"{version}-failed"})
+            raise
         _post(http, "/weights/finish", {"version": version})
-        del keep, buffer
         torch.cuda.ipc_collect()  # type: ignore[no-untyped-call]
         return sent
 
@@ -153,10 +142,13 @@ class Plan:
     """Where each engine runs and how much of its GPU vLLM may take."""
 
     hf_device: str | None
-    """``device_map`` for transformers (``None``: spread over every GPU)."""
+    """``device_map`` for transformers (``None``: spread over every GPU; ``cpu``: host memory,
+    streamed to the GPU a layer at a time)."""
     vllm_gpu: int
     memory: float
     lines: list[str] = field(default_factory=list)
+    stream: bool = False
+    """transformers' copy stays in host memory and runs a layer at a time on the GPU."""
 
     def describe(self) -> str:
         return "engine plan:\n" + "\n".join(f"  {line}" for line in self.lines)
@@ -168,11 +160,14 @@ def plan(
     checkpoint_bytes: int,
     gpus: list[tuple[str, int]] | None = None,
     hf_bytes: int | None = None,
+    resident_bytes: int | None = None,
 ) -> Plan:
     """Decide where vLLM runs before transformers loads (``gpus``: name and memory per GPU).
 
-    With two or more GPUs, transformers keeps the first and vLLM the last; with one, vLLM
-    gets what transformers leaves, which is checked again once it has loaded."""
+    With two or more GPUs, transformers keeps the first and vLLM the last. With one, both
+    share it when transformers' copy (``hf_bytes``) leaves vLLM room for a useful KV cache;
+    otherwise transformers' copy stays in host memory and only ``resident_bytes`` (what lies
+    outside its layer stacks, and a layer in flight) sit on the GPU."""
     if gpus is None:
         if not torch.cuda.is_available():
             raise WspxError("the vLLM engine needs a GPU; set [lab] gpu, or use engine = 'hf'")
@@ -200,21 +195,99 @@ def plan(
     name, total = gpus[0]
     hf = hf_bytes if hf_bytes is not None else checkpoint_bytes
     headroom = 0.08 * total + 3 * gb  # activations for probes, allocator slack
+    useful = need + max(0.0, 0.15 * total - 4 * gb)  # a KV cache for batched evals
     room = (total - hf - headroom) / total
-    memory = settings.memory or round(max(room, 0.0), 2)
-    p = Plan(None, 0, memory)
-    p.lines = [
-        f"one GPU ({name}, {total / gb:.0f} GB) shared by both engines",
-        f"transformers holds about {hf / gb:.1f} GB; vLLM may use {memory:.0%} "
-        f"({memory * total / gb:.0f} GB) for a {checkpoint_bytes / gb:.1f} GB checkpoint",
-    ]
-    if memory * total < need or memory > room + 1e-6:
-        raise WspxError(
-            f"both engines do not fit on one {total / gb:.0f} GB {name}: transformers needs "
-            f"about {hf / gb:.0f} GB and vLLM about {need / gb:.0f} GB more; use two GPUs "
-            "([lab] gpu = 'H100:2'), a larger GPU, or engine = 'hf'"
+    if room * total >= useful or (resident_bytes is None and room * total >= need):
+        memory = settings.memory or round(max(room, 0.0), 2)
+        p = Plan(None, 0, memory)
+        p.lines = [
+            f"one GPU ({name}, {total / gb:.0f} GB) shared by both engines",
+            f"transformers holds about {hf / gb:.1f} GB; vLLM may use {memory:.0%} "
+            f"({memory * total / gb:.0f} GB) for a {checkpoint_bytes / gb:.1f} GB checkpoint",
+        ]
+        if memory * total < need or memory > room + 1e-6:
+            raise WspxError(
+                f"both engines do not fit on one {total / gb:.0f} GB {name}: transformers "
+                f"needs about {hf / gb:.0f} GB and vLLM about {need / gb:.0f} GB more; use "
+                "two GPUs ([lab] gpu = 'H100:2'), a larger GPU, or engine = 'hf'"
+            )
+        return p
+    if resident_bytes is not None:
+        streamed = (total - resident_bytes - headroom) / total
+        memory = settings.memory or round(max(streamed, 0.0), 2)
+        if memory * total >= need and memory <= streamed + 1e-6:
+            p = Plan("cpu", 0, memory, stream=True)
+            p.lines = [
+                f"one GPU ({name}, {total / gb:.0f} GB): vLLM may use {memory:.0%} "
+                f"({memory * total / gb:.0f} GB) for a {checkpoint_bytes / gb:.1f} GB checkpoint",
+                f"transformers' {hf / gb:.1f} GB copy stays in host memory and runs a layer at "
+                f"a time on the GPU ({resident_bytes / gb:.1f} GB stays there)",
+            ]
+            return p
+    raise WspxError(
+        f"both engines do not fit on one {total / gb:.0f} GB {name}: vLLM needs about "
+        f"{need / gb:.0f} GB, and transformers {hf / gb:.0f} GB (or "
+        f"{(resident_bytes or hf) / gb:.0f} GB streamed from host memory); use two GPUs "
+        "([lab] gpu = 'H100:2'), a larger GPU, or engine = 'hf'"
+    )
+
+
+def supported_archs(python: str = VLLM_PYTHON) -> set[str] | None:
+    """Architectures this vLLM build serves (``None``: it could not be asked). Read from
+    ``wspx-archs.json`` beside the vLLM environment when the image wrote one, else asked."""
+    baked = Path(python).parent.parent / "wspx-archs.json"
+    cache = Path(tempfile.gettempdir()) / "wspx-vllm-archs.json"
+    for f in (baked, cache):
+        if f.is_file():
+            try:
+                return set(json.loads(f.read_text()))
+            except ValueError:
+                pass
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    code = (
+        "import json; from vllm import ModelRegistry; "
+        "print(json.dumps(sorted(ModelRegistry.get_supported_archs())))"
+    )
+    try:
+        out = subprocess.run(
+            [python, "-P", "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            env=env,
+            check=False,
         )
-    return p
+        archs = json.loads(out.stdout.strip().splitlines()[-1])
+    except Exception:
+        return None
+    with contextlib.suppress(OSError):
+        cache.write_text(json.dumps(archs))
+    return set(archs)
+
+
+def can_serve(source: Path, *, python: str = VLLM_PYTHON) -> tuple[bool, str]:
+    """Whether vLLM can serve this checkpoint with wspx's edits reaching it, and if not why."""
+    if not torch.cuda.is_available():
+        return False, "there is no GPU"
+    if not Path(python).exists():
+        return False, "this lab image has no vLLM (the vLLM lab image does)"
+    config_file = Path(source) / "config.json"
+    if not config_file.is_file():
+        return False, "the model has no config.json (a custom module)"
+    config = json.loads(config_file.read_text())
+    model_type = config.get("model_type")
+    if model_type in UNSERVED:
+        return False, UNSERVED[model_type]
+    archs = list(config.get("architectures") or [])
+    known = supported_archs(python)
+    if known is not None and archs and not any(a in known for a in archs):
+        return False, f"this vLLM has no {archs[0]}"
+    from wspx.lab import served
+
+    why = served.unwritable(checkpoint.read_source(Path(source)))
+    if why:
+        return False, why
+    return True, ""
 
 
 def free_port() -> int:
@@ -250,8 +323,11 @@ class VLLMEngine(Engine):
         self.held = TreeState()
         """The state vLLM's weights are at (it loads the base checkpoint)."""
         self.syncs: list[dict[str, Any]] = []
-        self.full_resync = False
-        """Push every layer each time: for vLLM models whose loader takes only whole models."""
+        self.stale = False
+        """A push failed partway, so what vLLM holds is unknown: the next push sends every
+        layer."""
+        self.survival: dict[str, Any] = {}
+        """Adapter edits on tensors stored quantized, as vLLM serves them (merged)."""
         self.agreement: dict[str, Any] | None = None
         self.proc: subprocess.Popen[bytes] | None = None
         self.log = log
@@ -297,6 +373,7 @@ class VLLMEngine(Engine):
             "--max-num-seqs", str(self.settings.max_num_seqs),
             "--gpu-memory-utilization", f"{self.plan.memory:.3f}",
             "--weight-transfer-config", json.dumps({"backend": "ipc"}),
+            "--worker-extension-cls", EXTENSION_CLS,
             "--logprobs-mode", "processed_logprobs",
             "--generation-config", "auto",
             "--seed", "0",
@@ -305,20 +382,30 @@ class VLLMEngine(Engine):
             *(self._speculative() if self.settings.speculative else []),
             *self.settings.args,
         ]  # fmt: skip
+        # The worker and its extension run from a folder of their own: next to this file,
+        # ``import vllm`` would find wspx's ``vllm.py``, not vLLM.
+        worker = folder / "wspx_vllm_worker.py"
+        worker.write_text(WORKER.read_text())
+        (folder / "wspx_vllm_ext.py").write_text(EXTENSION.read_text())
         env = {
             **os.environ,
             **recipe_env,
             "CUDA_VISIBLE_DEVICES": str(self.plan.vllm_gpu),
             "VLLM_ALLOW_INSECURE_SERIALIZATION": "1",
+            # layer by layer: an update holds only the layers that changed, and vLLM puts
+            # back the ones it leaves out (direct reload takes whole models only)
+            "VLLM_RELOAD_MODE": "layerwise",
             "HF_HUB_OFFLINE": "1",
             "PYTHONNOUSERSITE": "1",
+            # only the extension: the lab's packages must not shadow vLLM's
+            "PYTHONPATH": str(folder),
         }
-        env.pop("PYTHONPATH", None)  # the lab's packages must not shadow vLLM's
         self.log = self.log or folder / "vllm.log"
         out = self.log.open("ab")
         cmd = [
             python,
-            str(WORKER),
+            "-P",
+            str(worker),
             "--port",
             str(port),
             "--token-file",
@@ -407,11 +494,28 @@ class VLLMEngine(Engine):
             )
         return live[name]
 
+    def _stored_value(
+        self, name: str, state: TreeState, live: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor] | None:
+        """A tensor stored quantized that has adapter edits: transformers runs them as a
+        side path, and vLLM gets the weight with them merged, in the stored format."""
+        served = self.tree.served
+        if served is None or name not in state.adapter:
+            return None
+        value = self._value(name, state, live)
+        encoded = served.encode(name, self.tree.base(name).to(value.device), value)
+        if encoded is None:
+            return None
+        parts, survival, _ = encoded
+        self.survival[name] = survival
+        out: dict[str, torch.Tensor] = parts
+        return out
+
     def sync(self) -> dict[str, Any] | None:
         """Push every layer whose tensors changed since the last push, then check agreement."""
         state = self.tree.state
         changed = self.dirty(state)
-        if not changed:
+        if not changed and not self.stale:
             return None
         served = self.tree.served
         if (
@@ -446,24 +550,25 @@ class VLLMEngine(Engine):
                 "adapter edits on this checkpoint"
             )
         touched = set(changed)
-        groups = (
-            list(self._groups)
-            if self.full_resync
-            else [g for g in self._groups if touched & set(g)]
-        )
+        groups = list(self._groups) if self.stale else [g for g in self._groups if touched & set(g)]
         live: dict[str, torch.Tensor] = dict(self.model.named_parameters())
         live.update(dict(self.model.named_buffers()))
         started = time.perf_counter()
 
         def chunks() -> Iterator[dict[str, torch.Tensor]]:
             for group in groups:
-                plain, stored = {}, {}
+                plain: dict[str, torch.Tensor] = {}
+                stored: dict[str, torch.Tensor] = {}
                 for n in group:
                     shape = tuple(live[n].shape)
                     if served is not None and served.quantized(n, shape):
                         # the checkpoint's own format: the edited codes, or the source's bytes
                         device = live[n].device
-                        stored.update(served.stored(n) or served.source_parts(n, shape, device))
+                        stored.update(
+                            self._stored_value(n, state, live)
+                            or served.stored(n)
+                            or served.source_parts(n, shape, device)
+                        )
                     else:
                         plain[n] = self._value(n, state, live)
                 # vLLM loads only the dtype the checkpoint stores (transformers widens some)
@@ -475,14 +580,10 @@ class VLLMEngine(Engine):
         version = self.state_key(state) or f"sync-{len(self.syncs) + 1}"
         try:
             sent = self.transport.send(self.http, chunks(), version)
-        except WspxError as exc:
-            if self.full_resync or "Missing checkpoint tensors" not in str(exc):
-                raise
-            # seen with vLLM's Inkling2: its loader takes only a whole model per update. The
-            # failed update left vLLM mid-reload; a full one (start → update → finish) mends it
-            self.full_resync = True
-            groups = list(self._groups)
-            sent = self.transport.send(self.http, chunks(), version)
+        except Exception:
+            self.stale = True
+            raise
+        self.stale = False
         self.held = state
         record = {
             "version": version,
@@ -676,7 +777,7 @@ class VLLMEngine(Engine):
         """Greedy answers from both engines on the same prompts: how many match exactly,
         how long they agree, and the KL of the first token over transformers' top 20."""
         self.sync()
-        batch = text.batch(prompts, next(self.model.parameters()).device)
+        batch = text.batch(prompts, device_of(self.model))
         with torch.no_grad():
             logits = analysis.forward(self.model, self.ir, batch.ids, batch.mask, batch.extra)
         top = sorted({int(i) for row in logits[:, -1].topk(AGREEMENT_TOP).indices for i in row})
