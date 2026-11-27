@@ -212,6 +212,25 @@ def _by_storage(params: dict[str, torch.Tensor]) -> dict[int, tuple[str, torch.T
     }
 
 
+def _live_match(
+    by_storage: dict[int, tuple[str, torch.Tensor]], w: torch.Tensor
+) -> tuple[str, torch.Tensor] | None:
+    """The expert tensor a 2-D matmul operand is a slice of, if its values are still where
+    they were found. Seen live on Inkling: a streamed layer's weights were freed after its
+    pass, the next layer's took the same address, and the earlier layer's parameter (a
+    placeholder again, stride 0) was taken for it."""
+    if w.dim() != 2:
+        return None
+    ptr = w.untyped_storage().data_ptr()
+    found = by_storage.get(ptr)
+    if found is None:
+        return None
+    param = found[1]
+    if param.untyped_storage().data_ptr() != ptr or param.dim() < 1 or param.stride(0) == 0:
+        return None
+    return found
+
+
 class _ExpertInputs(TorchDispatchMode):  # type: ignore[no-untyped-call]
     """Each expert's input to a 3-D expert tensor, seen where an op multiplies by one
     expert's slice (``F.linear(x, w[e])``): the slice is a view of the parameter, and its
@@ -243,7 +262,7 @@ class _ExpertInputs(TorchDispatchMode):  # type: ignore[no-untyped-call]
             return out
         tensors = [a for a in args if isinstance(a, torch.Tensor)]
         for w in tensors:
-            found = self.by_storage.get(w.untyped_storage().data_ptr()) if w.dim() == 2 else None
+            found = _live_match(self.by_storage, w)
             if found is None:
                 continue
             name, param = found
@@ -446,7 +465,7 @@ class _ExpertWrites(TorchDispatchMode):  # type: ignore[no-untyped-call]
             return out
         tensors = [a for a in args if isinstance(a, torch.Tensor)]
         for w in tensors:
-            found = self.by_storage.get(w.untyped_storage().data_ptr()) if w.dim() == 2 else None
+            found = _live_match(self.by_storage, w)
             if found is None:
                 continue
             name, param = found
