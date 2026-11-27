@@ -97,8 +97,13 @@ def _experts_shape(module: Any, param: Any) -> tuple[int, ...] | None:
     return None
 
 
+_EXPERT_TENSORS = tuple(f"{p}_{s}" for p in ("w13", "w2") for s in ("weight", "weight_scale"))
+
+
 def _patch_experts(cls: type) -> list[str]:
-    """Inkling2Experts: out of the layerwise reload, reloaded and repacked in place."""
+    """Inkling2Experts: out of the layerwise reload; an update gives its emptied tensors
+    their checkpoint shape again, and its processing repacks them into the kernel tensors
+    already in use."""
     import torch
 
     if getattr(cls, "_wspx_reload", False):
@@ -125,55 +130,66 @@ def _patch_experts(cls: type) -> list[str]:
     for name in ("_load_weight", "_load_block_scales", "_load_expert_shard"):
         if name in cls.__dict__:
             setattr(cls, name, with_room(cls.__dict__[name]))
-    cls._wspx_pwal = original_pwal  # type: ignore[attr-defined]
+
+    @functools.wraps(original_pwal)
+    def process_weights_after_loading(self: Any) -> None:
+        old = getattr(self, "humming", None)
+        empty = [n for n in _EXPERT_TENSORS if getattr(self, n).numel() == 0]
+        if old is not None and len(empty) == len(_EXPERT_TENSORS):
+            return  # repacked already, and no update loaded them again
+        if old is not None and empty:
+            raise RuntimeError(f"an update gave these experts only part of their tensors: {empty}")
+        original_pwal(self)
+        new = self.humming
+        if old is None or new is old:
+            return
+        for projection, tensors in new.tensors.items():
+            for key, tensor in tensors.items():
+                if tensor is None:
+                    continue
+                target = old.tensors[projection][key]
+                if target.shape != tensor.shape or target.dtype != tensor.dtype:
+                    raise RuntimeError(
+                        f"repacked {projection}.{key} is {tuple(tensor.shape)} {tensor.dtype}, "
+                        f"the one in use {tuple(target.shape)} {target.dtype}"
+                    )
+                target.copy_(tensor)
+        self.humming = old  # what the captured graphs read
+
+    cls.process_weights_after_loading = process_weights_after_loading  # type: ignore[attr-defined]
     cls._wspx_reload = True  # type: ignore[attr-defined]
     return [f"{cls.__module__}.{cls.__qualname__} (repacked in place)"]
 
 
-def _rebuild_experts(module: Any) -> None:
-    """Repack an update's experts and copy the result into the kernel tensors in use."""
-    old = getattr(module, "humming", None)
-    names = [f"{p}_{s}" for p in ("w13", "w2") for s in ("weight", "weight_scale")]
-    if old is None:  # kernels that read the checkpoint layout: loaded in place already
-        return
-    empty = [n for n in names if getattr(module, n).numel() == 0]
-    if empty:
-        raise RuntimeError(f"an update gave these experts only part of their tensors: {empty}")
-    type(module)._wspx_pwal(module)
-    new = module.humming
-    for projection, tensors in new.tensors.items():
-        for key, tensor in tensors.items():
-            if tensor is None:
-                continue
-            target = old.tensors[projection][key]
-            if target.shape != tensor.shape or target.dtype != tensor.dtype:
-                raise RuntimeError(
-                    f"repacked {projection}.{key} is {tuple(tensor.shape)} {tensor.dtype}, the "
-                    f"one in use {tuple(target.shape)} {target.dtype}"
-                )
-            target.copy_(tensor)
-    module.humming = old  # what the captured graphs read
-
-
-def _rederive(module: Any) -> None:
-    """Run a module's own weight processing again, copying derived tensors that it makes
-    anew into the ones already there (so captured graphs see them)."""
+def _in_place(cls: type) -> bool:
+    """A module's own weight processing, made to keep the tensors it derives: what it makes
+    anew is copied into the tensor already there (captured graphs hold its address)."""
     import torch
 
-    before = {k: v for k, v in vars(module).items() if isinstance(v, torch.Tensor)}
-    module.process_weights_after_loading()
-    for key, old in before.items():
-        new = getattr(module, key, None)
-        if not isinstance(new, torch.Tensor) or new is old:
-            continue
-        if new.shape == old.shape and new.dtype == old.dtype:
-            old.copy_(new)
-            setattr(module, key, old)
+    original = cls.__dict__.get("process_weights_after_loading")
+    if original is None or getattr(original, "_wspx", False):
+        return False
+
+    @functools.wraps(original)
+    def process_weights_after_loading(self: Any) -> Any:
+        before = {k: v for k, v in vars(self).items() if isinstance(v, torch.Tensor)}
+        out = original(self)
+        for key, old in before.items():
+            new = getattr(self, key, None)
+            if not isinstance(new, torch.Tensor) or new is old:
+                continue
+            if new.shape == old.shape and new.dtype == old.dtype:
+                old.copy_(new)
+                setattr(self, key, old)
+        return out
+
+    process_weights_after_loading._wspx = True  # type: ignore[attr-defined]
+    cls.process_weights_after_loading = process_weights_after_loading  # type: ignore[attr-defined]
+    return True
 
 
 def _patch_finish() -> bool:
-    """After vLLM finishes an update: repack the experts it touched, and derive Inkling2's
-    other processed tensors again."""
+    """Clear what an update recorded when vLLM starts and finishes one."""
     from vllm.model_executor.model_loader import reload
 
     original = reload.finish_reload
@@ -184,39 +200,41 @@ def _patch_finish() -> bool:
     @functools.wraps(begin)
     def start_reload(model: Any) -> Any:
         SENT.clear()
+        _TOUCHED.clear()
         return begin(model)
-
-    reload.start_reload = start_reload
 
     @functools.wraps(original)
     def finish_reload(model: Any, model_config: Any, device: Any) -> Any:
-        out = original(model, model_config, device)
+        out = original(model, model_config, device)  # reruns modules' own processing
         SENT.clear()
-        touched, _TOUCHED[:] = list(_TOUCHED), []
-        for module in touched:
-            _rebuild_experts(module)
-        for module in model.modules():
-            cls = type(module)
-            if (
-                cls.__module__.startswith("vllm.models.inkling2")
-                and "process_weights_after_loading" in cls.__dict__
-                and not getattr(cls, "_wspx_reload", False)
-                and getattr(module, "quant_method", None) is None
-            ):
-                _rederive(module)
+        _TOUCHED.clear()
         return out
 
     finish_reload._wspx = True  # type: ignore[attr-defined]
+    reload.start_reload = start_reload
     reload.finish_reload = finish_reload
     return True
 
 
 def patch_reload() -> list[str]:
+    import importlib
+    import inspect
+    import pkgutil
+
     try:
         from vllm.models.inkling2.nvidia.moe import Inkling2Experts
     except Exception:
         return []
     done = _patch_experts(Inkling2Experts)
+    package = importlib.import_module("vllm.models.inkling2.nvidia")
+    for info in pkgutil.iter_modules(package.__path__):
+        try:
+            module = importlib.import_module(f"{package.__name__}.{info.name}")
+        except Exception:
+            continue
+        for _, cls in inspect.getmembers(module, inspect.isclass):
+            if cls.__module__ == module.__name__ and cls is not Inkling2Experts and _in_place(cls):
+                done.append(f"{cls.__module__}.{cls.__qualname__} (derived in place)")
     _patch_finish()
     return done
 

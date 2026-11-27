@@ -378,7 +378,8 @@ def _requant_scaled(
     d = delta.float().to(w.device)
     shape = (int(w.shape[0]), int(w.shape[1]))
     ids = _unit_ids(fmt, s, shape)
-    x = w.float() * _scale_map(fmt, s, shape) + d
+    was = w.float() * _scale_map(fmt, s, shape)
+    x = torch.where(d != 0, was + d, was)  # untouched values exactly (-0 stays -0)
     hit_units = torch.zeros(s.numel(), dtype=torch.bool, device=w.device)
     hit_units[ids[d.ne(0)]] = True
     limit = FP8_MAX if fmt.kind == "fp8" else 127.0
@@ -517,7 +518,8 @@ def _requant_mxfp4(
     hit_n = values = clipped = 0
     for e in d_all.flatten(1).ne(0).any(1).nonzero().flatten().tolist():
         b_e, s_e, d = blocks[e].to(dev), scales[e].to(dev), d_all[e].to(dev)
-        x = _mxfp4_decode(b_e, s_e) + d
+        was = _mxfp4_decode(b_e, s_e)
+        x = torch.where(d != 0, was + d, was)  # untouched values exactly (-0 stays -0)
         xb = _blocks(x, 32)  # [out, nb, 32]
         hit = _blocks(d, 32).ne(0).any(-1)
         peak = xb.abs().amax(-1)

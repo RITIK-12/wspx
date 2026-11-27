@@ -442,11 +442,16 @@ def test_experts_that_repack_and_empty_their_weights_reload_in_place() -> None:
         assert m in vllm_ext._TOUCHED
         active["on"] = False
         vllm_ext._TOUCHED.clear()
-        vllm_ext._rebuild_experts(m)
+        m.process_weights_after_loading()  # vLLM reruns it when the update finishes
         assert m.humming is in_use  # the object the graphs read
         assert in_use.tensors["w2"]["weight"].data_ptr() == address
         assert torch.equal(in_use.tensors["w2"]["weight"], torch.full((2, 64, 32), 6.0))
         assert m.w13_weight.numel() == 0  # emptied again
+        untouched = Experts()
+        untouched.process_weights_after_loading()
+        kept = untouched.humming
+        untouched.process_weights_after_loading()  # nothing loaded since: left as it is
+        assert untouched.humming is kept
     finally:
         if saved is None:
             sys.modules.pop("vllm.model_executor.model_loader.reload", None)

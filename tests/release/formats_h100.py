@@ -43,7 +43,8 @@ CASES = [
     ("nvidia--Qwen3-8B-FP4", [_scale("modelopt nvfp4: L18 down_proj", "L18.mlp.down_proj")]),
     (
         "openai--gpt-oss-20b",
-        [_scale("mxfp4 experts 0-3 of L12", "L12.mlp.experts.down_proj[0:4]")],
+        # x1.1 rounds back to every E2M1 value (refused, rightly); x1.5 lands on the grid
+        [_scale("mxfp4 experts 0-3 of L12", "L12.mlp.experts.down_proj[0:4]", 1.5)],
     ),
 ]
 

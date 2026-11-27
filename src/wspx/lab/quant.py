@@ -334,7 +334,8 @@ def requantize(
     for e in touched_experts:
         w_e, s_e, d_e = weight[e].to(dev), scale[e].to(dev), d[e].to(dev)
         f = (factor[e] if factor.numel() > 1 else factor[0]).to(dev)
-        x = (nvfp4_decode(w_e, s_e, f) if fmt.kind == "nvfp4" else mxfp8_decode(w_e, s_e)) + d_e
+        was = nvfp4_decode(w_e, s_e, f) if fmt.kind == "nvfp4" else mxfp8_decode(w_e, s_e)
+        x = torch.where(d_e != 0, was + d_e, was)  # untouched values exactly (-0 stays -0)
         hit = _blocks(d_e, n).ne(0).any(-1)  # (rows, blocks)
         if fmt.kind == "nvfp4" and not keep_scales and per_expert and amax is not None:
             peak = float(x.abs().max())
