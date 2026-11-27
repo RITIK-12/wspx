@@ -325,3 +325,88 @@ def test_the_extension_lets_strict_loaders_take_part_of_a_checkpoint() -> None:
                 sys.modules.pop(k, None)
             else:
                 sys.modules[k] = v
+
+
+def test_experts_that_repack_and_empty_their_weights_reload_in_place() -> None:
+    """Inkling2's experts repack their checkpoint tensors into kernel tensors and empty
+    them; vLLM's layerwise reload cannot redo that. The extension gives an emptied tensor
+    its shape back when an update loads it, repacks after the update, and copies the result
+    into the kernel tensors in use (captured CUDA graphs hold their addresses)."""
+    import sys
+    import types
+
+    from wspx.lab.engines import vllm_ext
+
+    active = {"on": False}
+    reload = types.ModuleType("vllm.model_executor.model_loader.reload")
+    reload.weight_update_active = lambda: active["on"]  # type: ignore[attr-defined]
+    saved = sys.modules.get("vllm.model_executor.model_loader.reload")
+    sys.modules["vllm.model_executor.model_loader.reload"] = reload
+
+    class Humming:
+        def __init__(self, m: torch.nn.Module) -> None:
+            self.tensors = {
+                p: {
+                    "weight": getattr(m, f"{p}_weight") * 2,
+                    "scale": getattr(m, f"{p}_weight_scale") + 1,
+                }
+                for p in ("w13", "w2")
+            }
+
+    class Experts(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.nvfp4, self.num_experts = False, 2
+            self.shapes = ((8, 64), (64, 32))
+            for p, (n, k) in zip(("w13", "w2"), self.shapes, strict=True):
+                self.register_parameter(
+                    f"{p}_weight", torch.nn.Parameter(torch.zeros(2, n, k), requires_grad=False)
+                )
+                self.register_parameter(
+                    f"{p}_weight_scale",
+                    torch.nn.Parameter(torch.zeros(2, n, k // 32), requires_grad=False),
+                )
+            self.humming: Humming | None = None
+
+        def _load_weight(self, param: torch.Tensor, loaded: torch.Tensor) -> None:
+            param.data.copy_(loaded)
+
+        def _load_block_scales(self, param: torch.Tensor, loaded: torch.Tensor) -> None:
+            param.data.copy_(loaded)
+
+        def process_weights_after_loading(self) -> None:
+            self.humming = Humming(self)
+            for p in ("w13", "w2"):
+                for s in ("weight", "weight_scale"):
+                    t = getattr(self, f"{p}_{s}")
+                    t.data = t.data.new_empty((0,))
+
+    try:
+        vllm_ext._patch_experts(Experts)
+        assert Experts._skip_layerwise_reload  # type: ignore[attr-defined]
+        m = Experts()
+        m.process_weights_after_loading()  # cold start
+        assert m.humming is not None
+        in_use = m.humming
+        address = in_use.tensors["w2"]["weight"].data_ptr()
+        active["on"] = True
+        new: dict[str, torch.Tensor] = {}
+        for p, (n, k) in zip(("w13", "w2"), m.shapes, strict=True):
+            new[f"{p}_weight"] = torch.full((2, n, k), 3.0)
+            new[f"{p}_weight_scale"] = torch.full((2, n, k // 32), 3.0)
+        for name, value in new.items():
+            loader = m._load_block_scales if "scale" in name else m._load_weight
+            loader(getattr(m, name), value)
+        assert m in vllm_ext._TOUCHED
+        active["on"] = False
+        vllm_ext._TOUCHED.clear()
+        vllm_ext._rebuild_experts(m)
+        assert m.humming is in_use  # the object the graphs read
+        assert in_use.tensors["w2"]["weight"].data_ptr() == address
+        assert torch.equal(in_use.tensors["w2"]["weight"], torch.full((2, 64, 32), 6.0))
+        assert m.w13_weight.numel() == 0  # emptied again
+    finally:
+        if saved is None:
+            sys.modules.pop("vllm.model_executor.model_loader.reload", None)
+        else:
+            sys.modules["vllm.model_executor.model_loader.reload"] = saved

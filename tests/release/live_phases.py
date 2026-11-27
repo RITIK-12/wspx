@@ -144,9 +144,14 @@ def run(model: str, edits: list[dict[str, Any]], out: str) -> None:
             _maxdiff(first, _first_token(engine, lab, watch)), 5
         )
         report["syncs"] = engine.syncs
+        report["notes"] = list(engine.notes)
         engine.close()
     except Exception:
         report["error"] = traceback.format_exc()[-6000:]
+        engine_ = locals().get("engine")
+        if engine_ is not None:
+            report["incomplete"] = getattr(engine_.transport, "reported", None)
+            report["notes"] = list(engine_.notes)
     log = work / "vllm.log"
     if log.exists():
         lines = log.read_text(errors="replace").splitlines()

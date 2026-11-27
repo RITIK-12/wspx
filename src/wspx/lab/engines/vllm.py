@@ -93,6 +93,8 @@ class IPCTransport(Transport):
 
     device: torch.device
     _inited: bool = False
+    reported: list[str] = field(default_factory=list)
+    """The modules vLLM last reported as given only part of their tensors."""
 
     def send(
         self,
@@ -113,6 +115,7 @@ class IPCTransport(Transport):
                 missing = _incomplete(http)
                 if not missing:
                     break
+                self.reported = missing
                 if used == len(more):
                     raise WspxError(
                         "vLLM has only part of the tensors of "
@@ -693,10 +696,12 @@ class VLLMEngine(Engine):
             raise
         if used:
             self.with_outside = True
+            seen = ", ".join(getattr(self.transport, "reported", [])[:3])
             if used == 1:
                 self.notes.append(
-                    "vLLM maps tensors kept outside the layer stack into every layer: each "
-                    "push sends them too"
+                    "vLLM maps tensors kept outside the layer stack into every layer"
+                    + (f" ({seen})" if seen else "")
+                    + ": each push sends them too"
                 )
         self.stale = False
         self.held = state
