@@ -114,6 +114,7 @@ class Code(StrEnum):
     NON_FINITE = "E107"
     DTYPE_OVERFLOW = "E108"
     QUANTIZED_NEEDS_ADAPTER = "E109"
+    QUANT_LOST = "E110"
     # static warnings
     TIED_WEIGHT = "W101"
     READER_NOT_WRITER = "W102"
@@ -124,6 +125,7 @@ class Code(StrEnum):
     SPECTRUM_SHIFT = "W202"
     SUB_ULP = "W203"
     DENSE_EDIT = "W204"
+    QUANT_SURVIVAL = "W205"
     # smoke warnings
     CANARY_KL = "W301"
     PERPLEXITY = "W302"

@@ -61,6 +61,7 @@ def open_lab(
     trust_remote_code: bool = False,
     workdir: str | Path | None = None,
     processor: Any = None,
+    source_dir: str | Path | None = None,
 ) -> Lab:
     """Load (or take) a model, build or reuse its IR from the store, and open a session.
 
@@ -71,7 +72,7 @@ def open_lab(
     base_reader = None
     hashes = None
     fingerprint = None
-    source_dir = None
+    source_dir = Path(source_dir) if source_dir is not None else None
     if isinstance(model, str):
         from wspx.lab.loader import load_hf
 

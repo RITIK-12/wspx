@@ -181,6 +181,7 @@ exclude = ["data/raw"]      # kept out of the upload, on top of .git, venvs, cac
 [model]
 id = "Qwen/Qwen3-0.6B"
 dtype = "bfloat16"
+quant_scales = "refit"      # stored NVFP4/MXFP8: edits are written in that format; or "keep"
 
 [driver]
 model = "anthropic:claude-opus-5-5"

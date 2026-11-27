@@ -37,11 +37,17 @@ def export_merged(
     source: Path | None = None,
     tokenizer: Any = None,
     processor: Any = None,
+    served: Any = None,
     shard_bytes: int = SHARD_BYTES,
 ) -> dict[str, Any]:
     """Sharded safetensors of the live weights under the checkpoint's own names and layouts
     (what transformers renamed or fused on load is turned back), plus every non-weight file
-    of the source checkpoint: config, tokenizer, chat template, processor."""
+    of the source checkpoint: config, tokenizer, chat template, processor.
+
+    With ``served`` (a checkpoint stored quantized, :mod:`wspx.lab.served`), tensors stored
+    quantized are written in their format: edited ones as the lab requantized them, the
+    rest as the source's own bytes. A tensor kept in promote mode is written in its loaded
+    dtype, and ``hf_quant_config.json`` lists it so."""
     out.mkdir(parents=True, exist_ok=True)
     for stale in out.glob("*.safetensors"):
         stale.unlink()
@@ -54,7 +60,23 @@ def export_merged(
         if t.dtype == torch.float32 and ir.params.get(n) and ir.params[n].dtype != "float32"
     ]
     src = checkpoint.read_source(source)
-    dequantized = bool(src and src.quantized and getattr(model, "hf_quantizer", None) is None)
+    dequantized = bool(
+        src and src.quantized and getattr(model, "hf_quantizer", None) is None and served is None
+    )
+    stored: list[dict[str, torch.Tensor]] = []
+    kept_bf16: list[str] = []
+    if served is not None:
+        for name in sorted(live):
+            shape = tuple(live[name].shape)
+            if not served.quantized(name, shape):
+                continue
+            if name in promoted:  # exact in fp32 here: written in the loaded dtype instead
+                kept_bf16 += served.checkpoint_names(name, shape)
+                live[name] = live[name].to(_dtype(ir.params[name].dtype))
+                continue
+            parts = served.stored(name) or served.source_parts(name, shape, torch.device("cpu"))
+            stored.append({k: v.detach().cpu().contiguous() for k, v in parts.items()})
+            del live[name]
     written: dict[str, tuple[str, tuple[int, ...]]] = {}
     shards: list[list[str]] = []
     weight_map: dict[str, str] = {}
@@ -69,7 +91,7 @@ def export_merged(
             shards.append(sorted(pending))
             pending, size = {}, 0
 
-    for batch in checkpoint.stream(model, live):
+    for batch in [*stored, *checkpoint.stream(model, live)]:
         for name, t in batch.items():
             nbytes = t.numel() * t.element_size()
             if pending and size + nbytes > shard_bytes:
@@ -100,12 +122,19 @@ def export_merged(
     _copy_configs(
         model, out, src, dequantized=dequantized, tokenizer=tokenizer, processor=processor
     )
+    if kept_bf16:
+        _requant_config(out, kept_bf16)
     if extras:
         warnings.append(f"copied unedited (not part of the loaded model): {', '.join(extras)}")
     if promoted:
         warnings.append(
             f"{len(promoted)} tensor(s) stored in fp32 (promote mode); runtimes that cast the "
             f"whole model to one dtype will round them: {', '.join(promoted[:4])}"
+        )
+    if kept_bf16:
+        warnings.append(
+            f"{len(kept_bf16)} tensor(s) stored quantized are written in bf16 (promote mode), "
+            f"and hf_quant_config.json lists them so: {', '.join(kept_bf16[:3])}"
         )
     if src and dequantized:
         lowered = sorted(
@@ -121,7 +150,9 @@ def export_merged(
             "quantization config is left out, so loaders read the export unquantized"
         )
     if src:
-        warnings += checkpoint.compare(written, src, dequantized=dequantized)
+        warnings += checkpoint.compare(
+            written, src, dequantized=dequantized, unquantized=set(kept_bf16)
+        )
     return {
         "path": str(out),
         "files": files,
@@ -129,6 +160,43 @@ def export_merged(
         "warnings": warnings,
         "names": "checkpoint" if src and src.tensors else "loaded",
     }
+
+
+def _dtype(name: str) -> torch.dtype:
+    dtype: torch.dtype = getattr(torch, name)
+    return dtype
+
+
+def _requant_config(out: Path, kept: list[str]) -> None:
+    """Move tensors written unquantized out of their group in ``hf_quant_config.json``."""
+    path = out / "hf_quant_config.json"
+    if not path.is_file():
+        return
+    config = json.loads(path.read_text())
+    groups = config.get("model", {}).get("parameter_groups", [])
+    moved = set(kept)
+    for g in groups:
+        g["tensors"] = [t for t in g.get("tensors", []) if t not in moved]
+    plain = next(
+        (
+            g
+            for g in groups
+            if g.get("compute_dtype") == "bfloat16" and not g.get("weight_block_shape")
+        ),
+        None,
+    )
+    if plain is None:
+        plain = {
+            "compute_dtype": "bfloat16",
+            "output_dtype": "bfloat16",
+            "required_activation_quantization": None,
+            "tensors": [],
+            "weight_block_shape": [],
+            "weight_transform": "cast",
+        }
+        groups.append(plain)
+    plain["tensors"] = sorted({*plain["tensors"], *moved})
+    path.write_text(json.dumps(config, indent=2) + "\n")
 
 
 def _persistent_buffers(model: torch.nn.Module) -> set[str]:

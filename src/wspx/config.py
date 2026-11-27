@@ -78,6 +78,9 @@ class ModelSection(_Section):
     revision: str | None = None
     dtype: Literal["bfloat16", "float16", "float32", "auto"] = "bfloat16"
     trust_remote_code: bool = False
+    quant_scales: Literal["refit", "keep"] = "refit"
+    """For a checkpoint stored quantized: edits re-fit the scales of the blocks they touch,
+    or keep each block's scale and change only its codes."""
     code: str | None = None
     """Custom architecture, e.g. ``"git+https://…#pkg.module:Class"`` or ``"pkg.module:Class"``."""
 
@@ -137,6 +140,9 @@ class CheckSection(_Section):
     subulp_error_at: float = Field(default=0.5, gt=0, le=1)
     warn_dense_fraction: float = Field(default=0.05, gt=0, le=1)
     max_ppl_increase: float = Field(default=0.10, gt=0)
+    min_quant_survival: float = Field(default=0.25, ge=0, le=1)
+    """An edit to a tensor stored quantized is refused when less than this share of it
+    (by norm) survives the format."""
 
 
 class TestsSection(_Section):

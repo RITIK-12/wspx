@@ -415,16 +415,26 @@ class VLLMEngine(Engine):
         changed = self.dirty(state)
         if not changed:
             return None
+        served = self.tree.served
         if (
-            self.src is not None
+            served is None
+            and self.src is not None
             and self.src.quantized
             and getattr(self.model, "hf_quantizer", None) is None
         ):
             method = (self.src.quantization or {}).get("quant_method", "quantized")
             raise WspxError(
-                f"vLLM serves this checkpoint {method}, and wspx cannot yet write edits in that "
-                "format, so the edit cannot reach vLLM; use engine = 'hf', or a bf16 checkpoint"
+                f"vLLM serves this checkpoint {method} in a format wspx cannot write edits "
+                "in, so the edit cannot reach vLLM; use engine = 'hf'"
             )
+        if served is not None:
+            for name in changed:
+                shape = tuple(dict(self.model.named_parameters())[name].shape)
+                if name in state.promote and served.quantized(name, shape):
+                    raise WspxError(
+                        f"{name} is kept exact in bf16 (promote mode), and vLLM holds it in the "
+                        "checkpoint's quantized format; edit it merged, or use engine = 'hf'"
+                    )
         touched = set(changed)
         groups = [g for g in self._groups if touched & set(g)]
         live: dict[str, torch.Tensor] = dict(self.model.named_parameters())
@@ -433,8 +443,16 @@ class VLLMEngine(Engine):
 
         def chunks() -> Iterator[dict[str, torch.Tensor]]:
             for group in groups:
-                values = {n: self._value(n, state, live) for n in group}
-                yield checkpoint.to_checkpoint(self.model, values)
+                plain, stored = {}, {}
+                for n in group:
+                    shape = tuple(live[n].shape)
+                    if served is not None and served.quantized(n, shape):
+                        # the checkpoint's own format: the edited codes, or the source's bytes
+                        device = live[n].device
+                        stored.update(served.stored(n) or served.source_parts(n, shape, device))
+                    else:
+                        plain[n] = self._value(n, state, live)
+                yield {**checkpoint.to_checkpoint(self.model, plain), **stored}
 
         version = self.state_key(state) or f"sync-{len(self.syncs) + 1}"
         sent = self.transport.send(self.http, chunks(), version)

@@ -99,6 +99,10 @@ class WorkingTree:
         self._hashes: dict[str, str] = {}
         self._deltas: dict[str, TensorDelta] = {}
         self._hooks: dict[str, list[Any]] = {}
+        self.served: Any = None
+        """:class:`wspx.lab.served.Served` when the checkpoint stores tensors quantized that
+        the model holds dequantized: merged edits on them are written in that format, and
+        the live weights are what loading it gives."""
 
     # ------------------------------------------------------------------ deltas
 
@@ -205,6 +209,13 @@ class WorkingTree:
             promote = name in state.promote
             dtype = torch.float32 if promote else self._dtype[name]
             new = materialize(self.base(name), deltas, dtype=dtype)
+            shape = tuple(self.params[name].shape)
+            if self.served is not None and self.served.quantized(name, shape):
+                if promote:  # kept exact in bf16; the stored format no longer applies
+                    self.served.parts.pop(name, None)
+                    self.served.last.pop(name, None)
+                else:
+                    new = self.served.apply(name, self.base(name), new)
             self._write(name, new, promote=promote)
             self._hashes.pop(name, None)
             changed.append(name)

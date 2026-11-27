@@ -47,6 +47,56 @@ def to_checkpoint(
     return out
 
 
+def from_checkpoint(
+    model: torch.nn.Module, tensors: dict[str, torch.Tensor]
+) -> dict[str, torch.Tensor]:
+    """Checkpoint names and layouts → in-memory ones, the way loading converts them (renamings,
+    then at most one converter per key; quantized experts are dequantized as on load)."""
+    if not tensors or not _converts(model):
+        return dict(tensors)
+    from copy import deepcopy
+
+    from transformers.core_model_loading import (
+        PrefixChange,
+        WeightConverter,
+        WeightRenaming,
+        dot_natural_key,
+        rename_source_key,
+    )
+
+    conversions = getattr(model, "_weight_conversions", None)
+    if conversions is None:
+        from transformers.conversion_mapping import get_model_conversion_mapping
+
+        conversions = get_model_conversion_mapping(model, add_legacy=False)  # type: ignore[arg-type]
+        conversions = [c for c in conversions if not isinstance(c, PrefixChange)]
+    conversions = deepcopy(list(conversions))  # renamings keep state between keys
+    renamings = [c for c in conversions if isinstance(c, WeightRenaming)]
+    converters = [c for c in conversions if isinstance(c, WeightConverter)]
+    by_pattern = {k: c for c in converters for k in c.source_patterns}
+    pending: dict[str, Any] = {}
+    for key, tensor in sorted(tensors.items(), key=lambda kv: dot_natural_key(kv[0])):
+        renamed, pattern = rename_source_key(key, renamings, converters)
+        if pattern is not None:
+            transform = pending.setdefault(renamed, deepcopy(by_pattern[pattern]))
+        else:
+            transform = pending.setdefault(renamed, WeightRenaming(key, renamed))
+            pattern = key
+        transform.add_tensor(renamed, key, pattern, tensor)
+    out: dict[str, torch.Tensor] = {}
+    for first, transform in pending.items():
+        realized = transform.convert(first, model=model, config=model.config)
+        for name, value in realized.items():
+            out[name] = value[0] if isinstance(value, list) else value
+    return out
+
+
+def names_in_checkpoint(model: torch.nn.Module, name: str, shape: tuple[int, ...]) -> list[str]:
+    """The checkpoint tensors one in-memory tensor is stored as (no data is touched)."""
+    meta = torch.empty(shape, device="meta")
+    return sorted(to_checkpoint(model, {name: meta}))
+
+
 def groups(names: list[str]) -> list[list[str]]:
     """Names grouped by layer (everything outside a layer stack is one group), so a
     conversion that combines tensors sees all of them, one layer's worth at a time."""
@@ -152,11 +202,23 @@ def st_dtype(t: torch.Tensor) -> str:
 
 
 def compare(
-    written: dict[str, tuple[str, tuple[int, ...]]], src: Source, *, dequantized: bool
+    written: dict[str, tuple[str, tuple[int, ...]]],
+    src: Source,
+    *,
+    dequantized: bool,
+    unquantized: set[str] = frozenset(),  # type: ignore[assignment]
 ) -> list[str]:
-    """How the written tensors differ from the source checkpoint's, as warnings."""
+    """How the written tensors differ from the source checkpoint's, as warnings.
+    ``unquantized``: quantized source tensors deliberately written unquantized."""
     if not src.tensors:
         return []
+    skip = {
+        f"{n}{suffix}"
+        for n in unquantized
+        for suffix in ("", "_scale", "_amax", "_outer_scale_denominator")
+    }
+    written = {k: v for k, v in written.items() if k not in skip}
+    src = Source(src.path, {k: v for k, v in src.tensors.items() if k not in skip})
     out = []
     missing = sorted(
         k for k in set(src.tensors) - set(written) if not (dequantized and QUANT_AUX.search(k))

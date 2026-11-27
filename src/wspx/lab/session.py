@@ -28,7 +28,7 @@ from safetensors.torch import save as st_save
 
 from wspx.addressing import HandleKind, make_slug, parse_handle
 from wspx.config import WspxConfig
-from wspx.diagnostics import Code, Report, diag
+from wspx.diagnostics import Code, Fix, Report, Severity, diag
 from wspx.errors import (
     AddressError,
     CheckFailed,
@@ -62,6 +62,7 @@ from wspx.lab.model_io import ModelIO
 from wspx.lab.ops import OpContext
 from wspx.lab.patch import TensorDelta, materialize
 from wspx.lab.probe import Probe
+from wspx.lab.served import Served
 from wspx.lab.tensors import normalize_index, select, tensor_hash
 from wspx.lab.text import Prompt, Text
 from wspx.lab.tree import TreeState, WorkingTree
@@ -147,6 +148,9 @@ class Lab:
         self.text.io = self.io
         self.tree = WorkingTree(
             model, ir, load_delta=self._load_delta, base_reader=base_reader, cache_bytes=cache_bytes
+        )
+        self.tree.served = Served.open(
+            model, source_dir, keep_scales=self.config.model.quant_scales == "keep"
         )
         self.probe = Probe(model, ir)
         self.handles = HandleTable()
@@ -988,7 +992,9 @@ class Lab:
                 script=self._script,
             )
         )
+        before = self.tree.state
         self.tree.stage(deltas, precision)
+        self._survival(deltas, before, report)
         self.staged.append(record)
         targets = sorted({_display(self.ir, d.tensor) for d in deltas})
         slug = make_slug(op, targets[0] if len(targets) == 1 else f"{len(targets)}-tensors")
@@ -1003,6 +1009,45 @@ class Lab:
         )
         self._save()
         return PatchRef(self, f"{record.handle}:{slug}", record, report)
+
+    def _survival(self, deltas: list[TensorDelta], before: TreeState, report: Any) -> None:
+        """How much of an edit to a tensor stored quantized survived its format; refused
+        (and unstaged) below ``[check] min_quant_survival``."""
+        served = self.tree.served
+        if served is None:
+            return
+        for name in sorted({d.tensor for d in deltas}):
+            s = served.last.get(name)
+            if s is None:
+                continue
+            target = _display(self.ir, name)
+            promote = Fix(
+                title='precision="promote" keeps it exact in bf16', action={"precision": "promote"}
+            )
+            if s.ratio < self.config.check.min_quant_survival:
+                self.tree.checkout(before)
+                raise CheckFailed(
+                    [
+                        diag(
+                            Code.QUANT_LOST,
+                            f"the edit mostly vanishes on the stored {s.format} grid: {s.describe()}",
+                            target=target,
+                            fixes=[promote],
+                            **s.to_dict(),
+                        )
+                    ]
+                )
+            severity = Severity.INFO if s.ratio >= 0.9 and s.cosine >= 0.99 else Severity.WARNING
+            report.diagnostics.append(
+                diag(
+                    Code.QUANT_SURVIVAL,
+                    s.describe(),
+                    target=target,
+                    severity=severity,
+                    fixes=[] if severity == Severity.INFO else [promote],
+                    **s.to_dict(),
+                )
+            )
 
     def _expand_unit_handles(self, args: dict[str, Any]) -> dict[str, Any]:
         """``cols=@r1`` (or a GrepHits) narrows each target to the result set's units for that weight."""
@@ -2038,6 +2083,7 @@ class Lab:
             "source": self.source_dir,
             "tokenizer": self.text.tokenizer,
             "processor": self.processor,
+            "served": self.tree.served,
         }
         if kind == "merged":
             info = export.export_merged(self.model, self.ir, out, **files)
