@@ -152,7 +152,7 @@ mypy_path = "src"
 packages = ["wspx"]
 
 [[tool.mypy.overrides]]
-module = ["modal.*", "gguf.*", "pyarrow.*", "peft.*", "accelerate.*", "av.*", "PIL.*"]
+module = ["modal.*", "gguf.*", "pyarrow.*", "peft.*", "accelerate.*", "av.*", "PIL.*", "vllm.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import (
@@ -88,6 +88,7 @@ class NewSession(BaseModel):
     revision: str | None = None
     dtype: str = "bfloat16"
     trust_remote_code: bool = False
+    engine: Literal["hf", "vllm"] = "hf"
     grace_s: float = Field(900.0, ge=0)
     keep_warm: str = "auto"
     project: str = ""

@@ -668,3 +668,19 @@ def test_the_same_result_is_the_same_diagnostics_not_the_same_codes() -> None:
     assert outcome_of(staged)[1] == "W203"
     assert outcome_of("E105 nothing changed") == ("no-op edit", "no-op edit")
     assert outcome_of("all good") == ("", "")
+
+
+def test_a_vllm_session_needs_a_gpu_vllm_can_use() -> None:
+    """Refused at creation, not minutes later when the lab fails to start."""
+    from wspx.control.sessions import check_engine_gpu
+    from wspx.errors import WspxError
+
+    check_engine_gpu("hf", None)
+    check_engine_gpu("vllm", "H100:2")
+    check_engine_gpu("vllm", "a100-80gb")
+    with pytest.raises(WspxError, match="needs a GPU"):
+        check_engine_gpu("vllm", None)
+    with pytest.raises(WspxError, match=r"T4 has 7\.5"):
+        check_engine_gpu("vllm", "T4")
+    with pytest.raises(WspxError, match="unknown engine"):
+        check_engine_gpu("sglang", "H100")

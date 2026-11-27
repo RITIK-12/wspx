@@ -88,7 +88,31 @@ class DriverSection(_Section):
     """Tools the driver is not offered and may not call, e.g. ``["run", "export"]``."""
 
 
+class VllmSection(_Section):
+    """The vLLM engine (``[lab] engine = "vllm"``), run next to the lab on the same machine."""
+
+    memory: float | None = Field(default=None, gt=0, lt=1)
+    """Share of its GPU vLLM may use (weights, KV cache, graphs). Unset: planned at start
+    from what transformers already holds on that GPU."""
+    max_model_len: int = Field(default=8192, ge=256)
+    """Longest prompt plus answer, in tokens; it sets the KV cache vLLM reserves."""
+    max_num_seqs: int = Field(default=64, ge=1)
+    """Sequences decoded at once (continuous batching)."""
+    speculative: bool = False
+    """Use the checkpoint's draft heads (MTP), reporting their acceptance rate."""
+    args: list[str] = Field(default_factory=list)
+    """Further engine arguments, as on the ``vllm serve`` command line."""
+    agreement_prompts: int = Field(default=4, ge=0, le=32)
+    """Greedy prompts compared between transformers and vLLM at start and after each sync."""
+
+
 class LabSection(_Section):
+    engine: Literal["hf", "vllm"] = "hf"
+    """What generates: ``generate``, test suites, check's smoke prompts and ``run`` scripts'
+    batches. ``hf`` is transformers in the lab; ``vllm`` serves the same weights, so what is
+    tested is what vLLM serves. Probes (trace, activations, contrast, grep) always use
+    transformers."""
+    vllm: VllmSection = Field(default_factory=VllmSection)
     gpu: str | None = None
     """``None`` runs on CPU; otherwise a Modal GPU spec such as ``"H100"`` or ``"H100:8"``."""
     grace: Duration = 15 * 60

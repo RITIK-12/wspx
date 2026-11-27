@@ -156,6 +156,10 @@ class WorkingTree:
             evicted = self._cache.pop(victim)
             self._cache_used -= evicted.numel() * evicted.element_size()
 
+    def dtype_of(self, name: str) -> torch.dtype:
+        """The dtype ``name`` was loaded in (promote mode changes the live one to fp32)."""
+        return self._dtype[name]
+
     # ------------------------------------------------------------------ apply
 
     def preview(

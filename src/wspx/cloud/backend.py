@@ -72,7 +72,7 @@ class ModalBackend:
     def start_lab(
         self, record: SessionRecord, cancelled: Callable[[], bool] = lambda: False
     ) -> ModalLab:
-        from wspx.cloud.app import app, lab_image, models_volume
+        from wspx.cloud.app import app, lab_image, models_volume, vllm_lab_image
 
         path = self._fn("download").remote(record.model, record.revision)
         if cancelled():
@@ -103,7 +103,7 @@ class ModalBackend:
         sandbox = self.modal.Sandbox.create(
             *args,
             app=app,
-            image=lab_image,
+            image=vllm_lab_image if record.engine == "vllm" else lab_image,
             gpu=record.gpu,
             timeout=SANDBOX_MAX_S,
             idle_timeout=int(record.grace_s) + 120,  # a backstop: the control plane stops it first

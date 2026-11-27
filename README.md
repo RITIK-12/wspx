@@ -190,6 +190,11 @@ deny_tools = ["run"]        # tools the agent is not offered
 gpu = "L4"
 grace = "15m"               # keep the lab warm this long after the session goes idle
 max_gpu_time = "2h"         # then the session's agent and lab stop
+engine = "hf"               # or "vllm": generation (generate, tests, check, run batches) by vLLM
+
+[lab.vllm]                  # with engine = "vllm"; each edit reaches vLLM before it generates
+memory = 0.45               # share of its GPU; unset, planned from what transformers holds
+max_model_len = 8192
 
 [check]
 max_rel_norm = 0.05

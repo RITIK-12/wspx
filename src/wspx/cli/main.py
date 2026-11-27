@@ -308,6 +308,7 @@ def new(
             revision=revision or cfg.model.revision,
             dtype=cfg.model.dtype,
             trust_remote_code=trust_remote_code or cfg.model.trust_remote_code,
+            engine=cfg.lab.engine,
             grace_s=_duration(grace, "--grace") if grace else cfg.lab.grace,
             keep_warm=cfg.lab.keep_warm,
             project=project.name if project else "",

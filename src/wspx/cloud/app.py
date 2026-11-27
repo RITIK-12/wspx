@@ -118,6 +118,13 @@ control_image = _image("control")
 gateway_image = _image("gateway")
 driver_image = _image("driver")
 lab_image = _image("lab")
+VLLM_VERSION = "0.34.0"
+# vLLM pins its own torch and transformers, so it gets an environment of its own; the lab's
+# vLLM worker runs with /opt/vllm/bin/python and talks to the lab over localhost
+vllm_lab_image = lab_image.run_commands(
+    "python -m venv /opt/vllm",
+    f"/opt/vllm/bin/pip install --no-cache-dir vllm=={VLLM_VERSION}",
+).env({"WSPX_VLLM_PYTHON": "/opt/vllm/bin/python"})
 
 
 @app.function(

@@ -141,7 +141,13 @@ class LabServer:
             # event loop, and a heartbeat that times out makes the control plane think the lab
             # is gone. A busy lab renews its lease; that call's response carries the journal.
             if not self._lock.acquire(blocking=False):
-                return _JSON({"lease_expires": self.lease_expires, "busy": True})
+                return _JSON(
+                    {
+                        "lease_expires": self.lease_expires,
+                        "busy": True,
+                        "progress": self.lab.progress,
+                    }
+                )
             try:
                 journal, workspace = self.journal(), self.workspace()
             finally:
@@ -253,8 +259,23 @@ def main(argv: list[str] | None = None) -> None:
     workdir = Path(args.workdir)
     if args.snapshot:
         extract(store.objects.get(args.snapshot), workdir)
+    config = WspxConfig.discover(workdir)
+    engine_plan = None
+    if config.lab.engine == "vllm":  # where each engine runs is decided before either loads
+        from wspx.lab.engines.vllm import plan as plan_engine
+        from wspx.lab.loader import resolve_source
+
+        on_disk = sum(
+            f.stat().st_size
+            for f in resolve_source(args.model, local_only=True).glob("*.safetensors")
+        )
+        engine_plan = plan_engine(config.lab.vllm, checkpoint_bytes=on_disk)
     loaded = load_hf(
-        args.model, dtype=args.dtype, trust_remote_code=args.trust_remote_code, local_only=True
+        args.model,
+        dtype=args.dtype,
+        trust_remote_code=args.trust_remote_code,
+        local_only=True,
+        device=engine_plan.hf_device if engine_plan else None,
     )
     ir = _cached_ir(store, loaded.fingerprint)
     if ir is None:
@@ -274,16 +295,52 @@ def main(argv: list[str] | None = None) -> None:
         tokenizer=loaded.tokenizer,
         base_reader=loaded.base_reader if loaded.readable else None,
         workdir=workdir,
-        config=WspxConfig.discover(workdir),
+        config=config,
         processor=loaded.processor,
         scratch=bool(args.snapshot),
         source_dir=loaded.path,
     )
+    if engine_plan is not None and loaded.path is not None:
+        lab.engine = _start_vllm(lab, loaded, config, engine_plan, on_disk, args)
     server = LabServer(lab, lease_s=args.lease, token=os.environ.get("WSPX_LAB_TOKEN"))
     server.network = network_check()
     print(f"wspx lab: outbound network {server.network}", file=sys.stderr, flush=True)
     server.watchdog()
     uvicorn.run(server.app(), host="0.0.0.0", port=args.port, log_level="warning")
+
+
+def _start_vllm(
+    lab: Any, loaded: Any, config: Any, engine_plan: Any, on_disk: int, args: Any
+) -> Any:
+    """The vLLM worker beside this lab, once transformers holds its share of the GPU."""
+    import atexit
+
+    import torch
+
+    from wspx.lab.engines.vllm import VLLMEngine, plan
+
+    if engine_plan.hf_device is None:  # one GPU: plan again with what transformers took
+        engine_plan = plan(
+            config.lab.vllm, checkpoint_bytes=on_disk, hf_bytes=torch.cuda.memory_allocated(0)
+        )
+    print(engine_plan.describe(), file=sys.stderr, flush=True)
+    engine = VLLMEngine(
+        loaded.model,
+        tree=lab.tree,
+        ir=lab.ir,
+        source=loaded.path,
+        settings=config.lab.vllm,
+        plan=engine_plan,
+        state_key=lab.tree_key,
+        dtype=args.dtype,
+        trust_remote_code=args.trust_remote_code,
+        log=Path(lab.workdir) / ".wspx-vllm.log" if not lab.scratch else None,
+    )
+    atexit.register(engine.close)
+    if config.lab.vllm.agreement_prompts:
+        engine.ensure(lab.text)  # compared once at start, before anything is edited
+    print(engine.describe(), file=sys.stderr, flush=True)
+    return engine
 
 
 if __name__ == "__main__":

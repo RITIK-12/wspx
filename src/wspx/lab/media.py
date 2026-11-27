@@ -197,10 +197,16 @@ class Media:
         return Batch(ids.to(device), mask.to(device), extra)
 
     def _render(self, prompt: Mapping[str, Any]) -> tuple[str, list[Any], list[Any]]:
-        allowed = {"messages", "reply"}
+        allowed = {"messages", "reply", "template"}
         if set(prompt) - allowed:
             raise WspxError(
-                f"a media prompt takes 'messages' and 'reply' (got {sorted(set(prompt) - allowed)})"
+                "a media prompt takes 'messages', 'reply' and 'template' "
+                f"(got {sorted(set(prompt) - allowed)})"
+            )
+        settings = prompt.get("template") or {}
+        if not isinstance(settings, Mapping):
+            raise WspxError(
+                '\'template\' holds chat-template settings, e.g. {"reasoning_effort": "high"}'
             )
         messages = prompt.get("messages")
         if not isinstance(messages, list) or not messages:
@@ -238,6 +244,7 @@ class Media:
             tokenize=False,
             add_generation_prompt=not last_assistant,
             continue_final_message=last_assistant,
+            **dict(settings),
         )
         return str(text) + str(prompt.get("reply") or ""), images, videos
 

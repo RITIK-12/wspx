@@ -12,6 +12,7 @@ import torch
 
 from wspx.lab import analysis
 from wspx.lab.check import perplexity, token_kl
+from wspx.lab.engines import Engine
 from wspx.lab.ir.model_ir import ModelIR
 from wspx.lab.media import is_media
 from wspx.lab.text import Prompt, Text
@@ -47,8 +48,12 @@ class SuiteModel:
         ir: ModelIR,
         text: Text,
         at_base: Callable[[], AbstractContextManager[Any]],
+        *,
+        engine: Engine | None = None,
     ) -> None:
         self._model = model
+        self._engine = engine or Engine(model)
+        """Generation goes through the lab's engine; scoring (logits) runs on transformers."""
         self._ir = ir
         self._text = text
         self._at_base = at_base
@@ -70,13 +75,8 @@ class SuiteModel:
     def generate(
         self, prompt: Prompt, *, max_tokens: int = 64, temperature: float = 0.0, seed: int = 0
     ) -> str:
-        ids = analysis.generate(
-            self._model,
-            self._text,
-            [prompt],
-            max_tokens=max_tokens,
-            temperature=temperature,
-            seed=seed,
+        ids = self._engine.generate(
+            self._text, [prompt], max_tokens=max_tokens, temperature=temperature, seed=seed
         )[0]
         eos = self._text.eos_id
         if eos is not None and eos in ids:
@@ -102,8 +102,7 @@ class SuiteModel:
         stops = {eos} if eos is not None else set()
         stops |= set(_generation_eos(self._model))
         for start in range(0, len(prompts), max(1, batch_size)):
-            rows = analysis.generate_scored(
-                self._model,
+            rows = self._engine.generate_scored(
                 self._text,
                 list(prompts[start : start + batch_size]),
                 max_tokens=max_tokens,

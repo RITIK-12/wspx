@@ -110,6 +110,9 @@ class RunResult:
     cached: bool = False
     blind: bool = False
     """Aggregates only for the driver (a blind or held-out suite)."""
+    engine: dict[str, Any] = field(default_factory=dict)
+    """What generated the answers: engine, versions, GPU, and for vLLM its agreement with
+    transformers on the same weights."""
 
     @property
     def aggregate_only(self) -> bool:
@@ -282,8 +285,15 @@ def summary(
         + (f" · mean {measure} {result.mean_score:.3f}" if measure else "")
         + (f" · {unscored} without an answer" if unscored and measure else "")
         + (" · cached" if result.cached else f" · {result.seconds:.1f}s")
+        + (f" · vLLM {result.engine.get('vllm')}" if result.engine.get("engine") == "vllm" else "")
     )
     lines = [head]
+    agreement = result.engine.get("agreement") or {}
+    if agreement and agreement.get("exact", 0) < agreement.get("prompts", 0):
+        lines.append(
+            f"  ! vLLM and transformers agree on {agreement['exact']}/{agreement['prompts']} "
+            f"greedy canary answers at these weights (first-token KL {agreement.get('kl_first')})"
+        )
     slices = groups(result)
     if slices:
         lines.append(

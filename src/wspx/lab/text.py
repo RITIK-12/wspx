@@ -46,6 +46,8 @@ class Text:
         return out
 
     def ids(self, prompt: Prompt) -> list[int]:
+        if is_media(prompt) and self.media is None and self._chat(prompt):
+            return self._chat_ids(prompt)  # type: ignore[arg-type]
         if is_media(prompt):
             return [int(t) for t in self._batch([prompt]).ids[0].tolist()]
         if isinstance(prompt, str):
@@ -76,8 +78,51 @@ class Text:
             return {**resolved, "item": prompt["item"]}
         return {"item": prompt["item"]}
 
+    def _chat(self, prompt: Prompt) -> bool:
+        """A chat with text only, which the tokenizer's chat template can render."""
+        if self.tokenizer is None or not isinstance(prompt, Mapping) or "messages" not in prompt:
+            return False
+        return all(
+            isinstance(m, Mapping)
+            and (
+                isinstance(m.get("content", ""), str)
+                or all(
+                    isinstance(part, Mapping) and part.get("type") == "text"
+                    for part in m.get("content", [])
+                )
+            )
+            for m in prompt["messages"]
+        )
+
+    def _chat_ids(self, prompt: Mapping[str, Any]) -> list[int]:
+        """A text chat through the tokenizer's chat template (models without a processor)."""
+        messages = [
+            {
+                "role": m["role"],
+                "content": m["content"]
+                if isinstance(m["content"], str)
+                else "".join(str(part.get("text", "")) for part in m["content"]),
+            }
+            for m in prompt["messages"]
+        ]
+        if not getattr(self.tokenizer, "chat_template", None):
+            raise WspxError("this model's tokenizer has no chat template; pass prompts as text")
+        last_assistant = messages[-1]["role"] == "assistant"
+        rendered = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=not last_assistant,
+            continue_final_message=last_assistant,
+            **dict(prompt.get("template") or {}),
+        )
+        rendered = str(rendered) + str(prompt.get("reply") or "")
+        # the template writes its own special tokens
+        return list(self.tokenizer(rendered, add_special_tokens=False)["input_ids"])
+
     def _batch(self, prompts: Sequence[Prompt], device: torch.device | str = "cpu") -> Batch:
-        if any(is_media(p) for p in prompts):
+        if self.media is None and all(not is_media(p) or self._chat(p) for p in prompts):
+            pass  # text, token ids and text chats: the tokenizer path below
+        elif any(is_media(p) for p in prompts):
             if self.media is None:
                 raise WspxError(
                     "image, video and stored prompts need a vision-language model with a processor"

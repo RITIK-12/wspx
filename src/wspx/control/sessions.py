@@ -118,6 +118,7 @@ class SessionManager:
         revision: str | None = None,
         dtype: str = "bfloat16",
         trust_remote_code: bool = False,
+        engine: str = "hf",
         grace_s: float = 900.0,
         keep_warm: str = "auto",
         project: str = "",
@@ -127,6 +128,7 @@ class SessionManager:
     ) -> SessionRecord:
         if self.halted:
             raise WspxError("wspx is halted; `wspx resume` first")
+        check_engine_gpu(engine, gpu)
         if snapshot is not None and not self.store.objects.has(snapshot):
             raise WspxError(f"project snapshot {snapshot[:12]} was not uploaded")
         unknown = sorted(set(tools_deny or []) - set(TOOLS))
@@ -153,6 +155,7 @@ class SessionManager:
             status="starting" if driver else "idle",
             tools_deny=sorted(set(tools_deny or [])),
             max_lab_s=max_lab_s,
+            engine=engine,
         )
         self.records[sid] = record
         self._save(record)
@@ -165,6 +168,7 @@ class SessionManager:
                 "driver": driver,
                 "task": task,
                 "gpu": gpu,
+                "engine": engine,
                 "grace_s": grace_s,
                 "tools_deny": record.tools_deny,
                 "max_lab_s": max_lab_s,
@@ -694,3 +698,38 @@ class SessionManager:
 
 def _minutes(seconds: float) -> str:
     return f"{seconds / 60:.0f} min" if seconds >= 60 else f"{seconds:.0f} s"
+
+
+GPU_CAPABILITY = {
+    "T4": 7.5,
+    "L4": 8.9,
+    "A10G": 8.6,
+    "A10": 8.6,
+    "A100": 8.0,
+    "A100-40GB": 8.0,
+    "A100-80GB": 8.0,
+    "L40S": 8.9,
+    "H100": 9.0,
+    "H100!": 9.0,
+    "H200": 9.0,
+    "B200": 10.0,
+}
+"""CUDA compute capability of Modal's GPU types."""
+VLLM_MIN_CAPABILITY = 8.0
+
+
+def check_engine_gpu(engine: str, gpu: str | None) -> None:
+    """Refuse at creation what the lab could only fail at minutes later."""
+    if engine not in ("hf", "vllm"):
+        raise WspxError(f"unknown engine {engine!r}; use 'hf' or 'vllm'")
+    if engine != "vllm":
+        return
+    if not gpu:
+        raise WspxError("engine = 'vllm' needs a GPU: set [lab] gpu, e.g. 'H100' or 'H100:2'")
+    kind = gpu.split(":")[0].upper()
+    capability = GPU_CAPABILITY.get(kind) or GPU_CAPABILITY.get(gpu.split(":")[0])
+    if capability is not None and capability < VLLM_MIN_CAPABILITY:
+        raise WspxError(
+            f"engine = 'vllm' needs compute capability {VLLM_MIN_CAPABILITY} or newer, and a "
+            f"{kind} has {capability}; use an L4, A100, L40S, H100 or newer"
+        )
