@@ -91,7 +91,16 @@ def export_merged(
             shards.append(sorted(pending))
             pending, size = {}, 0
 
-    for batch in [*stored, *checkpoint.stream(model, live)]:
+    keep = {  # promote mode: fp32 on purpose, said so below
+        c
+        for n in promoted
+        if n in live
+        for c in checkpoint.names_in_checkpoint(model, n, tuple(live[n].shape))
+    }
+    cast = 0
+    for raw in [*stored, *checkpoint.stream(model, live)]:
+        batch, recast = checkpoint.as_stored(src, raw, keep)
+        cast += recast
         for name, t in batch.items():
             nbytes = t.numel() * t.element_size()
             if pending and size + nbytes > shard_bytes:
@@ -111,7 +120,8 @@ def export_merged(
         (out / f"part-{i:05d}.safetensors").rename(out / fname)
         files.append(fname)
         weight_map.update(dict.fromkeys(names, fname))
-    warnings = []
+    warnings: list[str] = []
+    notes: list[str] = []
     extras = sorted(src.extra_files) if src else []
     for name in extras:  # draft heads and the like: not loaded, so never edited
         shutil.copy2(src.path / name, out / name)  # type: ignore[union-attr]
@@ -126,6 +136,11 @@ def export_merged(
         _requant_config(out, kept_bf16)
     if extras:
         warnings.append(f"copied unedited (not part of the loaded model): {', '.join(extras)}")
+    if cast:
+        notes.append(
+            f"{cast} tensor(s) transformers held in a wider float were written in the dtype the "
+            "checkpoint stores them in"
+        )
     if promoted:
         warnings.append(
             f"{len(promoted)} tensor(s) stored in fp32 (promote mode); runtimes that cast the "
@@ -158,6 +173,7 @@ def export_merged(
         "files": files,
         "tensors": len(written),
         "warnings": warnings,
+        "notes": notes,
         "names": "checkpoint" if src and src.tensors else "loaded",
     }
 

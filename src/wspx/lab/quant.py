@@ -228,7 +228,8 @@ class Requantized:
     values: int
     """Stored values that changed."""
     clipped: int
-    """Values beyond the largest the format can hold there (kept at that largest)."""
+    """Values beyond the largest the format holds there by more than half a step (kept at
+    that largest): saturation, not rounding."""
     rescaled: int = 0
     """Experts whose range the edit grew past their stored ``amax``: their factor is raised
     and all their blocks are re-encoded (with ``keep_scales``, such values are clipped)."""
@@ -276,13 +277,15 @@ def requantize(
                 rescaled += 1
         if fmt.kind == "nvfp4":
             codes, sc = nvfp4_encode(x, f, rule=fmt.rule, scale=s_e if keep_scales else None)
-            limit = 6.0 * sc.float().unsqueeze(-1) * f
+            # past 7 (6 plus half the 4-to-6 step) is saturation, not rounding
+            limit = 7.0 * sc.float().unsqueeze(-1) * f
             over = (_blocks(x, n).abs() > limit * (1 + 1e-6)) & hit.unsqueeze(-1)
             mask_bytes = hit.repeat_interleave(n // 2, dim=-1)
             new_w[e] = torch.where(mask_bytes, codes, w_e)
         else:
             vals, sc = mxfp8_encode(x, scale=s_e if keep_scales else None)
-            limit = FP8_MAX * torch.exp2(sc.float() - 127).unsqueeze(-1)
+            # past 464 (448 plus half E4M3's top step of 32) is saturation, not rounding
+            limit = (FP8_MAX + 16.0) * torch.exp2(sc.float() - 127).unsqueeze(-1)
             over = (_blocks(x, n).abs() > limit * (1 + 1e-6)) & hit.unsqueeze(-1)
             mask_vals = hit.repeat_interleave(n, dim=-1)
             new_w[e] = torch.where(mask_vals, vals.view(torch.uint8), w_e.view(torch.uint8)).view(

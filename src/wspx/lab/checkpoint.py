@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -206,7 +206,7 @@ def compare(
     src: Source,
     *,
     dequantized: bool,
-    unquantized: set[str] = frozenset(),  # type: ignore[assignment]
+    unquantized: Collection[str] = (),
 ) -> list[str]:
     """How the written tensors differ from the source checkpoint's, as warnings.
     ``unquantized``: quantized source tensors deliberately written unquantized."""
@@ -238,3 +238,35 @@ def compare(
             shown = ", ".join(names[:4]) + (f", … {len(names) - 4} more" if len(names) > 4 else "")
             out.append(f"{len(names)} tensor(s) {label}: {shown}")
     return out
+
+
+_TORCH = {v: k for k, v in _DTYPES.items()}
+
+
+def stored_dtype(src: Source | None, name: str, t: torch.Tensor) -> torch.dtype | None:
+    """The float dtype the source stores ``name`` in, when ``t`` is a float in another one
+    (transformers keeps some tensors in fp32, Inkling's short convolutions and routers among
+    them, and runtimes such as vLLM load only the stored dtype)."""
+    if src is None or name not in src.tensors or not t.dtype.is_floating_point:
+        return None
+    stored = _TORCH.get(src.tensors[name][0])
+    if stored is None or stored == t.dtype or not stored.is_floating_point or stored.itemsize < 2:
+        return None
+    if tuple(src.tensors[name][1]) != tuple(t.shape):
+        return None
+    return stored
+
+
+def as_stored(
+    src: Source | None,
+    tensors: dict[str, torch.Tensor],
+    keep: Collection[str] = (),
+) -> tuple[dict[str, torch.Tensor], int]:
+    """Float tensors cast to the dtype the source stores them in (``keep``: left as they are);
+    returns them and how many were cast."""
+    out, cast = {}, 0
+    for name, t in tensors.items():
+        dtype = None if name in keep else stored_dtype(src, name, t)
+        out[name] = t if dtype is None else t.to(dtype)
+        cast += dtype is not None
+    return out, cast

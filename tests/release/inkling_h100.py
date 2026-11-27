@@ -197,10 +197,8 @@ def _lab_phase(report: dict) -> None:  # type: ignore[type-arg]
     report["export"]["edited_layer_bytes_changed"] = not bool(
         torch.equal(read(out_files, edited), read(src_files, edited))
     )
-    lab.__dict__.clear()  # drops the model, tree and quantized copies: frees the GPU
+    lab.__dict__.clear()
     gc.collect()
-    torch.cuda.empty_cache()
-    report["gpu_free_after_lab_gb"] = round(torch.cuda.mem_get_info()[0] / 2**30, 1)
 
 
 VLLM_SCRIPT = r"""
@@ -273,13 +271,28 @@ def _vllm(path: str) -> dict:  # type: ignore[type-arg]
     volumes={"/models": models_volume.read_only()},
 )
 def inkling() -> dict:  # type: ignore[type-arg]
+    import subprocess
+    import sys
     import traceback
+    from pathlib import Path
 
-    report: dict = {}  # type: ignore[type-arg]
+    # the lab runs in a process of its own, so all of its GPU memory is gone before vLLM
+    # starts (seen: clearing the lab in-process left ~56 GB held, and vLLM ran out)
+    child = (
+        "import json, sys, traceback; sys.path.insert(0, '/root'); import inkling_h100 as m\n"
+        "r = {}\n"
+        "try:\n    m._lab_phase(r)\n"
+        "except Exception:\n    r['lab_error'] = traceback.format_exc()[-4000:]\n"
+        "json.dump(r, open('/tmp/lab.json', 'w'), default=str)\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", child], capture_output=True, text=True, check=False
+    )
     try:
-        _lab_phase(report)
-    except Exception:
-        report["lab_error"] = traceback.format_exc()[-4000:]
+        report: dict = json.loads(Path("/tmp/lab.json").read_text())  # type: ignore[type-arg]
+    except (OSError, ValueError):
+        report = {"lab_error": done.stderr[-4000:]}
+    del traceback
     if "export" in report:
         report["vllm_edited"] = _vllm("/tmp/export")
     report["vllm_base"] = _vllm(MODEL)

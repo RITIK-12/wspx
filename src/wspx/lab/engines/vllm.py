@@ -466,7 +466,11 @@ class VLLMEngine(Engine):
                         stored.update(served.stored(n) or served.source_parts(n, shape, device))
                     else:
                         plain[n] = self._value(n, state, live)
-                yield {**checkpoint.to_checkpoint(self.model, plain), **stored}
+                # vLLM loads only the dtype the checkpoint stores (transformers widens some)
+                as_stored, _ = checkpoint.as_stored(
+                    self.src, checkpoint.to_checkpoint(self.model, plain)
+                )
+                yield {**as_stored, **stored}
 
         version = self.state_key(state) or f"sync-{len(self.syncs) + 1}"
         try:

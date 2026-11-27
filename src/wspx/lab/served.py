@@ -35,10 +35,16 @@ class Survival:
     values: int
     clipped: int
     rescaled: int = 0
+    kept: float = 0.0
+    """The share of the intended change the served one keeps along it (``ratio × cosine``):
+    rounding noise from re-encoding a block adds size, not this."""
 
     def describe(self) -> str:
-        kept = f"{self.ratio:.0%} of the edit's size survives {self.format}"
-        line = f"{kept} (cosine {self.cosine:.3f}); {self.values:,} stored values in {self.blocks:,} blocks changed"
+        line = (
+            f"{self.kept:.0%} of the edit survives {self.format} (the served change is "
+            f"{self.ratio:.0%} of its size, cosine {self.cosine:.3f}); {self.values:,} stored "
+            f"values in {self.blocks:,} blocks changed"
+        )
         if self.rescaled:
             line += f"; {self.rescaled} expert(s) outgrew their scale and were re-encoded whole"
         if self.clipped:
@@ -143,6 +149,7 @@ class Served:
             values,
             clipped,
             rescaled,
+            0.0 if math.isnan(cos) else ratio * cos,
         )
         return live
 

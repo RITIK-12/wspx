@@ -164,11 +164,17 @@ def test_an_edit_is_written_in_the_stored_format_and_tested_as_served(
     out = tmp_path / "out"
     info = lab.export("merged", "../out").data
     assert not any("dequantized" in w for w in info["warnings"]), info["warnings"]
+    # seen on the real model: transformers keeps the short convolutions (and others) in fp32,
+    # and vLLM refused the export ("checkpoint dtype torch.float32 != torch.bfloat16")
+    assert not any("differs" in w for w in info["warnings"]), info["warnings"]
+    assert any("dtype the checkpoint stores" in n for n in info["notes"])
     written = {}
     for f in out.glob("model*.safetensors"):
         written.update(load_file(str(f)))
     source = load_file(str(tmp_path / "src" / "model.safetensors"))
     assert written["model.llm.layers.3.mlp.experts.w13_weight"].dtype == torch.uint8
+    conv = "model.llm.layers.0.attn.k_sconv.weight"
+    assert written[conv].dtype == source[conv].dtype == torch.bfloat16
     assert torch.equal(
         written["model.llm.layers.4.mlp.experts.w13_weight"],
         source["model.llm.layers.4.mlp.experts.w13_weight"],

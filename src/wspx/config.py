@@ -187,8 +187,8 @@ class CheckSection(_Section):
     warn_dense_fraction: float = Field(default=0.05, gt=0, le=1)
     max_ppl_increase: float = Field(default=0.10, gt=0)
     min_quant_survival: float = Field(default=0.25, ge=0, le=1)
-    """An edit to a tensor stored quantized is refused when less than this share of it
-    (by norm) survives the format."""
+    """An edit to a tensor stored quantized is refused when the change served keeps less
+    than this share of it along its direction (rounding noise does not count)."""
 
 
 class TestsSection(_Section):

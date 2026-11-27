@@ -1056,7 +1056,7 @@ class Lab:
             promote = Fix(
                 title='precision="promote" keeps it exact in bf16', action={"precision": "promote"}
             )
-            if s.ratio < self.config.check.min_quant_survival:
+            if s.kept < self.config.check.min_quant_survival:
                 self.tree.checkout(before)
                 raise CheckFailed(
                     [
@@ -1069,7 +1069,7 @@ class Lab:
                         )
                     ]
                 )
-            severity = Severity.INFO if s.ratio >= 0.9 and s.cosine >= 0.99 else Severity.WARNING
+            severity = Severity.INFO if s.kept >= 0.9 and s.cosine >= 0.99 else Severity.WARNING
             report.diagnostics.append(
                 diag(
                     Code.QUANT_SURVIVAL,
