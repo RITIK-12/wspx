@@ -96,6 +96,8 @@ def stream(model: nn.Module, device: torch.device | str, *, pin: bool = True) ->
             for p in _params(block):
                 host = p.data if p.device.type == "cpu" else p.data.cpu()
                 p.data = host.pin_memory() if pin and torch.cuda.is_available() else host
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()  # what moved to the host is free for vLLM
     out = Streamed(model, device, blocks)
 
     def bring(block: nn.Module, *_: Any, **__: Any) -> None:

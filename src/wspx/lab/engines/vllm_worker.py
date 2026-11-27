@@ -143,6 +143,15 @@ def _row(i: int, out: Any, watch: list[int]) -> dict[str, Any]:
     }
 
 
+async def _patched(engine: Any) -> list[str]:
+    """The strict loaders the extension patched in vLLM's model process."""
+    try:
+        out = await engine.collective_rpc("wspx_patched_loaders")
+    except Exception:
+        return []
+    return sorted({name for rank in out or [] for name in rank or []})
+
+
 def build_app(engine_argv: list[str], token: str) -> Any:
     from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import JSONResponse, StreamingResponse
@@ -198,6 +207,7 @@ def build_app(engine_argv: list[str], token: str) -> Any:
             "speculative": e.vllm_config.speculative_config is not None,
             "reload_mode": os.environ.get("VLLM_RELOAD_MODE", "auto"),
             "extension": e.vllm_config.parallel_config.worker_extension_cls,
+            "patched": await _patched(e),
         }
 
     @app.post("/generate")
