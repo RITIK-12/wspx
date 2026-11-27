@@ -642,6 +642,11 @@ def test_snapshots_are_unpacked_once_and_the_oldest_are_dropped(tmp_path: Path) 
     for _ in range(3):
         path, kind = cache.file(loader("one"), "sha256:one", "prompts/a.png")
     assert (path.read_text(), kind, reads) == ("one", "image/png", ["one"])
+    path.unlink()  # seen locally: macOS cleared the temp folder's old files, not the marker
+    again, _ = cache.file(loader("one"), "sha256:one", "prompts/a.png")
+    assert (again.read_text(), reads) == ("one", ["one", "one"])
+    with pytest.raises(FileNotFoundError):
+        cache.file(loader("one"), "sha256:one", "prompts/b.png")
     for i in range(media.KEEP + 2):
         cache.file(loader(f"s{i}"), f"sha256:s{i}", "prompts/a.png")
     kept = [p for p in (tmp_path / "cache").iterdir() if (p / ".unpacked").exists()]

@@ -60,20 +60,28 @@ class MediaCache:
             raise WspxError(f"{rel}: only images and videos are served")
         folder = self._unpacked(snapshot, snapshot_bytes)
         path = (folder / rel).resolve()
-        if not path.is_relative_to(folder.resolve()) or not path.is_file():
+        if not path.is_relative_to(folder.resolve()):
             raise FileNotFoundError(rel)
+        if not path.is_file():
+            # seen locally: macOS clears old files out of the temp folder and kept the marker,
+            # so a file the snapshot holds went missing; unpack it again before saying so
+            folder = self._unpacked(snapshot, snapshot_bytes, fresh=True)
+            if not path.is_file():
+                raise FileNotFoundError(rel)
         if path.stat().st_size > MAX_BYTES:
             raise WspxError(f"{rel}: {path.stat().st_size / 2**20:.0f} MB, too large to preview")
         return path, kind
 
-    def _unpacked(self, snapshot: str, snapshot_bytes: Callable[[], bytes]) -> Path:
+    def _unpacked(
+        self, snapshot: str, snapshot_bytes: Callable[[], bytes], *, fresh: bool = False
+    ) -> Path:
         from wspx.project import extract
 
         safe = "".join(c for c in snapshot if c.isalnum() or c in "-_")
         folder = self.root / safe
         with self._lock:
             done = folder / ".unpacked"
-            if not done.exists():
+            if fresh or not done.exists():
                 partial = Path(tempfile.mkdtemp(prefix=f".{safe}-", dir=self.root))
                 try:
                     extract(snapshot_bytes(), partial)
